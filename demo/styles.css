@@ -1,0 +1,52 @@
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #f4f4f4;
+  color: #222;
+}
+
+.page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 32px;
+}
+
+.hero {
+  padding: 24px;
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+}
+
+.card {
+  margin-top: 20px;
+  padding: 20px;
+  background: white;
+  border-radius: 16px;
+}
+
+#signup-form {
+  display: flex;
+  flex-direction: colum;
+  gap: 10px;
+}
+
+input {
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+}
+
+button {
+  padding: 10px 14px;
+  border: none;
+  border-radius: 8px;
+  background: #1456d9;
+  color: white;
+  cursor: pointer;
+}
+
+#message {
+  min-height: 24px;
+  color: #b42318;
+}

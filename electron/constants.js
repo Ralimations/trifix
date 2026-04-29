@@ -1,27 +1,25 @@
+import { AGENT_CONFIGS } from "../shared/agentConfig.js";
+
 export const AI_ENDPOINT =
   process.env.TRIFIX_AI_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat";
 
+export const ARCHITECT_ENDPOINT =
+  process.env.TRIFIX_ARCHITECT_ENDPOINT ||
+  "http://localhost:3010/api/v1/chat";
+
 export const AGENTS = {
+  ...AGENT_CONFIGS,
   junior: {
-    id: "junior",
-    name: "Junior Explainer",
-    role: "Simple explanation",
-    model: "google/gemma-4-e2b",
-    color: "blue"
+    ...AGENT_CONFIGS.junior,
+    endpoint: process.env.TRIFIX_JUNIOR_ENDPOINT || AI_ENDPOINT
   },
-  senior: {
-    id: "senior",
-    name: "Senior Critic",
-    role: "Bugs, risks, bad practices",
-    model: "gemma-4-e4b-uncensored-hauhaucs-aggressive",
-    color: "red"
+  supervisor: {
+    ...AGENT_CONFIGS.supervisor,
+    endpoint: process.env.TRIFIX_SUPERVISOR_ENDPOINT || AI_ENDPOINT
   },
-  lead: {
-    id: "lead",
-    name: "Lead Architect",
-    role: "Fix and recommendation",
-    model: "google/gemma-4-e4b",
-    color: "green"
+  architect: {
+    ...AGENT_CONFIGS.architect,
+    endpoint: process.env.TRIFIX_ARCHITECT_ENDPOINT || ARCHITECT_ENDPOINT
   }
 };
 

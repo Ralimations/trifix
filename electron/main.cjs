@@ -1,13 +1,16 @@
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const fs = require("node:fs/promises");
 const path = require("node:path");
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
 let mainWindow = null;
 let backend = null;
+let settingsFilePath = null;
 
 app.whenReady().then(async () => {
   backend = await loadBackend();
+  settingsFilePath = path.join(app.getPath("userData"), "trifix-settings.json");
   registerIpc();
   createWindow();
 
@@ -84,8 +87,22 @@ function registerIpc() {
 
   ipcMain.handle("app:settings", async () => ({
     endpoint: backend.AI_ENDPOINT,
-    agents: backend.AGENTS
+    agents: await getMergedAgents()
   }));
+
+  ipcMain.handle("app:dialogue:save", async (_event, dialoguePatch) => {
+    const current = await readSettings();
+    current.dialogue = {
+      ...(current.dialogue || {}),
+      ...(dialoguePatch || {})
+    };
+    await writeSettings(current);
+
+    return {
+      endpoint: backend.AI_ENDPOINT,
+      agents: await getMergedAgents()
+    };
+  });
 
   ipcMain.handle("pipeline:run", async (event, payload) => {
     const files = payload?.projectRoot
@@ -102,4 +119,44 @@ function registerIpc() {
       }
     );
   });
+}
+
+async function getMergedAgents() {
+  const settings = await readSettings();
+  const dialogue = settings.dialogue || {};
+  const mergedAgents = {};
+
+  for (const [agentId, agent] of Object.entries(backend.AGENTS)) {
+    mergedAgents[agentId] = {
+      ...agent,
+      dialogue: {
+        ...(agent.dialogue || {}),
+        ...(dialogue[agentId] || {})
+      }
+    };
+  }
+
+  return mergedAgents;
+}
+
+async function readSettings() {
+  if (!settingsFilePath) {
+    return {};
+  }
+
+  try {
+    const raw = await fs.readFile(settingsFilePath, "utf8");
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return {};
+    }
+
+    throw error;
+  }
+}
+
+async function writeSettings(settings) {
+  await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+  await fs.writeFile(settingsFilePath, JSON.stringify(settings, null, 2), "utf8");
 }

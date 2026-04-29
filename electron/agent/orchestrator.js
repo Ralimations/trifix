@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { AGENTS, AI_ENDPOINT, MAX_CONTEXT_CHARS_PER_FILE, MAX_CONTEXT_CHARS_TOTAL } from "../constants.js";
 
 const REQUEST_TIMEOUT_MS = 45000;
+const SPEAKING_DELAY_MS = 800;
 let lastResult = null;
 
 export function getLastResult() {
@@ -28,34 +29,32 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   emitProgress({ runId, agent: "junior", status: "thinking" });
   const explanation = await callAgent({
     agent: AGENTS.junior,
-    systemPrompt:
-      "Explain this code or error simply for a developer. Be concise. Mention likely intent and failure point.",
+    systemPrompt: buildSystemPrompt(AGENTS.junior),
     input: compactContext
   });
+  emitProgress({ runId, agent: "junior", status: "speaking" });
+  await delay(SPEAKING_DELAY_MS);
   emitProgress({ runId, agent: "junior", status: "done" });
 
-  emitProgress({ runId, agent: "senior", status: "thinking" });
+  emitProgress({ runId, agent: "supervisor", status: "thinking" });
   const critique = await callAgent({
-    agent: AGENTS.senior,
-    systemPrompt:
-      "Find bugs, risks, bad practices, missing edge cases, and test gaps. Be direct, concise, and professional.",
+    agent: AGENTS.supervisor,
+    systemPrompt: buildSystemPrompt(AGENTS.supervisor),
     input: `${compactContext}\n\nJUNIOR_EXPLANATION:\n${trimForPrompt(explanation, 5000)}`
   });
-  emitProgress({ runId, agent: "senior", status: "done" });
+  emitProgress({ runId, agent: "supervisor", status: "speaking" });
+  await delay(SPEAKING_DELAY_MS);
+  emitProgress({ runId, agent: "supervisor", status: "done" });
 
-  emitProgress({ runId, agent: "lead", status: "thinking" });
+  emitProgress({ runId, agent: "architect", status: "thinking" });
   const leadOutput = await callAgent({
-    agent: AGENTS.lead,
-    systemPrompt:
-      "Use the context and reviews to produce a fix. Output exactly two sections: FIXED_CODE and RECOMMENDATION. Keep code complete but minimal.",
-    input: [
-      compactContext,
-      `JUNIOR_EXPLANATION:\n${trimForPrompt(explanation, 4000)}`,
-      `SENIOR_CRITIQUE:\n${trimForPrompt(critique, 5000)}`,
-      `Preferred language: ${language}`
-    ].join("\n\n")
+    agent: AGENTS.architect,
+    systemPrompt: buildSystemPrompt(AGENTS.architect),
+    input: buildArchitectContext({ compactContext, explanation, critique, language })
   });
-  emitProgress({ runId, agent: "lead", status: "done" });
+  emitProgress({ runId, agent: "architect", status: "speaking" });
+  await delay(SPEAKING_DELAY_MS);
+  emitProgress({ runId, agent: "architect", status: "done" });
 
   const leadResult = parseLeadOutput(leadOutput);
   lastResult = {
@@ -71,14 +70,22 @@ export async function runPipeline(payload, emitProgress = () => {}) {
 
 async function callAgent({ agent, systemPrompt, input }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const requestTimeoutMs = agent.timeoutMs || REQUEST_TIMEOUT_MS;
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const endpoint = agent.endpoint || AI_ENDPOINT;
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json"
+  };
+
+  if (endpoint.includes("ngrok-free.dev")) {
+    headers["ngrok-skip-browser-warning"] = "true";
+  }
 
   try {
-    const response = await fetch(AI_ENDPOINT, {
+    const response = await fetch(endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers,
       body: JSON.stringify({
         model: agent.model,
         system_prompt: systemPrompt,
@@ -104,12 +111,12 @@ async function callAgent({ agent, systemPrompt, input }) {
     return parsed;
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`${agent.name} timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds.`);
+      throw new Error(`${agent.name} timed out after ${Math.round(requestTimeoutMs / 1000)} seconds.`);
     }
 
     if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|network/i.test(error?.message || "")) {
       throw new Error(
-        `${agent.name} could not reach ${AI_ENDPOINT}. Confirm the VPN is connected and the endpoint is online.`
+        `${agent.name} could not reach ${endpoint}. Confirm the endpoint is online${endpoint.includes("10.8.0.3") ? " and the VPN is connected" : ""}.`
       );
     }
 
@@ -220,6 +227,34 @@ function parseLeadOutput(output) {
     fixedCode: cleanCode(fixedMatch?.[1] || fallbackCodeFence?.[1] || output),
     recommendation: (recommendationMatch?.[1] || output).trim()
   };
+}
+
+function buildSystemPrompt(agent) {
+  const parts = [agent.prompts?.system, agent.prompts?.output];
+
+  if (agent.speech?.prefix) {
+    parts.push(`Speaking habit: may start with "${agent.speech.prefix}" when speaking naturally.`);
+  }
+
+  if (agent.speech?.habit) {
+    parts.push(`Style note: ${agent.speech.habit}`);
+  }
+
+  return parts.filter(Boolean).join(" ");
+}
+
+function buildArchitectContext({ compactContext, explanation, critique, language }) {
+  return [
+    trimForPrompt(compactContext, 12000),
+    `JUNIOR_EXPLANATION:\n${trimForPrompt(explanation, 2200)}`,
+    `SUPERVISOR_CRITIQUE:\n${trimForPrompt(critique, 2600)}`,
+    `Preferred language: ${language}`,
+    "Return only the minimal code needed and a concise recommendation."
+  ].join("\n\n");
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function cleanCode(value) {

@@ -15,16 +15,23 @@ npm install
 npm run dev
 ```
 
-The AI endpoint is expected to be reachable over VPN:
+Junior and Supervisor use the VPN endpoint:
 
 ```text
 POST http://10.8.0.3:3011/api/v1/chat
 ```
 
-Override it when needed:
+Architect uses:
+
+```text
+POST http://localhost:3010/api/v1/chat
+```
+
+Override them when needed:
 
 ```bash
 set TRIFIX_AI_ENDPOINT=http://10.8.0.3:3011/api/v1/chat
+set TRIFIX_ARCHITECT_ENDPOINT=http://localhost:3010/api/v1/chat
 npm run dev
 ```
 
@@ -62,9 +69,15 @@ The Electron main process rejects absolute selected paths, path traversal, block
 
 ## Pipeline
 
-1. Junior Explainer: `google/gemma-4-e2b`
-2. Senior Critic: `gemma-4-e4b-uncensored-hauhaucs-aggressive`
-3. Lead Architect: `google/gemma-4-e4b`
+1. YOU (`r` / Junior Dev): `google/gemma-4-e2b`
+2. SUPERVISOR (`j`): `gemma-4-e4b-uncensored-hauhaucs-aggressive`
+3. ARCHITECT (`a`): `google/gemma-4-e4b`
+
+## Agent Config
+
+Agent names, roles, prompt instructions, speech habits, and sprite paths live in [shared/agentConfig.js](</d:/ralskunk/trifix/shared/agentConfig.js>).
+
+Example: the supervisor is configured with `speech.prefix = "Bai"`, and that habit is injected into the system prompt during orchestration.
 
 Each run returns:
 

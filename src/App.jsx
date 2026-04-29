@@ -17,33 +17,7 @@ import {
   TerminalSquare,
   TriangleAlert
 } from "lucide-react";
-
-const INITIAL_AGENTS = [
-  {
-    id: "junior",
-    name: "Junior Explainer",
-    role: "Simple explanation",
-    model: "google/gemma-4-e2b",
-    color: "blue",
-    status: "idle"
-  },
-  {
-    id: "senior",
-    name: "Senior Critic",
-    role: "Bugs, risks, bad practices",
-    model: "gemma-4-e4b-uncensored-hauhaucs-aggressive",
-    color: "red",
-    status: "idle"
-  },
-  {
-    id: "lead",
-    name: "Lead Architect",
-    role: "Fix and recommendation",
-    model: "google/gemma-4-e4b",
-    color: "green",
-    status: "idle"
-  }
-];
+import { INITIAL_AGENTS } from "./agentViewModels.js";
 
 const LANGUAGES = [
   "auto",
@@ -60,6 +34,7 @@ const LANGUAGES = [
 
 export function App() {
   const [activeView, setActiveView] = useState("office");
+  const [agentCatalog, setAgentCatalog] = useState(INITIAL_AGENTS);
   const [agents, setAgents] = useState(INITIAL_AGENTS);
   const [project, setProject] = useState(null);
   const [selectedFiles, setSelectedFiles] = useState([]);
@@ -72,7 +47,15 @@ export function App() {
   const currentRunRef = useRef(null);
 
   useEffect(() => {
-    window.trifix.getSettings().then(setSettings).catch(() => {});
+    window.trifix
+      .getSettings()
+      .then((nextSettings) => {
+        setSettings(nextSettings);
+        const nextAgents = toAgentList(nextSettings?.agents);
+        setAgentCatalog(nextAgents);
+        setAgents(nextAgents);
+      })
+      .catch(() => {});
     window.trifix.getLastResult().then((cached) => cached && setResult(cached)).catch(() => {});
 
     return window.trifix.onPipelineProgress((progress) => {
@@ -136,7 +119,7 @@ export function App() {
     setIsRunning(true);
     setError("");
     setResult(null);
-    setAgents(INITIAL_AGENTS.map((agent) => ({ ...agent, status: "idle" })));
+    setAgents(agentCatalog.map((agent) => ({ ...agent, status: "idle" })));
 
     try {
       const nextResult = await window.trifix.runPipeline({
@@ -229,7 +212,23 @@ export function App() {
         ) : null}
 
         {activeView === "reports" ? <ReportsView result={result} /> : null}
-        {activeView === "settings" ? <SettingsView settings={settings} project={project} /> : null}
+        {activeView === "settings" ? (
+          <SettingsView
+            settings={settings}
+            project={project}
+            onSettingsChange={(nextSettings) => {
+              setSettings(nextSettings);
+              const nextAgents = toAgentList(nextSettings?.agents);
+              setAgentCatalog(nextAgents);
+              setAgents((currentAgents) =>
+                currentAgents.map((agent) => {
+                  const updated = nextAgents.find((item) => item.id === agent.id) || agent;
+                  return { ...updated, status: agent.status };
+                })
+              );
+            }}
+          />
+        ) : null}
       </main>
     </div>
   );
@@ -253,6 +252,8 @@ function OfficeView({
   onLanguage,
   onRun
 }) {
+  const activeAgentId = getActiveAgentId(agents, isRunning);
+
   return (
     <>
       <header className="workspace-header">
@@ -266,9 +267,15 @@ function OfficeView({
         </button>
       </header>
 
-      <section className="agent-grid" aria-label="Developer agents">
+      <section className="office-stage" aria-label="Developer agents">
+        <div className="stage-backdrop" />
         {agents.map((agent) => (
-          <AgentCard key={agent.id} agent={agent} />
+          <AgentCard
+            key={agent.id}
+            agent={agent}
+            isActive={activeAgentId === agent.id}
+            isDimmed={Boolean(activeAgentId) && activeAgentId !== agent.id && agent.status !== "done"}
+          />
         ))}
       </section>
 
@@ -347,23 +354,52 @@ function OfficeView({
   );
 }
 
-function AgentCard({ agent }) {
+function AgentCard({ agent, isActive, isDimmed }) {
   const StatusIcon = getStatusIcon(agent.status);
+  const spritePath = agent.sprites?.[agent.status] || agent.sprites?.idle;
+  const dialogue = agent.dialogue?.[agent.status] || agent.dialogue?.idle || "";
 
   return (
-    <article className={`agent-card ${agent.color}`}>
+    <article
+      className={`agent-card ${agent.color} status-${agent.status} ${isActive ? "is-active" : ""} ${
+        isDimmed ? "is-dimmed" : ""
+      }`}
+    >
+      <div className="agent-card-glow" />
       <div className="agent-topline">
-        <div className="agent-avatar">
-          <Bot size={22} />
+        <div className="agent-identity">
+          <div className="agent-meta">{agent.roleLabel}</div>
+          <h2>{agent.name}</h2>
         </div>
-        <span className={`status-pill ${agent.status}`}>
-          <StatusIcon size={15} className={agent.status === "thinking" ? "spin" : ""} />
-          {agent.status}
-        </span>
+        <div className="status-group">
+          {agent.status === "done" ? (
+            <span className="done-badge">
+              <CheckCircle2 size={14} />
+              complete
+            </span>
+          ) : null}
+          <span className={`status-pill ${agent.status}`}>
+            <StatusIcon size={15} className={agent.status === "thinking" ? "spin" : ""} />
+            {agent.status}
+          </span>
+        </div>
       </div>
-      <h2>{agent.name}</h2>
-      <p>{agent.role}</p>
-      <code>{agent.model}</code>
+
+      <div className="agent-stage">
+        <div className="agent-avatar sprite-frame">
+          {spritePath ? (
+            <img src={spritePath} alt={`${agent.name} ${agent.status}`} className="agent-sprite" />
+          ) : (
+            <Bot size={22} />
+          )}
+        </div>
+        {dialogue ? <div className="agent-dialogue">"{dialogue}"</div> : null}
+      </div>
+
+      <div className="agent-footer">
+        <p>{agent.summary}</p>
+        <code>{agent.model}</code>
+      </div>
     </article>
   );
 }
@@ -371,7 +407,11 @@ function AgentCard({ agent }) {
 function OutputPanels({ result }) {
   if (!result) {
     return (
-      <section className="output-grid">
+      <section className="output-section">
+        <div className="output-section-header">
+          <p className="eyebrow">Reports</p>
+          <h2>Office output</h2>
+        </div>
         <div className="empty-output">
           <Code2 size={28} />
           <span>Results will appear here after the pipeline finishes.</span>
@@ -381,34 +421,46 @@ function OutputPanels({ result }) {
   }
 
   return (
-    <section className="output-grid" aria-label="Pipeline output">
-      <OutputPanel title="Explanation" content={result.explanation} />
-      <OutputPanel title="Critique" content={result.critique} />
-      <OutputPanel title="Fixed Code" content={result.fixedCode} code />
-      <OutputPanel title="Final Recommendation" content={result.recommendation} />
-      <div className="output-panel">
-        <h2>Files Affected</h2>
-        {result.filesAnalyzed?.length ? (
-          <ul className="affected-files">
-            {result.filesAnalyzed.map((file) => (
-              <li key={file.path}>
-                <FileCode2 size={16} />
-                <span>{file.path}</span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">Snippet-only run</p>
-        )}
+    <section className="output-section" aria-label="Pipeline output">
+      <div className="output-section-header">
+        <p className="eyebrow">Reports</p>
+        <h2>Office output</h2>
+      </div>
+      <div className="output-grid">
+        <OutputPanel title="Explanation" content={result.explanation} tone="blue" />
+        <OutputPanel title="Critique" content={result.critique} tone="red" />
+        <OutputPanel title="Fixed Code" content={result.fixedCode} code tone="green" />
+        <OutputPanel title="Final Recommendation" content={result.recommendation} tone="green" />
+        <div className="output-panel output-files">
+          <div className="output-panel-header">
+            <span className="output-tab">Files</span>
+            <h2>Files Affected</h2>
+          </div>
+          {result.filesAnalyzed?.length ? (
+            <ul className="affected-files">
+              {result.filesAnalyzed.map((file) => (
+                <li key={file.path}>
+                  <FileCode2 size={16} />
+                  <span>{file.path}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">Snippet-only run</p>
+          )}
+        </div>
       </div>
     </section>
   );
 }
 
-function OutputPanel({ title, content, code = false }) {
+function OutputPanel({ title, content, code = false, tone = "blue" }) {
   return (
-    <div className={`output-panel ${code ? "code-panel" : ""}`}>
-      <h2>{title}</h2>
+    <div className={`output-panel ${code ? "code-panel" : ""} tone-${tone}`}>
+      <div className="output-panel-header">
+        <span className="output-tab">{title}</span>
+        <h2>{title}</h2>
+      </div>
       {code ? (
         <pre>
           <code>{content || "No fixed code returned."}</code>
@@ -473,7 +525,29 @@ function ReportsView({ result }) {
   );
 }
 
-function SettingsView({ settings, project }) {
+function SettingsView({ settings, project, onSettingsChange }) {
+  const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
+  const [saveState, setSaveState] = useState("idle");
+  const [saveError, setSaveError] = useState("");
+
+  useEffect(() => {
+    setDialogueDraft(buildDialogueDraft(settings?.agents));
+  }, [settings]);
+
+  async function saveDialogue() {
+    setSaveState("saving");
+    setSaveError("");
+
+    try {
+      const nextSettings = await window.trifix.saveDialogue(dialogueDraft);
+      onSettingsChange(nextSettings);
+      setSaveState("saved");
+    } catch (error) {
+      setSaveState("error");
+      setSaveError(error?.message || "Failed to save dialogue.");
+    }
+  }
+
   return (
     <section className="simple-view">
       <p className="eyebrow">Settings</p>
@@ -491,10 +565,47 @@ function SettingsView({ settings, project }) {
           ? Object.values(settings.agents).map((agent) => (
               <div className="settings-row" key={agent.id}>
                 <span>{agent.name}</span>
-                <code>{agent.model}</code>
+                <code>{`${agent.model} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
               </div>
             ))
           : null}
+      </div>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Dialogue</p>
+            <h2>Editable agent lines</h2>
+          </div>
+          <button className="primary-button" type="button" onClick={saveDialogue} disabled={saveState === "saving"}>
+            {saveState === "saving" ? <Loader2 size={18} className="spin" /> : null}
+            Save Dialogue
+          </button>
+        </div>
+        {Object.values(settings?.agents || {}).map((agent) => (
+          <div className="dialogue-block" key={agent.id}>
+            <h2>{agent.name}</h2>
+            {["idle", "thinking", "speaking", "done", "error"].map((status) => (
+              <label className="dialogue-field" key={`${agent.id}-${status}`}>
+                <span>{status}</span>
+                <input
+                  type="text"
+                  value={dialogueDraft?.[agent.id]?.[status] || ""}
+                  onChange={(event) =>
+                    setDialogueDraft((current) => ({
+                      ...current,
+                      [agent.id]: {
+                        ...(current[agent.id] || {}),
+                        [status]: event.target.value
+                      }
+                    }))
+                  }
+                />
+              </label>
+            ))}
+          </div>
+        ))}
+        {saveState === "saved" ? <div className="save-note">Dialogue saved.</div> : null}
+        {saveError ? <div className="error-banner" role="alert"><TriangleAlert size={18} /><span>{saveError}</span></div> : null}
       </div>
     </section>
   );
@@ -537,4 +648,40 @@ function hasPath(nodes, path) {
   }
 
   return false;
+}
+
+function toAgentList(agentsMap) {
+  if (!agentsMap) {
+    return INITIAL_AGENTS;
+  }
+
+  return Object.values(agentsMap).map((agent) => ({
+    ...agent,
+    status: "idle"
+  }));
+}
+
+function buildDialogueDraft(agentsMap) {
+  const draft = {};
+
+  for (const [agentId, agent] of Object.entries(agentsMap || {})) {
+    draft[agentId] = {
+      idle: agent.dialogue?.idle || "",
+      thinking: agent.dialogue?.thinking || "",
+      speaking: agent.dialogue?.speaking || "",
+      done: agent.dialogue?.done || "",
+      error: agent.dialogue?.error || ""
+    };
+  }
+
+  return draft;
+}
+
+function getActiveAgentId(agents, isRunning) {
+  if (!isRunning) {
+    return "";
+  }
+
+  const activeAgent = agents.find((agent) => agent.status === "thinking" || agent.status === "speaking");
+  return activeAgent?.id || "";
 }
