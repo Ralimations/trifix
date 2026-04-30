@@ -37,8 +37,11 @@ async function loadBackend() {
   return {
     AGENTS: constants.AGENTS,
     AI_ENDPOINT: constants.AI_ENDPOINT,
+    buildDefaultSandboxProject: fileSystem.buildDefaultSandboxProject,
     buildProjectTree: fileSystem.buildProjectTree,
     readSelectedProjectFiles: fileSystem.readSelectedProjectFiles,
+    previewFilePatches: fileSystem.previewFilePatches,
+    applyFilePatches: fileSystem.applyFilePatches,
     getLastResult: orchestrator.getLastResult,
     runPipeline: orchestrator.runPipeline
   };
@@ -81,6 +84,10 @@ function registerIpc() {
     return backend.buildProjectTree(selection.filePaths[0]);
   });
 
+  ipcMain.handle("project:sandbox", async () =>
+    backend.buildDefaultSandboxProject(app.getPath("documents"))
+  );
+
   ipcMain.handle("project:refresh", async (_event, rootPath) => backend.buildProjectTree(rootPath));
 
   ipcMain.handle("pipeline:last", async () => backend.getLastResult());
@@ -119,6 +126,28 @@ function registerIpc() {
       }
     );
   });
+
+  ipcMain.handle("decision:accept", async (_event, payload) => ({
+    acceptedAt: new Date().toISOString(),
+    decisionStatus: "accepted",
+    summary: payload?.summary || ""
+  }));
+
+  ipcMain.handle("decision:preview-apply", async (_event, payload) =>
+    backend.previewFilePatches(
+      payload?.projectRoot,
+      payload?.patches || [],
+      payload?.affectedFiles || []
+    )
+  );
+
+  ipcMain.handle("decision:apply", async (_event, payload) =>
+    backend.applyFilePatches(
+      payload?.projectRoot,
+      payload?.patches || [],
+      payload?.affectedFiles || []
+    )
+  );
 }
 
 async function getMergedAgents() {

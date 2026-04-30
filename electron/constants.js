@@ -7,6 +7,9 @@ export const ARCHITECT_ENDPOINT =
   process.env.TRIFIX_ARCHITECT_ENDPOINT ||
   "http://localhost:3010/api/v1/chat";
 
+export const ARCHITECT_MODEL =
+  process.env.TRIFIX_ARCHITECT_MODEL || AGENT_CONFIGS.architect.model;
+
 export const AGENTS = {
   ...AGENT_CONFIGS,
   junior: {
@@ -19,6 +22,7 @@ export const AGENTS = {
   },
   architect: {
     ...AGENT_CONFIGS.architect,
+    model: ARCHITECT_MODEL,
     endpoint: process.env.TRIFIX_ARCHITECT_ENDPOINT || ARCHITECT_ENDPOINT
   }
 };
@@ -26,9 +30,13 @@ export const AGENTS = {
 export const BLOCKED_NAMES = new Set([
   "node_modules",
   ".git",
+  ".trifix-backups",
   "dist",
   "build"
 ]);
+
+export const SANDBOX_FOLDER_NAME = "Sandbox folder";
+export const DEFAULT_SANDBOX_PROJECT_NAME = "TriFix AI Sandbox";
 
 export const ALLOWED_EXTENSIONS = new Set([
   ".js",

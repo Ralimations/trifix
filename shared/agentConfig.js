@@ -24,6 +24,7 @@ export const AGENT_CONFIGS = {
       idle: "Ready when you are.",
       thinking: "Let me try to understand this first...",
       speaking: "So this is what the code is doing...",
+      received: "Reviewing the feedback...",
       done: "I think that makes sense.",
       error: "I couldn't make sense of that yet."
     },
@@ -60,6 +61,7 @@ export const AGENT_CONFIGS = {
       idle: "Send it over.",
       thinking: "Reviewing your approach...",
       speaking: "There are some issues here.",
+      received: "Waiting on the revision...",
       done: "These need to be addressed.",
       error: "I can't review this properly yet."
     },
@@ -84,9 +86,9 @@ export const AGENT_CONFIGS = {
     color: "green",
     prompts: {
       system:
-        "Use the code and reviews to produce a clean fix. Output exactly two sections: FIXED_CODE and RECOMMENDATION. Keep code complete but minimal.",
+        'Use the code and reviews to produce a clean fix. Follow the requested section schema exactly. Keep replacement code complete but minimal. Put new files and projects under "Sandbox folder/".',
       output:
-        "Return the final fix, the decision, and the cleanest recommended approach."
+        "Return the final decision, affected files, proposed changes, patches, and the cleanest recommended approach."
     },
     speech: {
       prefix: "",
@@ -96,6 +98,7 @@ export const AGENT_CONFIGS = {
       idle: "Waiting to finalize the fix.",
       thinking: "Designing the proper solution...",
       speaking: "Here's how we fix this correctly.",
+      received: "Collecting the revised context...",
       done: "This is production-ready.",
       error: "I can't produce a clean fix from this yet."
     },

@@ -3,15 +3,30 @@ import path from "node:path";
 import {
   ALLOWED_EXTENSIONS,
   BLOCKED_NAMES,
+  DEFAULT_SANDBOX_PROJECT_NAME,
   MAX_FILE_SIZE_BYTES,
   MAX_SELECTED_FILES,
-  MAX_TREE_ENTRIES
+  MAX_TREE_ENTRIES,
+  SANDBOX_FOLDER_NAME
 } from "./constants.js";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
+const SANDBOX_BLOCKED_NAMES = new Set(["node_modules", ".git", ".trifix-backups"]);
+
+export async function buildDefaultSandboxProject(parentPath) {
+  if (!parentPath || typeof parentPath !== "string") {
+    throw new Error("Sandbox parent folder is missing.");
+  }
+
+  const root = path.join(parentPath, DEFAULT_SANDBOX_PROJECT_NAME);
+  await fs.mkdir(root, { recursive: true });
+  return buildProjectTree(root);
+}
 
 export async function buildProjectTree(rootPath) {
   const root = await normalizeRoot(rootPath);
+  const sandboxPath = path.join(root, SANDBOX_FOLDER_NAME);
+  await fs.mkdir(sandboxPath, { recursive: true });
   let entryCount = 0;
 
   async function walk(currentPath, relativePath = "", depth = 0) {
@@ -27,16 +42,18 @@ export async function buildProjectTree(rootPath) {
         break;
       }
 
-      if (isBlockedName(entry.name)) {
+      const childRelativePath = toProjectPath(path.join(relativePath, entry.name));
+      const inSandbox = isSandboxPath(childRelativePath);
+
+      if (isBlockedName(entry.name, inSandbox)) {
         continue;
       }
 
       const absolutePath = path.join(currentPath, entry.name);
-      const childRelativePath = toProjectPath(path.join(relativePath, entry.name));
 
       if (entry.isDirectory()) {
         const children = await walk(absolutePath, childRelativePath, depth + 1);
-        if (children.length > 0) {
+        if (children.length > 0 || childRelativePath === SANDBOX_FOLDER_NAME) {
           entryCount += 1;
           nodes.push({
             type: "directory",
@@ -48,7 +65,7 @@ export async function buildProjectTree(rootPath) {
         continue;
       }
 
-      if (!entry.isFile() || !isAllowedFile(entry.name)) {
+      if (!entry.isFile() || !isAllowedProjectFile(childRelativePath, entry.name)) {
         continue;
       }
 
@@ -70,9 +87,16 @@ export async function buildProjectTree(rootPath) {
     return nodes.sort(sortNodes);
   }
 
+  const tree = await walk(root);
+  const defaultSelectedFiles = [];
+  collectSelectableFiles(tree, defaultSelectedFiles, 6);
+
   return {
     rootPath: root,
-    tree: await walk(root),
+    sandboxPath,
+    sandboxRelativePath: SANDBOX_FOLDER_NAME,
+    tree,
+    defaultSelectedFiles,
     limits: {
       maxFileSizeBytes: MAX_FILE_SIZE_BYTES,
       maxSelectedFiles: MAX_SELECTED_FILES,
@@ -91,7 +115,7 @@ export async function readSelectedProjectFiles(rootPath, relativePaths) {
     const absolutePath = await resolveInsideRoot(root, relativePath);
     const baseName = path.basename(absolutePath);
 
-    if (isBlockedPath(relativePath) || !isAllowedFile(baseName)) {
+    if (isBlockedPath(relativePath) || !isAllowedProjectFile(relativePath, baseName)) {
       throw new Error(`Blocked or unsupported file: ${relativePath}`);
     }
 
@@ -120,6 +144,80 @@ export async function readSelectedProjectFiles(rootPath, relativePaths) {
   return files;
 }
 
+export async function previewFilePatches(rootPath, patches, allowedPaths = []) {
+  const root = await normalizeRoot(rootPath);
+  const previews = [];
+  const allowedSet = new Set((allowedPaths || []).map((value) => toProjectPath(value)));
+
+  for (const patch of patches || []) {
+    const requestedPath = toProjectPath(patch.path);
+    if (!requestedPath) {
+      continue;
+    }
+
+    const { targetPath, absolutePath, sandboxTarget, redirected } =
+      await resolvePatchWriteTarget(root, requestedPath, allowedSet);
+    const previous = await readExistingPatchTarget(absolutePath, targetPath, sandboxTarget);
+    const nextContent = String(patch.content || "");
+
+    previews.push({
+      path: targetPath,
+      requestedPath,
+      redirected,
+      diff: createDiffPreview(previous.content, nextContent),
+      previousSize: previous.content.length,
+      nextSize: nextContent.length,
+      created: previous.created
+    });
+  }
+
+  return previews;
+}
+
+export async function applyFilePatches(rootPath, patches, allowedPaths = []) {
+  const root = await normalizeRoot(rootPath);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupRoot = path.join(root, ".trifix-backups", timestamp);
+  const allowedSet = new Set((allowedPaths || []).map((value) => toProjectPath(value)));
+  const applied = [];
+
+  for (const patch of patches || []) {
+    const requestedPath = toProjectPath(patch.path);
+    if (!requestedPath) {
+      continue;
+    }
+
+    const { targetPath, absolutePath, sandboxTarget, redirected } =
+      await resolvePatchWriteTarget(root, requestedPath, allowedSet);
+    const previous = await readExistingPatchTarget(absolutePath, targetPath, sandboxTarget);
+    const backupPath = path.join(backupRoot, targetPath);
+
+    if (!previous.created) {
+      await fs.mkdir(path.dirname(backupPath), { recursive: true });
+      await fs.writeFile(backupPath, previous.content, "utf8");
+    }
+
+    if (sandboxTarget) {
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    }
+
+    await fs.writeFile(absolutePath, String(patch.content || ""), "utf8");
+
+    applied.push({
+      path: targetPath,
+      requestedPath,
+      redirected,
+      created: previous.created,
+      backupPath: previous.created ? "" : toProjectPath(path.relative(root, backupPath))
+    });
+  }
+
+  return {
+    backupRoot: applied.some((item) => !item.created) ? toProjectPath(path.relative(root, backupRoot)) : "",
+    applied
+  };
+}
+
 async function normalizeRoot(rootPath) {
   if (!rootPath || typeof rootPath !== "string") {
     throw new Error("Project folder is missing.");
@@ -140,15 +238,21 @@ async function resolveInsideRoot(root, relativePath) {
     throw new Error("File path is missing.");
   }
 
+  const targetRelativePath = toProjectPath(relativePath);
+
   if (path.isAbsolute(relativePath)) {
     throw new Error("Absolute paths are not allowed.");
   }
 
-  if (isBlockedPath(relativePath)) {
-    throw new Error(`Blocked path: ${relativePath}`);
+  if (targetRelativePath.split("/").includes("..")) {
+    throw new Error(`Path traversal is not allowed: ${relativePath}`);
   }
 
-  const target = path.resolve(root, relativePath);
+  if (isBlockedPath(targetRelativePath)) {
+    throw new Error(`Blocked path: ${targetRelativePath}`);
+  }
+
+  const target = path.resolve(root, targetRelativePath);
   const normalizedRoot = path.normalize(root);
   const relativeFromRoot = path.relative(normalizedRoot, target);
 
@@ -157,7 +261,7 @@ async function resolveInsideRoot(root, relativePath) {
     path.isAbsolute(relativeFromRoot) ||
     relativeFromRoot === ""
   ) {
-    throw new Error(`Path escapes the project folder: ${relativePath}`);
+    throw new Error(`Path escapes the project folder: ${targetRelativePath}`);
   }
 
   return target;
@@ -167,14 +271,111 @@ function isAllowedFile(fileName) {
   return ALLOWED_EXTENSIONS.has(path.extname(fileName).toLowerCase());
 }
 
-function isBlockedName(name) {
-  return BLOCKED_NAMES.has(name) || name === ".env" || name.startsWith(".env.");
+function isAllowedProjectFile(relativePath, fileName) {
+  return isSandboxPath(relativePath) || isAllowedFile(fileName);
+}
+
+function isBlockedName(name, inSandbox = false) {
+  const blockedNames = inSandbox ? SANDBOX_BLOCKED_NAMES : BLOCKED_NAMES;
+  return blockedNames.has(name) || name === ".env" || name.startsWith(".env.");
 }
 
 function isBlockedPath(relativePath) {
-  return toProjectPath(relativePath)
-    .split("/")
-    .some((part) => isBlockedName(part));
+  const targetPath = toProjectPath(relativePath);
+  const inSandbox = isSandboxPath(targetPath);
+  return targetPath.split("/").some((part) => isBlockedName(part, inSandbox));
+}
+
+function isSandboxPath(relativePath) {
+  const firstPart = toProjectPath(relativePath).split("/")[0] || "";
+  return firstPart.toLowerCase() === SANDBOX_FOLDER_NAME.toLowerCase();
+}
+
+function isAllowedPatchTarget(targetPath, allowedSet) {
+  if (allowedSet.size === 0 || allowedSet.has(targetPath)) {
+    return true;
+  }
+
+  if (!isSandboxPath(targetPath)) {
+    return false;
+  }
+
+  for (const allowedPath of allowedSet) {
+    if (targetPath.startsWith(`${allowedPath}/`)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function resolvePatchWriteTarget(root, requestedPath, allowedSet) {
+  if (!isAllowedPatchTarget(requestedPath, allowedSet)) {
+    throw new Error(`Patch target is not listed in affectedFiles: ${requestedPath}`);
+  }
+
+  const requestedAbsolutePath = await resolveInsideRoot(root, requestedPath);
+  const requestedSandboxTarget = isSandboxPath(requestedPath);
+
+  if (requestedSandboxTarget || (await fileExists(requestedAbsolutePath))) {
+    return {
+      targetPath: requestedPath,
+      absolutePath: requestedAbsolutePath,
+      sandboxTarget: requestedSandboxTarget,
+      redirected: false
+    };
+  }
+
+  const sandboxPath = toProjectPath(path.join(SANDBOX_FOLDER_NAME, requestedPath));
+
+  return {
+    targetPath: sandboxPath,
+    absolutePath: await resolveInsideRoot(root, sandboxPath),
+    sandboxTarget: true,
+    redirected: true
+  };
+}
+
+async function fileExists(absolutePath) {
+  try {
+    const stat = await fs.stat(absolutePath);
+    return stat.isFile();
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+async function readExistingPatchTarget(absolutePath, relativePath, allowCreate) {
+  try {
+    const stat = await fs.stat(absolutePath);
+    if (!stat.isFile()) {
+      throw new Error(`Patch target is not a file: ${relativePath}`);
+    }
+
+    return {
+      content: await fs.readFile(absolutePath, "utf8"),
+      created: false
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT" && allowCreate) {
+      return {
+        content: "",
+        created: true
+      };
+    }
+
+    if (error?.code === "ENOENT") {
+      throw new Error(
+        `Patch target does not exist outside ${SANDBOX_FOLDER_NAME}: ${relativePath}`
+      );
+    }
+
+    throw error;
+  }
 }
 
 function sortNodes(a, b) {
@@ -186,5 +387,65 @@ function sortNodes(a, b) {
 }
 
 function toProjectPath(value) {
-  return String(value).replaceAll("\\", "/");
+  return String(value)
+    .trim()
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+}
+
+function collectSelectableFiles(nodes, output, limit) {
+  for (const node of nodes || []) {
+    if (output.length >= limit) {
+      return;
+    }
+
+    if (node.type === "file" && node.selectable) {
+      output.push(node.path);
+      continue;
+    }
+
+    if (node.children) {
+      collectSelectableFiles(node.children, output, limit);
+    }
+  }
+}
+
+function createDiffPreview(previousContent, nextContent) {
+  const before = String(previousContent || "").split(/\r?\n/);
+  const after = String(nextContent || "").split(/\r?\n/);
+  const preview = [];
+  const maxLines = Math.max(before.length, after.length);
+
+  for (let index = 0; index < maxLines; index += 1) {
+    const oldLine = before[index];
+    const newLine = after[index];
+
+    if (oldLine === newLine) {
+      if (preview.length < 120) {
+        preview.push(`  ${oldLine ?? ""}`);
+      }
+      continue;
+    }
+
+    if (typeof oldLine !== "undefined") {
+      preview.push(`- ${oldLine}`);
+    }
+
+    if (typeof newLine !== "undefined") {
+      preview.push(`+ ${newLine}`);
+    }
+
+    if (preview.length >= 120) {
+      break;
+    }
+  }
+
+  if (preview.length === 0) {
+    return "No textual changes detected.";
+  }
+
+  return preview.slice(0, 120).join("\n");
 }
