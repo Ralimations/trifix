@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld("trifix", {
   openTrackedProject: (entry) => ipcRenderer.invoke("project:open-tracked", entry),
   openFolderPath: (folderPath) => ipcRenderer.invoke("project:open-folder", folderPath),
   refreshProject: (rootPath) => ipcRenderer.invoke("project:refresh", rootPath),
+  uploadProjectContext: (payload) => ipcRenderer.invoke("project:context-upload", payload),
+  runProjectCommand: (payload) => ipcRenderer.invoke("project:command", payload),
   runPipeline: (payload) => ipcRenderer.invoke("pipeline:run", payload),
   getLastResult: () => ipcRenderer.invoke("pipeline:last"),
   getSettings: () => ipcRenderer.invoke("app:settings"),

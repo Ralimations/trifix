@@ -235,6 +235,7 @@ h2 {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .office-stage {
@@ -863,6 +864,7 @@ select:focus {
 .workflow-meta {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
   color: #93a0b5;
   font-size: 12px;
 }
@@ -1022,6 +1024,62 @@ select:focus {
   font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   font-size: 12px;
   line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.context-doc-list,
+.command-log-list,
+.section-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.context-doc-list {
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(8, 12, 18, 0.48);
+}
+
+.context-doc-list strong,
+.section-list h3,
+.command-log-card strong {
+  color: #f0f5fc;
+  font-size: 13px;
+}
+
+.context-doc-list span {
+  color: #aeb8c9;
+  font-size: 12px;
+}
+
+.section-list ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #d1dae8;
+}
+
+.section-list li {
+  margin-bottom: 6px;
+}
+
+.command-log-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(8, 12, 18, 0.72);
+}
+
+.command-log-card span {
+  color: #93a0b5;
+  font-size: 12px;
+}
+
+.command-log-card pre {
+  max-height: 260px;
   white-space: pre-wrap;
 }
 

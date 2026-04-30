@@ -1,11 +1,11 @@
-# TriFix AI: Tiny Office Mode
+# TriFix AI V2: Software Team Simulator
 
-Desktop developer tool for running a three-agent code review and repair pass against a local snippet or selected project files.
+Desktop developer tool that simulates a small AI software team around a local project or task sandbox.
 
 ## Stack
 
-- Electron main process for filesystem access, IPC, and AI calls
-- Vite + React renderer for the Tiny Office UI
+- Electron main process for filesystem access, IPC, local metadata, context upload, and safe commands
+- Vite + React renderer for the team UI, speech bubbles, project tracking, and decision flow
 - Local-only file reads through a restricted preload API
 
 ## Setup
@@ -15,13 +15,13 @@ npm install
 npm run dev
 ```
 
-Junior and Supervisor use the VPN endpoint:
+DEV and QA use the VPN endpoint:
 
 ```text
 POST http://10.8.0.3:3011/api/v1/chat
 ```
 
-Architect uses:
+PROJECT MANAGER uses:
 
 ```text
 POST http://localhost:3010/api/v1/chat
@@ -43,55 +43,89 @@ npm run build
 npm start
 ```
 
-## Folder Structure
+## V2 Workflow
+
+TriFix keeps the existing three-agent architecture but repurposes the roles:
+
+1. PROJECT MANAGER: reads uploaded FSD/docs/image metadata, creates PRD, defines phases and tasks, and makes final scope decisions.
+2. QA: converts PM direction into DEV steps, reviews implementation output, checks PRD alignment, and reports risks.
+3. DEV: implements the task, returns patches, and requests safe project commands when needed.
+
+The loop is:
 
 ```text
-electron/
-  agent/orchestrator.js  AI pipeline, prompt compaction, timeout/error handling
-  constants.js           endpoint, models, file limits
-  fileSystem.js          safe project tree and selected file reads
-  main.js                Electron window and IPC
-  preload.cjs            narrow renderer API
-src/
-  App.jsx                Tiny Office UI and state
-  main.jsx               React entry
-  styles.css             dashboard styling and status animation
-scripts/
-  dev.mjs                starts Vite then Electron
+PM -> QA -> DEV -> QA -> PM
 ```
+
+Each run can produce:
+
+- PRD goals, features, constraints
+- phase and task tracking
+- QA instructions and review
+- DEV implementation patches
+- PM final decision
+- command requests and command logs
+
+## Context Input
+
+The UI can upload:
+
+- `.pdf`
+- `.txt`
+- `.md`
+- `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`
+
+TriFix summarizes uploaded context before it is sent to the agents. Images are stored as design context metadata; local OCR is not performed.
+
+## Command Controls
+
+The renderer exposes explicit user controls:
+
+- Run Project
+- Debug Project
+- Add Instruction
+
+Commands run only inside the current project folder. Supported commands include:
+
+- `npm install`
+- `npm run dev`
+- `npm run build`
+- `npm test`
+- `node <file>`
+- `python <file>`
+- `mkdir <folder>`
+
+Dangerous shell syntax, path traversal, external script pipes, and destructive system commands are blocked.
 
 ## File Access Rules
 
 Blocked names: `node_modules`, `.git`, `.env`, `.env.*`, `dist`, `build`.
 
-Allowed extensions: `.js`, `.ts`, `.jsx`, `.tsx`, `.json`, `.css`, `.html`, `.md`, `.cpp`, `.h`, `.hpp`, `.py`, `.sql`.
+Allowed extensions: `.js`, `.ts`, `.jsx`, `.tsx`, `.json`, `.css`, `.html`, `.md`, `.txt`, `.pdf`, images, `.cpp`, `.h`, `.hpp`, `.py`, `.sql`.
 
 The Electron main process rejects absolute selected paths, path traversal, blocked directories/files, unsupported extensions, files above 180 KB, and selections above 10 files.
 
-When a project is opened, TriFix creates `Sandbox folder/` at the project root. AI patches may create new files and nested folders inside that sandbox, including complete throwaway projects such as `Sandbox folder/example-app/package.json`. Outside `Sandbox folder/`, patches must target existing project files. The sandbox still blocks `.git`, `.env`, `.env.*`, `.trifix-backups`, and `node_modules`.
+When a project is opened, TriFix creates `Sandbox folder/` at the project root. AI patches may create new files and nested folders inside that sandbox. Outside `Sandbox folder/`, patches must target existing project files.
 
-If a user runs a prompt without opening a project, TriFix automatically creates and opens `Documents/TriFix AI Sandbox/`, then uses `Documents/TriFix AI Sandbox/Sandbox folder/` as the writable AI sandbox.
+Prompt-only runs create a task sandbox under:
 
-## Pipeline
+```text
+Documents/TriFix AI Sandbox/sandbox/tasks/task-YYYYMMDD-HHMMSS/
+```
 
-1. YOU (`r` / Junior Dev): `google/gemma-4-e2b`
-2. SUPERVISOR (`j`): `gemma-4-e4b-uncensored-hauhaucs-aggressive`
-3. ARCHITECT (`a`): `google/gemma-4-e4b`
+## Folder Structure
 
-## Agent Config
+```text
+electron/
+  agent/orchestrator.js  V2 PM/QA/DEV pipeline and prompt compaction
+  constants.js           endpoint, models, file limits
+  fileSystem.js          safe project tree, file reads, patch preview/apply
+  main.cjs               Electron window, IPC, context upload, safe commands
+  preload.cjs            narrow renderer API
+src/
+  App.jsx                Software team UI and state
+  main.jsx               React entry
+  styles.css             dashboard styling and status animation
+```
 
 Agent names, roles, prompt instructions, speech habits, and sprite paths live in [shared/agentConfig.js](</d:/ralskunk/trifix/shared/agentConfig.js>).
-
-Example: the supervisor is configured with `speech.prefix = "Bai"`, and that habit is injected into the system prompt during orchestration.
-
-Each run returns:
-
-```json
-{
-  "explanation": "",
-  "critique": "",
-  "fixedCode": "",
-  "recommendation": "",
-  "filesAnalyzed": []
-}
-```

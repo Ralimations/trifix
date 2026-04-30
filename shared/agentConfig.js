@@ -2,19 +2,19 @@ export const AGENT_CONFIGS = {
   junior: {
     id: "junior",
     key: "r",
-    name: "Junior",
-    title: "Junior Dev",
-    roleLabel: "r / Junior (me)",
-    summary: "tries to understand / explain code",
+    name: "DEV",
+    title: "Developer",
+    roleLabel: "dev / implementation",
+    summary: "implements tasks, writes patches, and runs commands",
     endpoint: "http://10.8.0.3:3011/api/v1/chat",
     model: "google/gemma-4-e2b",
-    timeoutMs: 45000,
+    timeoutMs: 120000,
     color: "blue",
     prompts: {
       system:
-        "Explain the code or error simply for a developer. Be concise. Mention likely intent and failure point.",
+        "You are the DEV in an AI software team. Execute QA instructions, write implementation patches, request safe sandbox commands only when needed, and keep output public and concise.",
       output:
-        "Explain what the code is doing, what likely went wrong, and what the developer should notice first."
+        "Return implementation notes, affected files, command requests if needed, and complete replacement patches. Do not manage scope or PRD decisions."
     },
     speech: {
       prefix: "",
@@ -22,9 +22,9 @@ export const AGENT_CONFIGS = {
     },
     dialogue: {
       idle: "Ready when you are.",
-      thinking: "Let me try to understand this first...",
-      speaking: "So this is what the code is doing...",
-      coding: "I'm shaping the fix now...",
+      thinking: "Reading the task instructions...",
+      speaking: "I'm implementing the task now.",
+      coding: "I'm writing the feature...",
       installing: "Installing what this task needs...",
       unpacking: "Checking what's inside the workspace...",
       testing: "Running the checks...",
@@ -44,28 +44,28 @@ export const AGENT_CONFIGS = {
   supervisor: {
     id: "supervisor",
     key: "j",
-    name: "SUPERVISOR",
-    title: "Supervisor",
-    roleLabel: "j",
-    summary: "reviews, critiques, points out issues",
+    name: "QA",
+    title: "Quality Assurance",
+    roleLabel: "qa / review + testing",
+    summary: "reviews DEV work, checks PRD alignment, and reports risks",
     endpoint: "http://10.8.0.3:3011/api/v1/chat",
     model: "gemma-4-e4b-uncensored-hauhaucs-aggressive",
-    timeoutMs: 45000,
+    timeoutMs: 90000,
     color: "red",
     prompts: {
       system:
-        'Review the code critically. Find bugs, risks, bad practices, edge cases, and test gaps. Start with "Bai" when it fits naturally. Be concise and specific.',
+        "You are QA in an AI software team. Convert PM direction into actionable DEV steps, review implementation output, identify bugs, test gaps, and PRD/FSD alignment issues. Be concise and specific.",
       output:
-        "Point out concrete issues, risks, and what should be fixed first."
+        "Return DEV instructions or QA review notes with concrete risks, tests, and PM-facing status."
     },
     speech: {
       prefix: "Bai",
       habit: 'Often opens with "Bai" before the critique.'
     },
     dialogue: {
-      idle: "Send it over.",
-      thinking: "Reviewing your approach...",
-      speaking: "There are some issues here.",
+      idle: "Ready to review.",
+      thinking: "Checking alignment with the PRD...",
+      speaking: "Here's the QA pass.",
       coding: "I'm tightening the changes...",
       installing: "Dependencies are going in...",
       unpacking: "Inspecting the task files...",
@@ -86,29 +86,29 @@ export const AGENT_CONFIGS = {
   architect: {
     id: "architect",
     key: "a",
-    name: "ARCHITECT",
-    title: "Architect",
-    roleLabel: "a",
-    summary: "final fix, decision, clean solution",
+    name: "PROJECT MANAGER",
+    title: "Project Manager",
+    roleLabel: "pm / planning + alignment",
+    summary: "owns the PRD, phase plan, scope, and final alignment",
     endpoint: "http://localhost:3010/api/v1/chat",
     model: "google/gemma-4-e4b",
     timeoutMs: 300000,
     color: "green",
     prompts: {
       system:
-        'Use the code and reviews to produce a clean fix. Follow the requested section schema exactly. Keep replacement code complete but minimal. Put new files and projects under "Sandbox folder/".',
+        "You are the PROJECT MANAGER in an AI software team. Read FSD/document context, create and maintain the PRD, define phases and tasks, align QA, and make final scope decisions. Do not output raw implementation code.",
       output:
-        "Return the final decision, affected files, proposed changes, patches, and the cleanest recommended approach."
+        "Return structured PM instructions, PRD goals, phases, tasks, constraints, and final decision summaries. No raw code."
     },
     speech: {
       prefix: "",
       habit: "Focuses on final decisions and cleaner implementation shape."
     },
     dialogue: {
-      idle: "Waiting to finalize the fix.",
-      thinking: "Designing the proper solution...",
-      speaking: "Here's how we fix this correctly.",
-      coding: "I'm coding the final fix now...",
+      idle: "Ready to plan the work.",
+      thinking: "Aligning the plan with the PRD...",
+      speaking: "Here's the project direction.",
+      coding: "Structuring the implementation plan...",
       installing: "Preparing the environment...",
       unpacking: "Reviewing the sandbox contents...",
       testing: "Validating the final output...",
@@ -127,4 +127,4 @@ export const AGENT_CONFIGS = {
   }
 };
 
-export const AGENT_ORDER = ["junior", "supervisor", "architect"];
+export const AGENT_ORDER = ["architect", "supervisor", "junior"];

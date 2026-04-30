@@ -12,6 +12,7 @@ import {
 
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 const SANDBOX_BLOCKED_NAMES = new Set(["node_modules", ".git", ".trifix-backups"]);
+const BINARY_CONTEXT_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 
 export async function buildDefaultSandboxProject(parentPath) {
   if (!parentPath || typeof parentPath !== "string") {
@@ -145,16 +146,27 @@ export async function readSelectedProjectFiles(rootPath, relativePaths) {
       );
     }
 
+    const extension = path.extname(baseName).toLowerCase();
     const buffer = await fs.readFile(absolutePath);
     files.push({
       path: toProjectPath(relativePath),
       size: stat.size,
-      extension: path.extname(baseName).toLowerCase(),
-      content: textDecoder.decode(buffer)
+      extension,
+      content: BINARY_CONTEXT_EXTENSIONS.has(extension)
+        ? summarizeBinaryContextFile(relativePath, extension, stat.size)
+        : textDecoder.decode(buffer)
     });
   }
 
   return files;
+}
+
+function summarizeBinaryContextFile(relativePath, extension, size) {
+  if (extension === ".pdf") {
+    return `PDF document selected as project context: ${relativePath} (${size} bytes). Use uploaded document summary or filename-level context; do not assume full PDF text is available from file selection.`;
+  }
+
+  return `Image/design file selected as project context: ${relativePath} (${size} bytes). Use uploaded image metadata and user notes; local OCR is not available.`;
 }
 
 export async function previewFilePatches(rootPath, patches, allowedPaths = []) {

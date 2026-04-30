@@ -7,10 +7,12 @@ import {
   ChevronRight,
   Code2,
   FileCode2,
+  FilePlus2,
   FolderOpen,
   History,
   Loader2,
   Play,
+  Bug,
   RefreshCw,
   Settings,
   Sparkles,
@@ -38,7 +40,7 @@ const PUNCTUATION_PAUSE = 550;
 const MESSAGE_GAP = 800;
 const STAGE_DELAY = MESSAGE_GAP;
 const SCENE_DELAY = 850;
-const OUTPUT_TABS = ["junior", "supervisor", "architect", "decision"];
+const OUTPUT_TABS = ["architect", "supervisor", "junior", "prd", "tasks", "logs", "decision"];
 const AGENT_STATUS_KEYS = [
   "idle",
   "thinking",
@@ -53,12 +55,12 @@ const AGENT_STATUS_KEYS = [
   "received"
 ];
 const JUNIOR_REACTION_MESSAGES = [
-  "Got it, reviewing your changes...",
-  "Ah, I see the issue now.",
-  "Updating based on your feedback."
+  "Got it. I'll adjust the implementation.",
+  "I see the QA issue now.",
+  "Updating based on the review."
 ];
 const DENY_SCENE_MESSAGES = [
-  { from: "junior", to: "team", role: "recovery", message: "I missed something. I'll re-check the issue." },
+  { from: "junior", to: "team", role: "recovery", message: "I missed something. I'll re-check the implementation." },
   {
     from: "supervisor",
     to: "team",
@@ -69,7 +71,7 @@ const DENY_SCENE_MESSAGES = [
     from: "architect",
     to: "team",
     role: "recovery",
-    message: "We'll revise the approach and rerun the cycle."
+    message: "I'll adjust scope and rerun the phase."
   }
 ];
 const SUCCESS_SCENE_MESSAGE = "Good job team!";
@@ -101,31 +103,31 @@ const phraseBank = {
     ]
   },
   junior: {
-    idle: ["Am I doing this right?", "I think I almost got it...", "Please don't crash..."],
+    idle: ["Ready to implement.", "I can wire that up.", "Please don't crash..."],
     thinkingSolo: [
       "Hmm...",
-      "I should ask AI... wait, I am AI.",
+      "Checking the task scope.",
       "This looks familiar. Suspiciously familiar.",
       "Maybe the bug is scared of me."
     ],
     askingHelp: [
-      "Sir, do I do it like this?",
-      "Can someone check my logic later?",
-      "I think I found something. Maybe."
+      "QA, can you check this later?",
+      "I think the implementation path is clear.",
+      "PM scope noted."
     ],
     coding: ["I'm coding carefully... probably.", "Typing fixes with confidence I borrowed."],
     waiting: ["Holding here...", "Waiting on the next clue."]
   },
   supervisor: {
-    idle: ["Reviewing... always reviewing.", "Let's keep it clean.", "This could be better."],
-    thinkingSolo: ["Let me review that.", "Something smells off here.", "Checking the junior's work..."],
+    idle: ["Review queue is open.", "Let's keep it aligned.", "This needs a test plan."],
+    thinkingSolo: ["Let me review that.", "Checking PRD alignment.", "Reviewing DEV output..."],
     replyToJunior: ["Yeah, I'll check it later.", "Send it over.", "Not bad. Needs review.", "Hold on, I'm looking."],
     coding: ["Cleaning this up.", "Making it less fragile."],
     waiting: ["Waiting, but critically.", "Still reviewing from afar."]
   },
   architect: {
-    idle: ["Thinking about scalability...", "We need a cleaner design.", "This needs structure."],
-    thinkingSolo: ["Looking at the bigger picture.", "The structure needs discipline.", "Final decision pending."],
+    idle: ["Scope is ready.", "We need a clean PRD.", "This needs structure."],
+    thinkingSolo: ["Looking at the bigger picture.", "Aligning phases.", "Final decision pending."],
     encouragement: ["You guys can do it.", "Good teamwork so far.", "Keep going. Almost there.", "Let's make this production-ready."],
     coding: ["Shaping the final form.", "Trying not to overengineer this."],
     waiting: ["Waiting for the right moment.", "Holding the final call."]
@@ -134,13 +136,14 @@ const phraseBank = {
 
 export function App() {
   const [activeView, setActiveView] = useState("office");
-  const [activeTab, setActiveTab] = useState("junior");
+  const [activeTab, setActiveTab] = useState("architect");
   const [agentCatalog, setAgentCatalog] = useState(INITIAL_AGENTS);
   const [agents, setAgents] = useState(INITIAL_AGENTS);
   const [agentNames, setAgentNames] = useState(() => loadAgentNames());
   const [project, setProject] = useState(null);
   const [resultProject, setResultProject] = useState(null);
   const [selectedFiles, setSelectedFiles] = useState([]);
+  const [contextDocuments, setContextDocuments] = useState([]);
   const [codeInput, setCodeInput] = useState("");
   const [language, setLanguage] = useState("auto");
   const [result, setResult] = useState(null);
@@ -153,8 +156,15 @@ export function App() {
     contextReady: false,
     currentStage: "idle",
     loopCount: 0,
-    decisionStatus: "pending"
+    decisionStatus: "pending",
+    currentPhase: "",
+    currentTask: "",
+    iterationCount: 0,
+    projectStatus: "Not started",
+    commandStatus: "idle"
   });
+  const [commandLog, setCommandLog] = useState([]);
+  const [isCommandRunning, setIsCommandRunning] = useState(false);
   const [scene, setScene] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [messageQueue, setMessageQueue] = useState([]);
@@ -179,7 +189,7 @@ export function App() {
   const selectedFileSet = useMemo(() => new Set(selectedFiles), [selectedFiles]);
   const canRun =
     !isRunning &&
-    (codeInput.trim().length > 0 || selectedFiles.length > 0);
+    (codeInput.trim().length > 0 || selectedFiles.length > 0 || contextDocuments.length > 0);
   const messageByAgent = getAgentMessageMap(activeMessage, visibleBubble);
   const agentNameMap = useMemo(() => buildAgentNameMap(agents, agentNames), [agents, agentNames]);
 
@@ -367,7 +377,7 @@ export function App() {
       return;
     }
 
-    const stageKey = `${progress.runId}:${progress.agent}`;
+    const stageKey = `${progress.runId}:${progress.agent}:${progress.stage || progress.status}`;
     if (stageMessageKeysRef.current.has(stageKey)) {
       return;
     }
@@ -563,6 +573,8 @@ export function App() {
     setProject(openedProject);
     setResultProject(null);
     setSelectedFiles(defaults);
+    setContextDocuments(openedProject.fsd?.documents || []);
+    setCommandLog(openedProject.commandHistory || []);
     setDecisionPreview([]);
     setDecisionMessage("");
     setWorkflow((current) => ({
@@ -583,6 +595,8 @@ export function App() {
     const refreshed = await window.trifix.refreshProject(project.rootPath);
     const defaults = refreshed.defaultSelectedFiles || [];
     setProject(refreshed);
+    setContextDocuments(refreshed.fsd?.documents || contextDocuments);
+    setCommandLog(refreshed.commandHistory || commandLog);
     setSelectedFiles((paths) => {
       const next = paths.filter((path) => hasPath(refreshed.tree, path));
       return next.length > 0 ? next : defaults;
@@ -607,6 +621,124 @@ export function App() {
       }
 
       return currentFiles.filter((item) => item !== path);
+    });
+  }
+
+  async function uploadContextDocuments() {
+    setError("");
+    try {
+      let targetProject = project;
+      if (!targetProject?.rootPath) {
+        targetProject = await window.trifix.openSandboxProject();
+        setProject(targetProject);
+        setActiveView("office");
+      }
+
+      const documents = await window.trifix.uploadProjectContext({
+        projectRoot: targetProject.rootPath,
+        projectId: targetProject.projectId
+      });
+      if (!documents?.length) {
+        return;
+      }
+
+      setContextDocuments((current) => [...current, ...documents].slice(-16));
+      setWorkflow((current) => ({
+        ...current,
+        folderLoaded: true,
+        contextReady: true,
+        currentStage: "context-ready",
+        currentPhase: current.currentPhase || "Planning",
+        currentTask: "PM context review",
+        projectStatus: "Context loaded"
+      }));
+      await refreshTrackedProjects();
+    } catch (uploadError) {
+      setError(uploadError?.message || "Could not upload project context.");
+    }
+  }
+
+  async function runProjectControl(mode) {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath) {
+      setDecisionMessage("Open or create a project before running commands.");
+      return;
+    }
+
+    setIsCommandRunning(true);
+    setWorkflow((current) => ({
+      ...current,
+      commandStatus: mode === "debug" ? "debugging" : "running",
+      projectStatus: mode === "debug" ? "Debugging" : "Running"
+    }));
+    enqueueAgentMessage({
+      from: mode === "debug" ? "supervisor" : "junior",
+      to: "team",
+      text: mode === "debug" ? "Running checks and collecting errors." : "Starting the project command.",
+      message: mode === "debug" ? "Running checks and collecting errors." : "Starting the project command.",
+      type: "status",
+      priority: "high",
+      restoreState: mode === "debug" ? "testing" : "waiting"
+    });
+
+    try {
+      const entry = await window.trifix.runProjectCommand({
+        projectRoot: targetProject.rootPath,
+        projectId: targetProject.projectId,
+        mode
+      });
+      setCommandLog((current) => [...current, entry].slice(-30));
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: entry.status,
+        projectStatus: entry.status === "passed" ? "Command passed" : "Command failed"
+      }));
+      setDecisionMessage(`${entry.command} ${entry.status}.`);
+      if (mode === "debug" && entry.status !== "passed") {
+        setCodeInput((current) =>
+          [
+            current,
+            "",
+            "DEBUG_OUTPUT:",
+            entry.output
+          ].filter(Boolean).join("\n")
+        );
+      }
+      await refreshTrackedProjects();
+    } catch (commandError) {
+      setDecisionMessage(commandError?.message || "Command failed.");
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: "error",
+        projectStatus: "Command failed"
+      }));
+    } finally {
+      setIsCommandRunning(false);
+    }
+  }
+
+  function addInstruction() {
+    const instruction = window.prompt("Add instruction for the Project Manager");
+    if (!instruction?.trim()) {
+      return;
+    }
+
+    setCodeInput((current) =>
+      [
+        current,
+        "",
+        "PM_ADDED_INSTRUCTION:",
+        instruction.trim()
+      ].filter(Boolean).join("\n")
+    );
+    enqueueAgentMessage({
+      from: "architect",
+      to: "supervisor",
+      text: "New instruction received. I'll adjust the scope.",
+      message: "New instruction received. I'll adjust the scope.",
+      type: "status",
+      priority: "high",
+      restoreState: "thinking"
     });
   }
 
@@ -645,10 +777,11 @@ export function App() {
         typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
       currentRunRef.current = runId;
       setResultProject(runProject);
+      setContextDocuments((current) => current.length > 0 ? current : runProject?.fsd?.documents || []);
 
       setDecisionMessage("");
       setDecisionPreview([]);
-      setActiveTab("junior");
+      setActiveTab("architect");
       setResult(null);
       setChatMessages([]);
       setMessageQueue([]);
@@ -659,9 +792,14 @@ export function App() {
       setWorkflow((current) => ({
         ...current,
         contextReady: true,
-        currentStage: "junior",
+        currentStage: "pm-plan",
         loopCount: nextLoopCount,
-        decisionStatus: "pending"
+        decisionStatus: "pending",
+        currentPhase: "Planning",
+        currentTask: "PM scoping",
+        iterationCount: nextLoopCount,
+        projectStatus: "In progress",
+        commandStatus: "idle"
       }));
 
       const nextResult = await window.trifix.runPipeline({
@@ -673,6 +811,11 @@ export function App() {
         projectName: runProject?.name || runProject?.rootPath?.split(/[\\/]/).pop(),
         projectType: runProject?.projectType,
         selectedFiles: runSelectedFiles,
+        contextDocuments,
+        fsd: {
+          documents: contextDocuments,
+          summary: contextDocuments.map((doc) => `${doc.name}: ${doc.summary}`).join("\n")
+        },
         feedback,
         loopCount: nextLoopCount
       });
@@ -883,6 +1026,8 @@ export function App() {
       const sandboxProject = await window.trifix.openSandboxProject();
       setProject(sandboxProject);
       setResultProject(null);
+      setContextDocuments([]);
+      setCommandLog([]);
       setWorkflow((current) => ({
         ...current,
         folderLoaded: true,
@@ -903,6 +1048,8 @@ export function App() {
       setProject(reopened);
       setResultProject(null);
       setSelectedFiles(reopened.defaultSelectedFiles || []);
+      setContextDocuments(reopened.fsd?.documents || []);
+      setCommandLog(reopened.commandHistory || []);
       setWorkflow((current) => ({
         ...current,
         folderLoaded: true,
@@ -931,6 +1078,8 @@ export function App() {
     setDecisionReason("");
     setDecisionPreview([]);
     setDecisionMessage("");
+    setContextDocuments([]);
+    setCommandLog([]);
     setScene(null);
     resetSpeechRuntime();
     setCodeInput("");
@@ -940,7 +1089,12 @@ export function App() {
       contextReady: false,
       currentStage: "idle",
       loopCount: 0,
-      decisionStatus: "pending"
+      decisionStatus: "pending",
+      currentPhase: "",
+      currentTask: "",
+      iterationCount: 0,
+      projectStatus: "Not started",
+      commandStatus: "idle"
     });
     if (clearProjectSelection) {
       setSelectedFiles([]);
@@ -1011,7 +1165,7 @@ export function App() {
           </div>
           <div>
             <strong>TriFix AI</strong>
-            <span>Tiny Office</span>
+            <span>Software Team V2</span>
           </div>
         </div>
 
@@ -1060,6 +1214,8 @@ export function App() {
             agents={agents}
             agentNameMap={agentNameMap}
             project={project}
+            contextDocuments={contextDocuments}
+            commandLog={commandLog}
             selectedFiles={selectedFiles}
             selectedFileSet={selectedFileSet}
             codeInput={codeInput}
@@ -1081,10 +1237,15 @@ export function App() {
             messageByAgent={messageByAgent}
             onOpenProject={openProject}
             onRefreshProject={refreshProject}
+            onUploadContext={uploadContextDocuments}
             onToggleFile={toggleFile}
             onCodeInput={setCodeInput}
             onLanguage={setLanguage}
             onRun={() => runOffice(workflow.loopCount, "")}
+            onRunProject={() => runProjectControl("run")}
+            onDebugProject={() => runProjectControl("debug")}
+            onAddInstruction={addInstruction}
+            isCommandRunning={isCommandRunning}
             onTabChange={setActiveTab}
             onDecisionReason={setDecisionReason}
             onAccept={acceptDecision}
@@ -1135,6 +1296,8 @@ function OfficeView({
   agents,
   agentNameMap,
   project,
+  contextDocuments,
+  commandLog = [],
   selectedFiles,
   selectedFileSet,
   codeInput,
@@ -1156,10 +1319,15 @@ function OfficeView({
   messageByAgent,
   onOpenProject,
   onRefreshProject,
+  onUploadContext,
   onToggleFile,
   onCodeInput,
   onLanguage,
   onRun,
+  onRunProject,
+  onDebugProject,
+  onAddInstruction,
+  isCommandRunning,
   onTabChange,
   onDecisionReason,
   onAccept,
@@ -1177,13 +1345,27 @@ function OfficeView({
     <>
       <header className="workspace-header">
         <div>
-          <p className="eyebrow">Tiny Office</p>
-          <h1>Three AI developers, one compact review pass.</h1>
+          <p className="eyebrow">AI Software Team Simulator V2</p>
+          <h1>PM, QA, and DEV working through one software workflow.</h1>
         </div>
-        <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
-          {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
-          Run Pipeline
-        </button>
+        <div className="button-row">
+          <button className="secondary-button" type="button" onClick={onRunProject} disabled={isCommandRunning || !project?.rootPath}>
+            {isCommandRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+            Run Project
+          </button>
+          <button className="secondary-button" type="button" onClick={onDebugProject} disabled={isCommandRunning || !project?.rootPath}>
+            <Bug size={18} />
+            Debug Project
+          </button>
+          <button className="secondary-button" type="button" onClick={onAddInstruction}>
+            <FilePlus2 size={18} />
+            Add Instruction
+          </button>
+          <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
+            {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+            Run Team
+          </button>
+        </div>
       </header>
 
       <section className="office-stage" aria-label="Developer agents">
@@ -1209,11 +1391,11 @@ function OfficeView({
 
       <div className="context-banner">
         {selectedFiles.length > 0
-          ? "All 3 AI developers are using only the queued project files as context."
+          ? "PM, QA, and DEV are using only queued files plus summarized uploaded context."
           : project?.projectType === "project"
             ? "No project files are queued. Prompt-only work runs inside the current task sandbox."
             : workflow.folderLoaded && workflow.contextReady
-              ? "All 3 AI developers are working inside the current task sandbox."
+              ? "The software team is working inside the current task sandbox."
               : "Open a project folder or start a new task to prepare context."}
       </div>
 
@@ -1229,22 +1411,36 @@ function OfficeView({
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Input</p>
-              <h2>Issue, error, or request</h2>
+              <h2>FSD, instruction, or request</h2>
             </div>
-            <select value={language} onChange={(event) => onLanguage(event.target.value)}>
-              {LANGUAGES.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
+            <div className="button-row">
+              <button className="secondary-button" type="button" onClick={onUploadContext}>
+                <FilePlus2 size={16} />
+                Upload Context
+              </button>
+              <select value={language} onChange={(event) => onLanguage(event.target.value)}>
+                {LANGUAGES.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
           <textarea
             value={codeInput}
             onChange={(event) => onCodeInput(event.target.value)}
             spellCheck="false"
-            placeholder="Describe the issue, paste an error, or request a change..."
+            placeholder="Paste an FSD, product request, bug report, or instruction for the Project Manager..."
           />
+          {contextDocuments.length > 0 ? (
+            <div className="context-doc-list">
+              <strong>Project context</strong>
+              {contextDocuments.map((doc) => (
+                <span key={doc.id || doc.name}>{doc.name} - {doc.type}</span>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <div className="files-panel">
@@ -1296,6 +1492,7 @@ function OfficeView({
         result={result}
         activeTab={activeTab}
         workflow={workflow}
+        commandLog={commandLog}
         decisionPreview={decisionPreview}
         decisionReason={decisionReason}
         decisionMessage={decisionMessage}
@@ -1497,6 +1694,7 @@ function OutputBin({
   result,
   activeTab,
   workflow,
+  commandLog,
   decisionPreview,
   decisionReason,
   decisionMessage,
@@ -1517,6 +1715,9 @@ function OutputBin({
         <div className="workflow-meta">
           <span>Stage: {workflow.currentStage}</span>
           <span>Loop: {workflow.loopCount}</span>
+          {workflow.currentPhase ? <span>Phase: {workflow.currentPhase}</span> : null}
+          {workflow.currentTask ? <span>Task: {workflow.currentTask}</span> : null}
+          {workflow.commandStatus ? <span>Command: {workflow.commandStatus}</span> : null}
           <span>Decision: {workflow.decisionStatus}</span>
         </div>
       </div>
@@ -1529,7 +1730,7 @@ function OutputBin({
             type="button"
             onClick={() => onTabChange(tab)}
           >
-            {capitalize(tab)}
+            {formatOutputTab(tab)}
           </button>
         ))}
       </div>
@@ -1537,9 +1738,9 @@ function OutputBin({
       <div className="output-grid single">
         {activeTab === "junior" ? (
           <OutputPanel
-            title="Junior"
+            title="DEV"
             content={joinSections([
-              ["Analysis", result?.junior?.rationale],
+              ["Implementation Notes", result?.junior?.rationale],
               ["Recommendation", result?.junior?.recommendation]
             ])}
             tone="blue"
@@ -1547,25 +1748,34 @@ function OutputBin({
         ) : null}
         {activeTab === "supervisor" ? (
           <OutputPanel
-            title="Supervisor"
+            title="QA"
             content={joinSections([
-              ["Critique", result?.supervisor?.critique],
-              ["Suggested Changes", result?.supervisor?.suggestedChanges]
+              ["Review", result?.supervisor?.critique],
+              ["Suggested Changes", result?.supervisor?.suggestedChanges],
+              ["Instructions", result?.qa?.instructions]
             ])}
             tone="red"
           />
         ) : null}
         {activeTab === "architect" ? (
           <OutputPanel
-            title="Architect"
+            title="Project Manager"
             content={joinSections([
               ["Summary", result?.architect?.summary],
-              ["Rationale", result?.architect?.rationale],
-              ["Recommendation", result?.architect?.recommendation]
+              ["PRD / Direction", result?.pm?.plan],
+              ["Decision", result?.architect?.recommendation]
             ])}
-            codeContent={result?.architect?.fixedCode}
             tone="green"
           />
+        ) : null}
+        {activeTab === "prd" ? (
+          <PrdPanel prd={result?.project?.prd} />
+        ) : null}
+        {activeTab === "tasks" ? (
+          <TasksPanel phases={result?.project?.phases} tasks={result?.project?.tasks} />
+        ) : null}
+        {activeTab === "logs" ? (
+          <CommandLogPanel commandLog={commandLog} result={result} />
         ) : null}
         {activeTab === "decision" ? (
           <DecisionPanel
@@ -1631,6 +1841,16 @@ function DecisionPanel({
               <li key={`${item}-${index}`}>{item}</li>
             ))}
           </ul>
+          {result?.dev?.commandRequests?.length ? (
+            <>
+              <h3>DEV Command Requests</h3>
+              <ul className="decision-list">
+                {result.dev.commandRequests.map((item, index) => (
+                  <li key={`${item}-${index}`}>{item}</li>
+                ))}
+              </ul>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -1680,6 +1900,83 @@ function DecisionPanel({
           <span>Manual review required.</span>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function PrdPanel({ prd }) {
+  return (
+    <div className="output-panel tone-green">
+      <div className="output-panel-header">
+        <span className="output-tab">PRD</span>
+        <h2>Product requirements</h2>
+      </div>
+      {prd ? (
+        <>
+          <p>{prd.summary}</p>
+          <SectionList title="Goals" items={prd.goals} />
+          <SectionList title="Features" items={prd.features} />
+          <SectionList title="Constraints" items={prd.constraints} />
+        </>
+      ) : (
+        <p>No PRD generated yet.</p>
+      )}
+    </div>
+  );
+}
+
+function TasksPanel({ phases = [], tasks = [] }) {
+  return (
+    <div className="output-panel tone-blue">
+      <div className="output-panel-header">
+        <span className="output-tab">Plan</span>
+        <h2>Phases and tasks</h2>
+      </div>
+      <SectionList title="Phases" items={phases.map((phase) => `${phase.name} - ${phase.status}`)} />
+      <SectionList title="Tasks" items={tasks.map((task) => `${task.phase}: ${task.title} - ${task.status}`)} />
+    </div>
+  );
+}
+
+function CommandLogPanel({ commandLog = [], result }) {
+  const logs = commandLog.length > 0 ? commandLog : result?.project?.commandHistory || [];
+  return (
+    <div className="output-panel tone-red">
+      <div className="output-panel-header">
+        <span className="output-tab">Logs</span>
+        <h2>Command history</h2>
+      </div>
+      {logs.length > 0 ? (
+        <div className="command-log-list">
+          {logs.map((entry) => (
+            <div className="command-log-card" key={entry.id || `${entry.command}-${entry.startedAt}`}>
+              <strong>{entry.command}</strong>
+              <span>{entry.status} {typeof entry.exitCode !== "undefined" ? `(exit ${entry.exitCode})` : ""}</span>
+              <pre>{entry.output || "No output captured."}</pre>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p>No commands have been run yet.</p>
+      )}
+    </div>
+  );
+}
+
+function SectionList({ title, items = [] }) {
+  const cleanItems = (items || []).filter(Boolean);
+  return (
+    <div className="section-list">
+      <h3>{title}</h3>
+      {cleanItems.length > 0 ? (
+        <ul>
+          {cleanItems.map((item, index) => (
+            <li key={`${title}-${index}`}>{item}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>None yet.</p>
+      )}
     </div>
   );
 }
@@ -1823,6 +2120,9 @@ function ProjectListSection({ title, entries, agentNameMap, onContinue, onOpenFo
                 <span>Loop: {entry.loopCount || 0}</span>
                 <span>Agent: {formatAgentName(entry.lastAgent || "team", agentNameMap)}</span>
                 <span>Decision: {entry.decisionStatus || "pending"}</span>
+                <span>PRD: {entry.prd ? "ready" : "none"}</span>
+                <span>Tasks: {(entry.tasks || []).length}</span>
+                <span>Commands: {(entry.commandHistory || []).length}</span>
                 <span>Updated: {formatTimestamp(entry.lastUpdated)}</span>
               </div>
               <div className="project-files">
@@ -1923,9 +2223,9 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
           ? Object.values(settings.agents).map((agent) => (
               <div className="settings-row" key={agent.id}>
                 <span>{formatAgentName(agent.id, {
-                  junior: agentNames.junior || "Junior",
-                  supervisor: agentNames.supervisor || "SUPERVISOR",
-                  architect: agentNames.architect || "ARCHITECT"
+                  junior: agentNames.junior || "DEV",
+                  supervisor: agentNames.supervisor || "QA",
+                  architect: agentNames.architect || "PROJECT MANAGER"
                 })}</span>
                 <code>{`${agent.model} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
               </div>
@@ -1943,9 +2243,9 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
           </button>
         </div>
         {[
-          ["juniorName", "Junior"],
-          ["supervisorName", "Supervisor"],
-          ["architectName", "Architect"]
+          ["juniorName", "DEV"],
+          ["supervisorName", "QA"],
+          ["architectName", "Project Manager"]
         ].map(([key, label]) => (
           <label className="dialogue-field" key={key}>
             <span>{label}</span>
@@ -1971,9 +2271,9 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
         {Object.values(settings?.agents || {}).map((agent) => (
           <div className="dialogue-block" key={agent.id}>
             <h2>{formatAgentName(agent.id, {
-              junior: agentNames.junior || "Junior",
-              supervisor: agentNames.supervisor || "SUPERVISOR",
-              architect: agentNames.architect || "ARCHITECT"
+              junior: agentNames.junior || "DEV",
+              supervisor: agentNames.supervisor || "QA",
+              architect: agentNames.architect || "PROJECT MANAGER"
             })}</h2>
             {AGENT_STATUS_KEYS.map((status) => (
               <label className="dialogue-field" key={`${agent.id}-${status}`}>
@@ -2076,16 +2376,16 @@ function buildStageMessages(progress, reactionIndex) {
     const juniorMessage = buildJuniorChatMessage(partialResult);
     return [
       {
-        id: `${runId}:junior:message`,
+        id: `${runId}:${progress.stage || "dev-implementation"}:junior:message`,
         from: "junior",
         to: "supervisor",
-        role: "observation",
-        stage: "junior",
+        role: "implementation",
+        stage: progress.stage || "dev-implementation",
         timestamp,
         message: juniorMessage.detailsText,
         bubbleText: juniorMessage.bubbleText,
         detailsText: juniorMessage.detailsText,
-        detailLabel: "Show junior notes",
+        detailLabel: "Show DEV notes",
         status: "queued",
         renderedText: ""
       }
@@ -2096,22 +2396,22 @@ function buildStageMessages(progress, reactionIndex) {
     const supervisorMessage = buildSupervisorChatMessage(partialResult);
     return [
       {
-        id: `${runId}:supervisor:message`,
+        id: `${runId}:${progress.stage || "qa-review"}:supervisor:message`,
         from: "supervisor",
-        to: "junior",
-        role: "critique",
-        stage: "supervisor",
+        to: progress.stage === "qa-scope" ? "junior" : "architect",
+        role: progress.stage === "qa-scope" ? "qa instruction" : "qa review",
+        stage: progress.stage || "qa-review",
         timestamp,
         message: supervisorMessage.detailsText,
         bubbleText: supervisorMessage.bubbleText,
         detailsText: supervisorMessage.detailsText,
-        detailLabel: "Show supervisor notes",
+        detailLabel: "Show QA notes",
         startDelayMs: STAGE_DELAY,
         status: "queued",
         renderedText: ""
       },
       {
-        id: `${runId}:junior:reaction`,
+        id: `${runId}:${progress.stage || "qa-review"}:junior:reaction`,
         from: "junior",
         to: "supervisor",
         role: "reaction",
@@ -2131,16 +2431,16 @@ function buildStageMessages(progress, reactionIndex) {
     const architectMessage = buildArchitectChatMessage(partialResult);
     return [
       {
-        id: `${runId}:architect:message`,
+        id: `${runId}:${progress.stage || "pm-decision"}:architect:message`,
         from: "architect",
         to: "team",
-        role: "decision",
-        stage: "architect",
+        role: progress.stage === "pm-plan" ? "planning" : "decision",
+        stage: progress.stage || "pm-decision",
         timestamp,
         message: architectMessage.detailsText,
         bubbleText: architectMessage.bubbleText,
         detailsText: architectMessage.detailsText,
-        detailLabel: "Show architect review",
+        detailLabel: "Show PM notes",
         startDelayMs: STAGE_DELAY,
         status: "queued",
         renderedText: ""
@@ -2158,7 +2458,7 @@ function buildJuniorChatMessage(partialResult) {
     partialResult?.explanation
   ]);
   return {
-    bubbleText: summarizeBubbleText(detailsText, { maxSentences: 2, maxWords: 22 }),
+    bubbleText: summarizeBubbleText(detailsText || "I'm implementing the current task.", { maxSentences: 2, maxWords: 22 }),
     detailsText
   };
 }
@@ -2170,7 +2470,7 @@ function buildSupervisorChatMessage(partialResult) {
     partialResult?.critique
   ]);
   return {
-    bubbleText: toBulletSummary(detailsText, 4),
+    bubbleText: toBulletSummary(detailsText || "QA is checking this against the PRD.", 4),
     detailsText
   };
 }
@@ -2179,13 +2479,14 @@ function buildArchitectChatMessage(partialResult) {
   const detailsText = firstNonEmpty([
     joinSections([
       ["Summary", partialResult?.architect?.summary],
+      ["PM Plan", partialResult?.pm?.plan],
       ["Decision", partialResult?.architect?.recommendation]
     ]),
     partialResult?.architect?.recommendation,
     partialResult?.recommendation
   ]);
   return {
-    bubbleText: toBulletSummary(detailsText, 4),
+    bubbleText: toBulletSummary(detailsText || "PM is aligning scope and next steps.", 4),
     detailsText
   };
 }
@@ -2291,7 +2592,7 @@ function mergePipelineResult(current, partial) {
     ...partial
   };
 
-  for (const key of ["junior", "supervisor", "architect", "decision", "workflow"]) {
+  for (const key of ["junior", "supervisor", "architect", "decision", "workflow", "project", "pm", "qa", "dev"]) {
     if (partial[key]) {
       next[key] = {
         ...(current?.[key] || {}),
@@ -2338,6 +2639,19 @@ function capitalize(value) {
   return value.slice(0, 1).toUpperCase() + value.slice(1);
 }
 
+function formatOutputTab(value) {
+  const labels = {
+    architect: "PM",
+    supervisor: "QA",
+    junior: "DEV",
+    prd: "PRD",
+    tasks: "Tasks",
+    logs: "Logs",
+    decision: "Decision"
+  };
+  return labels[value] || capitalize(value);
+}
+
 function joinSections(sections) {
   return sections
     .filter(([, content]) => content)
@@ -2351,15 +2665,15 @@ function formatAgentName(value, agentNameMap = {}) {
   }
 
   if (value === "junior") {
-    return "Junior";
+    return "DEV";
   }
 
   if (value === "supervisor") {
-    return "Supervisor";
+    return "QA";
   }
 
   if (value === "architect") {
-    return "Architect";
+    return "PROJECT MANAGER";
   }
 
   return capitalize(String(value || "team"));
@@ -2401,8 +2715,8 @@ function mapStatusToSpriteStatus(status) {
 }
 
 function mapProgressStatus(agentId, status) {
-  if (status === "thinking" && agentId === "architect") {
-    return "coding";
+  if (status === "coding" && agentId === "architect") {
+    return "thinking";
   }
 
   return status;
