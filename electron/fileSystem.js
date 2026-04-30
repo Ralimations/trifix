@@ -23,6 +23,19 @@ export async function buildDefaultSandboxProject(parentPath) {
   return buildProjectTree(root);
 }
 
+export async function buildTaskSandboxProject(parentPath, taskId = createTaskSandboxId()) {
+  if (!parentPath || typeof parentPath !== "string") {
+    throw new Error("Sandbox parent folder is missing.");
+  }
+
+  const root = path.join(parentPath, DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks", taskId);
+  await fs.mkdir(root, { recursive: true });
+  return {
+    ...(await buildProjectTree(root)),
+    taskId
+  };
+}
+
 export async function buildProjectTree(rootPath) {
   const root = await normalizeRoot(rootPath);
   const sandboxPath = path.join(root, SANDBOX_FOLDER_NAME);
@@ -448,4 +461,15 @@ function createDiffPreview(previousContent, nextContent) {
   }
 
   return preview.slice(0, 120).join("\n");
+}
+
+function createTaskSandboxId() {
+  const now = new Date();
+  const year = String(now.getFullYear());
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  const hours = String(now.getHours()).padStart(2, "0");
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  const seconds = String(now.getSeconds()).padStart(2, "0");
+  return `task-${year}${month}${day}-${hours}${minutes}${seconds}`;
 }
