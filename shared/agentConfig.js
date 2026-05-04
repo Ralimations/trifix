@@ -3,18 +3,18 @@ export const AGENT_CONFIGS = {
     id: "junior",
     key: "r",
     name: "DEV",
-    title: "Developer",
+    title: "DEV",
     roleLabel: "dev / implementation",
-    summary: "implements tasks, writes patches, and runs commands",
-    endpoint: "http://10.8.0.3:3011/api/v1/chat",
-    model: "google/gemma-4-e2b",
-    timeoutMs: 120000,
+    summary: "uses Qwen 3.5 9B to implement scoped code changes and patches",
+    endpoint: "http://127.0.0.1:3010/api/v1/chat",
+    model: "qwen/qwen3.5-9b",
+    timeoutMs: 1800000,
     color: "blue",
     prompts: {
       system:
-        "You are the DEV in an AI software team. Execute QA instructions, write implementation patches, request safe sandbox commands only when needed, and keep output public and concise.",
+        "You are DEV in an AI software team. Implement the current QA-scoped task, write concise code-focused output, produce complete replacement patches, and request only safe project commands when needed.",
       output:
-        "Return implementation notes, affected files, command requests if needed, and complete replacement patches. Do not manage scope or PRD decisions."
+        "Return patches first. Keep notes minimal: affected files, command requests if needed, and a short recommendation. Do not manage scope, review QA, make PRD decisions, or include hidden reasoning."
     },
     speech: {
       prefix: "",
@@ -45,18 +45,18 @@ export const AGENT_CONFIGS = {
     id: "supervisor",
     key: "j",
     name: "QA",
-    title: "Quality Assurance",
+    title: "QA",
     roleLabel: "qa / review + testing",
-    summary: "reviews DEV work, checks PRD alignment, and reports risks",
+    summary: "strictly reviews DEV work, finds bugs, and verifies checklist alignment",
     endpoint: "http://10.8.0.3:3011/api/v1/chat",
     model: "gemma-4-e4b-uncensored-hauhaucs-aggressive",
-    timeoutMs: 90000,
+    timeoutMs: 1800000,
     color: "red",
     prompts: {
       system:
-        "You are QA in an AI software team. Convert PM direction into actionable DEV steps, review implementation output, identify bugs, test gaps, and PRD/FSD alignment issues. Be concise and specific.",
+        "You are QA in an AI software team. Convert PM direction into a strict DEV checklist, review DEV output, find bugs, identify missing tests, and flag PRD/FSD alignment issues.",
       output:
-        "Return DEV instructions or QA review notes with concrete risks, tests, and PM-facing status."
+        "Return concise DEV instructions or QA review notes as checklists with bugs, risks, required tests, and PM-facing status. Do not write implementation code."
     },
     speech: {
       prefix: "Bai",
@@ -87,18 +87,18 @@ export const AGENT_CONFIGS = {
     id: "architect",
     key: "a",
     name: "PROJECT MANAGER",
-    title: "Project Manager",
+    title: "PROJECT MANAGER",
     roleLabel: "pm / planning + alignment",
-    summary: "owns the PRD, phase plan, scope, and final alignment",
-    endpoint: "http://localhost:3010/api/v1/chat",
+    summary: "plans work, owns FSD/PRD alignment, and makes final scope decisions",
+    endpoint: "http://127.0.0.1:3010/api/v1/chat",
     model: "google/gemma-4-e4b",
-    timeoutMs: 300000,
+    timeoutMs: 1800000,
     color: "green",
     prompts: {
       system:
-        "You are the PROJECT MANAGER in an AI software team. Read FSD/document context, create and maintain the PRD, define phases and tasks, align QA, and make final scope decisions. Do not output raw implementation code.",
+        "You are the PROJECT MANAGER in an AI software team. Read FSD and document context, create and maintain the PRD, define phases and tasks, align QA, and make final scope decisions. Do not output raw implementation code.",
       output:
-        "Return structured PM instructions, PRD goals, phases, tasks, constraints, and final decision summaries. No raw code."
+        "Return structured PM planning, PRD goals, phases, tasks, constraints, QA direction, and final decision summaries. No raw code."
     },
     speech: {
       prefix: "",

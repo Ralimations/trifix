@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import http from "node:http";
+import https from "node:https";
 import {
   AGENTS,
   AI_ENDPOINT,
@@ -7,12 +9,43 @@ import {
   SANDBOX_FOLDER_NAME
 } from "../constants.js";
 
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 1800000;
 const SPEAKING_DELAY_MS = 800;
+const MAX_DEV_HANDOFF_CHARS = 2200;
+const REQUEST_STATUS_INTERVAL_MS = 15000;
 let lastResult = null;
 
 export function getLastResult() {
   return lastResult;
+}
+
+export async function runAgentTest(payload) {
+  const agentId = String(payload?.agentId || "architect");
+  const agent = AGENTS[agentId];
+  if (!agent) {
+    throw new Error(`Unknown agent: ${agentId}`);
+  }
+
+  const scenario = String(payload?.scenario || "fsd");
+  const input = buildAgentTestInput({
+    scenario,
+    instruction: String(payload?.instruction || "").trim(),
+    contextDocuments: Array.isArray(payload?.contextDocuments) ? payload.contextDocuments : [],
+    files: Array.isArray(payload?.files) ? payload.files : [],
+    projectRoot: payload?.projectRoot || ""
+  });
+
+  const output = await callAgent({
+    agent,
+    systemPrompt: buildAgentTestPrompt(agent, scenario),
+    input
+  });
+
+  return {
+    agentId,
+    scenario,
+    output: trimForPrompt(output, 8000)
+  };
 }
 
 export async function runPipeline(payload, emitProgress = () => {}) {
@@ -44,13 +77,16 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     : "";
 
   emitProgress({ runId, agent: "architect", stage: "pm-plan", status: "thinking" });
-  const pmPlan = await callAgent({
+  let pmPlan = await callAgent({
     agent: AGENTS.architect,
     systemPrompt: buildSystemPrompt(AGENTS.architect),
-    input: buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount })
+    input: buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount }),
+    onRequestStatus: (requestStatus) =>
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-plan", status: "thinking", requestStatus, loopCount })
   });
-  const prd = buildPrd(pmPlan, contextDocuments, input);
-  const projectPlan = buildProjectPlan(prd);
+  let pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input);
+  let prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
+  let projectPlan = buildProjectPlan(prd);
   emitProgress({
     runId,
     agent: "architect",
@@ -59,6 +95,11 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     partialResult: {
       architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
       project: {
+        projectName: pmArchitecture.projectName,
+        projectSlug: pmArchitecture.projectSlug,
+        fileArchitecture: pmArchitecture.fileArchitecture,
+        implementationPlan: pmArchitecture.implementationPlan,
+        requiredFiles: pmArchitecture.requiredFiles,
         fsd: buildFsdState(projectFsd, contextDocuments),
         prd,
         phases: projectPlan.phases,
@@ -76,6 +117,11 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     partialResult: {
       architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
       project: {
+        projectName: pmArchitecture.projectName,
+        projectSlug: pmArchitecture.projectSlug,
+        fileArchitecture: pmArchitecture.fileArchitecture,
+        implementationPlan: pmArchitecture.implementationPlan,
+        requiredFiles: pmArchitecture.requiredFiles,
         fsd: buildFsdState(projectFsd, contextDocuments),
         prd,
         phases: projectPlan.phases,
@@ -86,11 +132,49 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   });
 
   emitProgress({ runId, agent: "supervisor", stage: "qa-scope", status: "thinking" });
-  const qaInstructions = await callAgent({
+  let qaInstructions = await callAgent({
     agent: AGENTS.supervisor,
     systemPrompt: buildSystemPrompt(AGENTS.supervisor),
-    input: buildQaInstructionContext({ compactContext, prd, pmPlan, feedback, revisionBrief, loopCount })
+    input: buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }),
+    onRequestStatus: (requestStatus) =>
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-scope", status: "thinking", requestStatus, loopCount, projectPlan })
   });
+  let qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
+
+  if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
+    emitProgress({ runId, agent: "architect", stage: "pm-revision", status: "thinking" });
+    pmPlan = await callAgent({
+      agent: AGENTS.architect,
+      systemPrompt: buildSystemPrompt(AGENTS.architect),
+      input: buildPmPlanningContext({
+        compactContext,
+        feedback,
+        revisionBrief,
+        loopCount,
+        qaFeedback: qaStructureReview.hardValidationIssues
+      }),
+      onRequestStatus: (requestStatus) =>
+        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-revision", status: "thinking", requestStatus, loopCount, projectPlan })
+    });
+    pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, pmArchitecture);
+    prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
+    projectPlan = buildProjectPlan(prd);
+
+    qaInstructions = await callAgent({
+      agent: AGENTS.supervisor,
+      systemPrompt: buildSystemPrompt(AGENTS.supervisor),
+      input: buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }),
+      onRequestStatus: (requestStatus) =>
+        emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-scope", status: "thinking", requestStatus, loopCount, projectPlan })
+    });
+    qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
+
+    if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
+      throw new Error(`QA rejected PM file architecture: ${qaStructureReview.hardValidationIssues.join("; ") || "No approval returned."}`);
+    }
+  }
+
+  const qaDevHandoff = buildDevHandoffFromQa(qaInstructions, qaStructureReview);
   const qaInstructionResult = buildSupervisorResult(qaInstructions);
   emitProgress({
     runId,
@@ -100,6 +184,10 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     partialResult: {
       supervisor: qaInstructionResult,
       critique: qaInstructions.trim(),
+      qa: {
+        structureReview: qaStructureReview,
+        instructions: qaInstructions.trim()
+      },
       workflow: buildV2Workflow({ loopCount, currentStage: "qa-scope", projectPlan })
     }
   });
@@ -112,6 +200,10 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     partialResult: {
       supervisor: qaInstructionResult,
       critique: qaInstructions.trim(),
+      qa: {
+        structureReview: qaStructureReview,
+        instructions: qaInstructions.trim()
+      },
       workflow: buildV2Workflow({ loopCount, currentStage: "dev-implementation", projectPlan })
     }
   });
@@ -120,7 +212,9 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const devOutput = await callAgent({
     agent: AGENTS.junior,
     systemPrompt: buildSystemPrompt(AGENTS.junior),
-    input: buildDevImplementationContext({ compactContext, prd, pmPlan, qaInstructions, language, feedback, revisionBrief, loopCount })
+    input: buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions: qaDevHandoff, qaStructureReview, language, feedback, revisionBrief, loopCount }),
+    onRequestStatus: (requestStatus) =>
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "dev-implementation", status: "coding", requestStatus, loopCount, projectPlan })
   });
   const devLeadResult = parseLeadOutput(devOutput, filesAnalyzed);
   const devResult = buildJuniorResult(devOutput);
@@ -138,6 +232,10 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         fixedCode: devLeadResult.fixedCode,
         proposedChanges: devLeadResult.proposedChanges
       },
+      dev: {
+        fileOperations: devLeadResult.fileOperations,
+        commandRequests: devLeadResult.commandRequests
+      },
       workflow: buildV2Workflow({ loopCount, currentStage: "dev-implementation", projectPlan })
     }
   });
@@ -156,6 +254,10 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         fixedCode: devLeadResult.fixedCode,
         proposedChanges: devLeadResult.proposedChanges
       },
+      dev: {
+        fileOperations: devLeadResult.fileOperations,
+        commandRequests: devLeadResult.commandRequests
+      },
       workflow: buildV2Workflow({ loopCount, currentStage: "qa-review", projectPlan })
     }
   });
@@ -164,7 +266,9 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const qaReview = await callAgent({
     agent: AGENTS.supervisor,
     systemPrompt: buildSystemPrompt(AGENTS.supervisor),
-    input: buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, devLeadResult, feedback, revisionBrief, loopCount })
+    input: buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions: qaDevHandoff, devOutput, devLeadResult, feedback, revisionBrief, loopCount }),
+    onRequestStatus: (requestStatus) =>
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-review", status: "testing", requestStatus, loopCount, projectPlan })
   });
   const qaReviewResult = buildSupervisorResult(qaReview);
   emitProgress({
@@ -195,7 +299,9 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const pmDecision = await callAgent({
     agent: AGENTS.architect,
     systemPrompt: buildSystemPrompt(AGENTS.architect),
-    input: buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount })
+    input: buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions: qaDevHandoff, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount }),
+    onRequestStatus: (requestStatus) =>
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-decision", status: "thinking", requestStatus, loopCount, projectPlan })
   });
   const pmDecisionResult = buildPmResult(pmDecision, devLeadResult.summary);
   const pipelineResult = buildPipelineResult({
@@ -211,12 +317,19 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     },
     loopCount,
     project: {
+      projectName: pmArchitecture.projectName,
+      projectSlug: pmArchitecture.projectSlug,
+      fileArchitecture: pmArchitecture.fileArchitecture,
+      implementationPlan: pmArchitecture.implementationPlan,
+      requiredFiles: pmArchitecture.requiredFiles,
+      architecture: pmArchitecture,
       fsd: buildFsdState(projectFsd, contextDocuments),
       prd,
       phases: projectPlan.phases,
       tasks: projectPlan.tasks
     },
     qaInstructions,
+    qaStructureReview,
     pmPlan,
     pmDecision
   });
@@ -229,11 +342,39 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   return lastResult;
 }
 
-async function callAgent({ agent, systemPrompt, input }) {
-  const controller = new AbortController();
+function emitAgentRequestProgress({ emitProgress, runId, agentId, stage, status, requestStatus, loopCount, projectPlan }) {
+  const agent = AGENTS[agentId];
+  const elapsed = formatDuration(requestStatus.elapsedMs || 0);
+  const label =
+    requestStatus.phase === "still-generating"
+      ? `${agent?.name || agentId} is still generating... ${elapsed} elapsed`
+      : `${agent?.name || agentId}: ${requestStatus.label} (${elapsed})`;
+
+  emitProgress({
+    runId,
+    agent: agentId,
+    stage,
+    status,
+    requestStatus: {
+      ...requestStatus,
+      agentName: agent?.name || agentId,
+      displayText: label
+    },
+    partialResult: {
+      workflow: {
+        ...buildV2Workflow({ loopCount, currentStage: stage, projectPlan }),
+        currentTask: requestStatus.label,
+        projectStatus: label
+      }
+    }
+  });
+}
+
+async function callAgent({ agent, systemPrompt, input, onRequestStatus }) {
   const requestTimeoutMs = agent.timeoutMs || REQUEST_TIMEOUT_MS;
-  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   const endpoint = agent.endpoint || AI_ENDPOINT;
+  const startedAt = Date.now();
+  const statusTimers = [];
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json"
@@ -243,16 +384,38 @@ async function callAgent({ agent, systemPrompt, input }) {
     headers["ngrok-skip-browser-warning"] = "true";
   }
 
+  const emitRequestStatus = (phase, label) => {
+    onRequestStatus?.({
+      phase,
+      label,
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs: requestTimeoutMs
+    });
+  };
+
+  const startStatusTimer = (callback, ms, repeat = false) => {
+    const timer = repeat ? setInterval(callback, ms) : setTimeout(callback, ms);
+    timer.unref?.();
+    statusTimers.push({ timer, repeat });
+  };
+
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
+    const body = {
+      model: agent.model,
+      system_prompt: systemPrompt,
+      input
+    };
+
+    emitRequestStatus("prompt-sent", "Prompt sent");
+    startStatusTimer(() => emitRequestStatus("model-processing", "Model processing"), 1000);
+    startStatusTimer(() => emitRequestStatus("waiting-first-token", "Waiting for first token"), 12000);
+    startStatusTimer(() => emitRequestStatus("still-generating", `${agent.name} is still generating...`), REQUEST_STATUS_INTERVAL_MS, true);
+
+    const response = await postJson({
+      endpoint,
       headers,
-      body: JSON.stringify({
-        model: agent.model,
-        system_prompt: systemPrompt,
-        input
-      }),
-      signal: controller.signal
+      body,
+      timeoutMs: requestTimeoutMs
     });
 
     if (!response.ok) {
@@ -260,6 +423,7 @@ async function callAgent({ agent, systemPrompt, input }) {
       throw new Error(formatAgentHttpError({ agent, endpoint, status: response.status, body }));
     }
 
+    emitRequestStatus("receiving-output", "Receiving output");
     const text = await response.text();
     const parsed = parseChatResponse(text);
 
@@ -267,22 +431,89 @@ async function callAgent({ agent, systemPrompt, input }) {
       throw new Error(`${agent.name} returned an empty response.`);
     }
 
+    emitRequestStatus("completed", "Completed");
     return parsed;
   } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error(`${agent.name} timed out after ${Math.round(requestTimeoutMs / 1000)} seconds.`);
+    const networkCode = getNetworkErrorCode(error);
+    if (networkCode === "ECONNREFUSED") {
+      throw new Error(`${agent.name} connection refused at ${endpoint}. Confirm the endpoint is online.`);
     }
 
-    if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|network/i.test(error?.message || "")) {
+    if (networkCode === "ENOTFOUND" || networkCode === "EAI_AGAIN") {
+      throw new Error(`${agent.name} endpoint host could not be resolved for ${endpoint}.`);
+    }
+
+    if (networkCode === "ETIMEDOUT") {
       throw new Error(
-        `${agent.name} could not reach ${endpoint}. Confirm the endpoint is online${endpoint.includes("10.8.0.3") ? " and the VPN is connected" : ""}.`
+        `${agent.name} request timed out after ${formatDuration(requestTimeoutMs)}. The model may still be generating. Try shorter context or increase timeout.`
       );
+    }
+
+    if (/UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT/i.test(networkCode)) {
+      throw new Error(
+        `${agent.name} request timed out after ${formatDuration(requestTimeoutMs)}. The model may still be generating. Try shorter context or increase timeout.`
+      );
+    }
+
+    if (networkCode === "ECONNRESET") {
+      throw new Error(`${agent.name} connection closed before a response was received from ${endpoint}.`);
+    }
+
+    if (/fetch failed|network/i.test(error?.message || "")) {
+      throw new Error(`${agent.name} network request failed for ${endpoint}: ${formatNetworkError(error)}`);
     }
 
     throw error;
   } finally {
-    clearTimeout(timeout);
+    for (const { timer, repeat } of statusTimers) {
+      if (repeat) {
+        clearInterval(timer);
+      } else {
+        clearTimeout(timer);
+      }
+    }
   }
+}
+
+function postJson({ endpoint, headers, body, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(endpoint);
+    const client = url.protocol === "https:" ? https : http;
+    const payload = JSON.stringify(body);
+    const request = client.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Content-Length": Buffer.byteLength(payload)
+        },
+        timeout: timeoutMs
+      },
+      (response) => {
+        const chunks = [];
+
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () =>
+          resolve({
+            ok: response.statusCode >= 200 && response.statusCode < 300,
+            status: response.statusCode || 0,
+            text: () => Promise.resolve(chunks.join(""))
+          })
+        );
+      }
+    );
+
+    request.on("timeout", () => {
+      const error = new Error(`Request timed out after ${formatDuration(timeoutMs)}.`);
+      error.code = "ETIMEDOUT";
+      request.destroy(error);
+    });
+    request.on("error", reject);
+    request.write(payload);
+    request.end();
+  });
 }
 
 function buildCompactContext({ input, files, language, feedback, contextDocuments = [], projectFsd = null }) {
@@ -290,9 +521,10 @@ function buildCompactContext({ input, files, language, feedback, contextDocument
     `LANGUAGE: ${language}`,
     [
       "SANDBOX_WORKSPACE:",
-      `The AIs may create new files and folders only under "${SANDBOX_FOLDER_NAME}/".`,
-      `For new projects, target paths like "${SANDBOX_FOLDER_NAME}/project-name/src/index.js".`,
-      "Outside that sandbox, patches must target existing project files."
+      "For FSD-only project creation, PM chooses one projectSlug and DEV returns project-relative fileOperations.",
+      "The app writes those fileOperations under sandbox/tasks/{projectSlug}/ after QA approval.",
+      `For existing project edits, patches may still use "${SANDBOX_FOLDER_NAME}/" for new scratch files.`,
+      "Do not scan node_modules, .git, dist, or build."
     ].join("\n")
   ];
 
@@ -400,8 +632,15 @@ function summarizeFile(file) {
 function parseChatResponse(responseText) {
   try {
     const json = JSON.parse(responseText);
-    return readChatText(json) || responseText;
-  } catch {
+    const text = readChatText(json);
+    if (!text) {
+      throw new Error("Bad response format: no public message content was returned.");
+    }
+    return text;
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
     return responseText;
   }
 }
@@ -416,8 +655,9 @@ function readChatText(value) {
   }
 
   if (Array.isArray(value)) {
+    const messageItems = value.filter((item) => isMessageItem(item));
     const publicItems = value.filter((item) => !isReasoningItem(item));
-    const items = publicItems.length > 0 ? publicItems : value;
+    const items = messageItems.length > 0 ? messageItems : publicItems.length > 0 ? publicItems : value;
 
     return items.map(readChatText).filter(Boolean).join("\n").trim();
   }
@@ -454,12 +694,39 @@ function isReasoningItem(value) {
   return typeof value === "object" && value !== null && /^(reasoning|analysis)$/i.test(String(value.type || ""));
 }
 
+function isMessageItem(value) {
+  return typeof value === "object" && value !== null && /^message$/i.test(String(value.type || ""));
+}
+
+function getNetworkErrorCode(error) {
+  return error?.cause?.code || error?.code || "";
+}
+
+function formatNetworkError(error) {
+  const code = getNetworkErrorCode(error);
+  const causeMessage = error?.cause?.message || "";
+  return [code, causeMessage || error?.message].filter(Boolean).join(" ");
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(Number(ms || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes <= 0) {
+    return `${seconds}s`;
+  }
+
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
 function formatAgentHttpError({ agent, endpoint, status, body }) {
   const trimmedBody = String(body || "").trim();
   const serverError = parseServerError(trimmedBody);
   const serverMessage = serverError?.message || "";
   const serverCode = serverError?.code || "";
-  const agentEnvPrefix = `TRIFIX_${String(agent.id || agent.name || "AGENT").toUpperCase()}`;
+  const agentEnvPrefix =
+    agent.id === "junior" ? "TRIFIX_DEV" : `TRIFIX_${String(agent.id || agent.name || "AGENT").toUpperCase()}`;
 
   if (/model_not_found|invalid model/i.test(`${serverCode} ${serverMessage}`)) {
     return [
@@ -498,6 +765,7 @@ function parseServerError(body) {
 }
 
 function parseLeadOutput(output, filesAnalyzed = []) {
+  const parsedJson = extractJsonObject(output);
   const summary = extractSection(output, "SUMMARY");
   const rationale = extractSection(output, "RATIONALE");
   const proposedChanges = extractListSection(output, "PROPOSED_CHANGES");
@@ -506,6 +774,8 @@ function parseLeadOutput(output, filesAnalyzed = []) {
   const commandRequests = extractListSection(output, "COMMAND_REQUESTS");
   const patches = extractPatches(output);
   const fallbackCodeFence = output.match(/```[\w+-]*\n([\s\S]*?)```/);
+  const jsonFileOperations = normalizeFileOperations(parsedJson?.fileOperations);
+  const jsonCommands = normalizeStringArray(parsedJson?.commands);
 
   let normalizedPatches = patches;
   if (normalizedPatches.length === 0 && filesAnalyzed.length === 1 && fallbackCodeFence?.[1]) {
@@ -517,27 +787,248 @@ function parseLeadOutput(output, filesAnalyzed = []) {
     ];
   }
 
+  const fileOperations = jsonFileOperations.length > 0
+    ? jsonFileOperations
+    : fileOperationsFromPatches(normalizedPatches);
+  const normalizedPatchesForApply = normalizedPatches.length > 0
+    ? normalizedPatches
+    : fileOperations.map((operation) => ({
+        path: operation.path,
+        content: operation.content
+      }));
+
   const normalizedAffectedFiles =
     affectedFiles.length > 0
       ? affectedFiles
-      : normalizedPatches.map((patch) => patch.path).filter(Boolean);
+      : fileOperations.length > 0
+        ? fileOperations.map((operation) => operation.path).filter(Boolean)
+        : normalizedPatches.map((patch) => patch.path).filter(Boolean);
 
   return {
-    summary: summary || "DEV completed an implementation pass.",
+    summary: parsedJson?.summary || summary || "DEV completed an implementation pass.",
     rationale: rationale || "Reviewed the project context, likely failure points, and the recommended fix.",
     proposedChanges:
       proposedChanges.length > 0
         ? proposedChanges
-        : normalizedPatches.map((patch) => `Update ${patch.path} with the DEV implementation.`),
+        : fileOperations.map((operation) => `Write ${operation.path} from the DEV implementation.`),
     affectedFiles: normalizedAffectedFiles,
-    commandRequests,
-    patches: normalizedPatches,
-    fixedCode: normalizedPatches[0]?.content || cleanCode(fallbackCodeFence?.[1] || output),
-    recommendation: recommendation || output.trim()
+    commandRequests: jsonCommands.length > 0 ? jsonCommands : commandRequests,
+    patches: normalizedPatchesForApply,
+    fileOperations,
+    fixedCode: fileOperations[0]?.content || normalizedPatchesForApply[0]?.content || cleanCode(fallbackCodeFence?.[1] || output),
+    recommendation: parsedJson?.recommendation || recommendation || output.trim()
   };
 }
 
-function buildPrd(pmPlan, contextDocuments = [], input = "") {
+function extractJsonObject(output) {
+  const text = String(output || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const candidates = [];
+  const fencedJson = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1]);
+  candidates.push(...fencedJson);
+  candidates.push(text);
+
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(text.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate.trim());
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function normalizePmArchitecture(parsed, input, previous = null) {
+  const fallbackName = deriveProjectName(input);
+  const projectName = normalizeTitle(parsed?.projectName || previous?.projectName || fallbackName);
+  const projectSlug = sanitizeProjectSlug(parsed?.projectSlug || projectName) || sanitizeProjectSlug(previous?.projectSlug) || createFallbackTaskSlug();
+  const fileArchitecture = normalizeFileArchitecture(parsed?.fileArchitecture, parsed?.requiredFiles);
+  const implementationPlan = normalizeStringArray(parsed?.implementationPlan);
+  const requiredFiles = normalizeStringArray(parsed?.requiredFiles).length > 0
+    ? normalizeStringArray(parsed?.requiredFiles)
+    : fileArchitecture.map((file) => file.path);
+
+  return {
+    projectName,
+    projectSlug,
+    fileArchitecture,
+    implementationPlan: implementationPlan.length > 0
+      ? implementationPlan
+      : fileArchitecture.map((file) => `Create ${file.path}`),
+    requiredFiles,
+    qaInstruction:
+      String(parsed?.qaInstruction || previous?.qaInstruction || "Verify required files and FSD alignment.").trim()
+  };
+}
+
+function normalizeQaStructureReview(parsed, pmArchitecture) {
+  const issues = normalizeStringArray(parsed?.issues);
+  const devChecklist = normalizeStringArray(parsed?.devChecklist);
+  const slug = pmArchitecture?.projectSlug || "";
+  const architecture = Array.isArray(pmArchitecture?.fileArchitecture) ? pmArchitecture.fileArchitecture : [];
+  const hardValidationIssues = [];
+
+  if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(slug)) {
+    hardValidationIssues.push("projectSlug must be lowercase kebab-case and max 40 characters.");
+  }
+
+  if (architecture.length === 0) {
+    hardValidationIssues.push("fileArchitecture must include at least one file.");
+  }
+
+  const guidanceIssues = issues.filter((issue) => !hardValidationIssues.includes(issue));
+  const approved = hardValidationIssues.length === 0;
+
+  return {
+    approved,
+    issues: [...hardValidationIssues, ...guidanceIssues],
+    hardValidationIssues,
+    devChecklist: devChecklist.length > 0
+      ? devChecklist
+      : (pmArchitecture?.implementationPlan || architecture.map((file) => `Create ${file.path}`))
+  };
+}
+
+function normalizeFileArchitecture(fileArchitecture, requiredFiles) {
+  const fromArchitecture = Array.isArray(fileArchitecture)
+    ? fileArchitecture.map((item) => ({
+        path: toProjectPath(item?.path || item),
+        purpose: String(item?.purpose || "Required project file").trim()
+      }))
+    : [];
+  const fromRequired = normalizeStringArray(requiredFiles).map((filePath) => ({
+    path: toProjectPath(filePath),
+    purpose: "Required project file"
+  }));
+  const merged = [...fromArchitecture, ...fromRequired].filter((item) => item.path);
+  const unique = [];
+  const seen = new Set();
+
+  for (const item of merged) {
+    if (seen.has(item.path)) {
+      continue;
+    }
+
+    seen.add(item.path);
+    unique.push(item);
+  }
+
+  return unique.length > 0
+    ? unique
+    : [{ path: "index.html", purpose: "Single-file app entry point" }];
+}
+
+function normalizeFileOperations(fileOperations) {
+  if (!Array.isArray(fileOperations)) {
+    return [];
+  }
+
+  return fileOperations
+    .map((operation) => ({
+      action: String(operation?.action || "write").toLowerCase(),
+      path: toProjectPath(operation?.path || ""),
+      content: typeof operation?.content === "string" ? operation.content : String(operation?.content || "")
+    }))
+    .filter((operation) => operation.action === "write" && operation.path);
+}
+
+function fileOperationsFromPatches(patches) {
+  return (patches || [])
+    .map((patch) => ({
+      action: "write",
+      path: toProjectPath(patch.path),
+      content: String(patch.content || "")
+    }))
+    .filter((operation) => operation.path);
+}
+
+function normalizeStringArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    return value
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^[-*]\s*/, "").trim())
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+function deriveProjectName(input) {
+  const text = String(input || "").trim();
+  const titleMatch = text.match(/(?:fsd\s*)?(?:title|project\s*name|project)\s*[:#-]\s*["']?([^\n."]+)/i);
+  if (titleMatch?.[1]) {
+    return normalizeTitle(titleMatch[1]);
+  }
+
+  const firstLine = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) || "";
+  const firstNamedToken = firstLine.match(/^([A-Z][A-Za-z0-9_-]{2,40})(?:\s|:|-|$)/);
+  if (firstNamedToken?.[1]) {
+    return normalizeTitle(firstNamedToken[1]);
+  }
+
+  return normalizeTitle(firstLine.split(/\s+/).slice(0, 5).join(" ")) || "Task";
+}
+
+function normalizeTitle(value) {
+  return String(value || "")
+    .replace(/[`*_#>]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80) || "Task";
+}
+
+function sanitizeProjectSlug(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+}
+
+function toProjectPath(value) {
+  return String(value || "")
+    .trim()
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+}
+
+function createFallbackTaskSlug() {
+  const now = new Date();
+  const year = String(now.getFullYear());
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  const hours = String(now.getHours()).padStart(2, "0");
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  const seconds = String(now.getSeconds()).padStart(2, "0");
+  return `task-${year}${month}${day}-${hours}${minutes}${seconds}`;
+}
+
+function buildPrd(pmPlan, contextDocuments = [], input = "", pmArchitecture = null) {
   const goals = extractListSection(pmPlan, "PRD_GOALS");
   const features = extractListSection(pmPlan, "FEATURES");
   const constraints = extractListSection(pmPlan, "CONSTRAINTS");
@@ -545,12 +1036,14 @@ function buildPrd(pmPlan, contextDocuments = [], input = "") {
   const tasks = extractListSection(pmPlan, "TASKS");
 
   return {
-    summary: extractSection(pmPlan, "QA_INSTRUCTION") || summarizePlan(pmPlan, input),
+    summary: pmArchitecture?.qaInstruction || extractSection(pmPlan, "QA_INSTRUCTION") || summarizePlan(pmPlan, input),
     goals: goals.length ? goals : ["Deliver the requested software change within the selected project context."],
-    features: features.length ? features : ["Implement the user-requested functionality."],
+    features: features.length ? features : (pmArchitecture?.implementationPlan || ["Implement the user-requested functionality."]),
     constraints: constraints.length ? constraints : [`Keep new files under "${SANDBOX_FOLDER_NAME}/" unless updating selected existing files.`],
     phases: phases.length ? phases : ["Phase 1: Setup", "Phase 2: Core Features", "Phase 3: Testing"],
-    tasks: tasks.length ? tasks : ["[Phase 1] Confirm scope", "[Phase 2] Implement feature", "[Phase 3] Run checks"],
+    tasks: tasks.length
+      ? tasks
+      : (pmArchitecture?.implementationPlan || ["Confirm scope", "Implement feature", "Run checks"]).map((task, index) => `[Phase ${Math.min(index + 1, 3)}] ${task}`),
     sourceDocuments: (contextDocuments || []).map((doc) => ({
       name: doc.name,
       type: doc.type,
@@ -626,7 +1119,7 @@ function buildSupervisorResult(critique) {
   };
 }
 
-function buildPipelineResult({ explanation, critique, files, filesAnalyzed, leadResult, loopCount, project, qaInstructions, pmPlan, pmDecision }) {
+function buildPipelineResult({ explanation, critique, files, filesAnalyzed, leadResult, loopCount, project, qaInstructions, qaStructureReview, pmPlan, pmDecision }) {
   return {
     junior: buildJuniorResult(explanation),
     supervisor: buildSupervisorResult(critique),
@@ -665,10 +1158,14 @@ function buildPipelineResult({ explanation, critique, files, filesAnalyzed, lead
     },
     qa: {
       instructions: qaInstructions,
+      structureReview: qaStructureReview,
       review: critique.trim()
     },
     dev: {
       implementation: explanation.trim(),
+      summary: leadResult.summary,
+      fileOperations: leadResult.fileOperations || [],
+      commands: leadResult.commandRequests || [],
       commandRequests: leadResult.commandRequests || []
     },
     filesAnalyzed,
@@ -707,99 +1204,103 @@ async function createRevisionBrief({ compactContext, feedback, loopCount }) {
   return trimForPrompt(output, 800);
 }
 
-function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount }) {
+function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, qaFeedback = [] }) {
   return [
     trimForPrompt(compactContext, 14000),
     feedback
       ? `Previous result was denied in loop ${loopCount}. Address this feedback in the plan:\n${trimForPrompt(feedback, 1200)}`
       : "",
+    normalizeStringArray(qaFeedback).length > 0
+      ? `QA_STRUCTURE_FEEDBACK:\n${normalizeStringArray(qaFeedback).map((issue) => `- ${issue}`).join("\n")}`
+      : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
     [
-      "Create a concise PRD from the provided FSD/docs/request.",
+      "Create the project architecture from the provided FSD/docs/request.",
       "Do not output raw code.",
-      "Output public content only using these sections:",
-      "PRD_GOALS:",
-      "- goal",
-      "FEATURES:",
-      "- feature",
-      "CONSTRAINTS:",
-      "- constraint",
-      "PHASES:",
-      "- Phase 1: name",
-      "TASKS:",
-      "- [Phase 1] task",
-      "QA_INSTRUCTION:",
-      "one concise instruction for QA"
+      "Extract a short projectName from the FSD title/project name when present.",
+      "projectSlug must be lowercase kebab-case, remove special characters, max 40 chars.",
+      "If there is no usable title, use a slug like task-YYYYMMDD-HHMMSS.",
+      "Return JSON only with this shape:",
+      "{",
+      '  "projectName": "Simple Admin Dashboard",',
+      '  "projectSlug": "simple-admin-dashboard",',
+      '  "fileArchitecture": [{ "path": "index.html", "purpose": "Single-file dashboard app" }],',
+      '  "implementationPlan": ["Create index.html", "Embed CSS", "Embed vanilla JS interactions"],',
+      '  "requiredFiles": ["index.html"],',
+      '  "qaInstruction": "Verify required files and FSD alignment."',
+      "}"
     ].join("\n")
   ].filter(Boolean).join("\n\n");
 }
 
-function buildQaInstructionContext({ compactContext, prd, pmPlan, feedback, revisionBrief, loopCount }) {
-  return [
-    trimForPrompt(compactContext, 9000),
-    `PM_PRD:\n${formatPrdForPrompt(prd)}`,
-    `PM_PLAN:\n${trimForPrompt(pmPlan, 3000)}`,
-    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}` : "",
-    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
-    [
-      "Convert PM scope into actionable DEV steps.",
-      "Keep the DEV inside the current phase and sandbox rules.",
-      "Output public content only using:",
-      "DEV_STEPS:",
-      "- step",
-      "ACCEPTANCE_CHECKS:",
-      "- check",
-      "RISKS:",
-      "- risk",
-      "MESSAGE_TO_DEV:"
-    ].join("\n")
-  ].filter(Boolean).join("\n\n");
-}
-
-function buildDevImplementationContext({ compactContext, prd, pmPlan, qaInstructions, language, feedback, revisionBrief, loopCount }) {
+function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }) {
   return [
     trimForPrompt(compactContext, 7000),
-    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
-    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 1400)}`,
-    `QA_DEV_STEPS:\n${trimForPrompt(qaInstructions, 1800)}`,
-    `Preferred language: ${language}`,
+    `PM_PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    `PM_PLAN:\n${trimForPrompt(pmPlan, 1800)}`,
+    `PM_FILE_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
+    [
+      "Verify the PM file structure before DEV starts.",
+      "Check required files match the FSD, no unnecessary folders, valid projectSlug, and realistic scope.",
+      "Do not write implementation code.",
+      "Return JSON only with this shape:",
+      "{",
+      '  "approved": true,',
+      '  "issues": [],',
+      '  "devChecklist": [',
+      '    "Create index.html",',
+      '    "Include required UI/features from the FSD",',
+      '    "Implement expected interactions"',
+      "  ]",
+      "}"
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions, qaStructureReview, language, feedback, revisionBrief, loopCount }) {
+  return [
+    trimForPrompt(compactContext, 4500),
+    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 900)}`,
+    `PM_FILE_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
+    `QA_DEV_STEPS:\n${trimForPrompt(qaInstructions, 1200)}`,
+    `QA_STRUCTURE_REVIEW:\n${JSON.stringify(qaStructureReview || {}, null, 2)}`,
+    `Preferred language: ${language}`,
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 800)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
     [
       "Implement only the current task scope.",
-      `New files, folders, or full projects must be placed under "${SANDBOX_FOLDER_NAME}/".`,
-      "If a command is needed, request one safe command in COMMAND_REQUESTS; do not invent command output.",
-      "Output public content only using exactly these sections when possible:",
-      "SUMMARY:",
-      "RATIONALE:",
-      "AFFECTED_FILES:",
-      "- relative/path",
-      "PROPOSED_CHANGES:",
-      "- concise change",
-      "COMMAND_REQUESTS:",
-      "- npm run build",
-      "PATCHES:",
-      "FILE: relative/path",
-      "```language",
-      "full replacement content",
-      "```",
-      "RECOMMENDATION:"
+      "Create/edit actual files by returning machine-readable fileOperations.",
+      "Use project-relative paths only, such as index.html or src/main.js. Do not include sandbox/tasks or absolute paths.",
+      "Keep output concise. Do not include hidden reasoning.",
+      "Return JSON only with this shape:",
+      "{",
+      '  "summary": "Created single-file dashboard.",',
+      '  "fileOperations": [',
+      '    { "action": "write", "path": "index.html", "content": "<!DOCTYPE html>..." }',
+      "  ],",
+      '  "commands": [],',
+      '  "recommendation": "Open index.html in browser."',
+      "}"
     ].join("\n")
   ].filter(Boolean).join("\n\n");
 }
 
 function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, devLeadResult, feedback, revisionBrief, loopCount }) {
   return [
-    trimForPrompt(compactContext, 9000),
+    trimForPrompt(compactContext, 7000),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
-    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 1600)}`,
-    `QA_ORIGINAL_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 2200)}`,
-    `DEV_OUTPUT:\n${trimForPrompt(devOutput, 4200)}`,
+    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 1200)}`,
+    `QA_ORIGINAL_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1400)}`,
+    `DEV_OUTPUT:\n${trimForPrompt(devOutput, 3200)}`,
     `DEV_AFFECTED_FILES:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
+    `DEV_FILE_OPERATIONS:\n${JSON.stringify(devLeadResult.fileOperations || [], null, 2).slice(0, 2200)}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
     [
-      "Review DEV output against the PRD and current phase.",
+      "Review DEV fileOperations against the PRD and current phase.",
       "Do not output raw code unless quoting a tiny issue snippet.",
       "Output public content only using:",
       "QA_RESULT: pass|needs_changes",
@@ -816,13 +1317,13 @@ function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, dev
 
 function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount }) {
   return [
-    trimForPrompt(compactContext, 8000),
+    trimForPrompt(compactContext, 6500),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
-    `PM_INITIAL_PLAN:\n${trimForPrompt(pmPlan, 2200)}`,
-    `QA_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1800)}`,
-    `DEV_IMPLEMENTATION:\n${trimForPrompt(devOutput, 3000)}`,
-    `QA_REVIEW:\n${trimForPrompt(qaReview, 2800)}`,
-    `DEV_PATCH_PATHS:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
+    `PM_INITIAL_PLAN:\n${trimForPrompt(pmPlan, 1400)}`,
+    `QA_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1400)}`,
+    `DEV_IMPLEMENTATION:\n${trimForPrompt(devOutput, 2200)}`,
+    `QA_REVIEW:\n${trimForPrompt(qaReview, 1800)}`,
+    `DEV_FILE_PATHS:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
     `Preferred language: ${language}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
@@ -837,6 +1338,47 @@ function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, d
       "RECOMMENDATION:"
     ].join("\n")
   ].filter(Boolean).join("\n\n");
+}
+
+function buildAgentTestPrompt(agent, scenario) {
+  const prompts = {
+    architect: {
+      fsd: "Read the provided FSD or project context and return a compact PRD with phases and tasks. Public output only.",
+      command: "Read the provided project context and propose the exact safe shell commands the team should run next. Public output only.",
+      review: "Read the project context and summarize whether the project scope is feasible. Public output only."
+    },
+    supervisor: {
+      fsd: "Convert the provided PRD or FSD into a short DEV task list and acceptance checks. Public output only.",
+      command: "Review the proposed project command plan and identify risks or missing checks. Public output only.",
+      review: "Review the provided implementation context and return bugs, alignment issues, and tests. Public output only."
+    },
+    junior: {
+      fsd: "Read the provided scope and explain what files should likely be created first. Public output only.",
+      command: "Read the project context and return the next safe command or commands needed to make progress. Public output only.",
+      review: "Read the provided task context and outline the implementation plan. Public output only."
+    }
+  };
+
+  return prompts[agent.id]?.[scenario] || prompts[agent.id]?.fsd || agent.prompts?.system || "";
+}
+
+function buildAgentTestInput({ scenario, instruction, contextDocuments, files, projectRoot }) {
+  const docs = buildDocumentContextSummary(contextDocuments, null);
+  const selectedFiles = (files || [])
+    .slice(0, 5)
+    .map((file) => `FILE: ${file.path}\n${trimForPrompt(file.content || "", 1800)}`)
+    .join("\n\n");
+
+  return [
+    `TEST_SCENARIO: ${scenario}`,
+    projectRoot ? `PROJECT_ROOT: ${projectRoot}` : "",
+    instruction ? `INSTRUCTION:\n${instruction}` : "",
+    docs ? `CONTEXT_DOCUMENTS:\n${docs}` : "",
+    selectedFiles ? `SELECTED_FILES:\n${selectedFiles}` : "",
+    "Keep the output short and public. Do not expose hidden reasoning."
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function buildJuniorContext({ compactContext, feedback, revisionBrief, loopCount }) {
@@ -960,6 +1502,37 @@ function formatPrdForPrompt(prd, options = {}) {
     `Phases:\n${phases.map((item) => `- ${item}`).join("\n")}`,
     `Tasks:\n${tasks.map((item) => `- ${item}`).join("\n")}`
   ].join("\n\n");
+}
+
+function buildDevHandoffFromQa(qaInstructions, qaStructureReview = null) {
+  const checklist = normalizeStringArray(qaStructureReview?.devChecklist);
+  if (checklist.length > 0) {
+    return trimForPrompt(
+      [
+        "DEV_CHECKLIST:",
+        ...checklist.slice(0, 8).map((item) => `- ${item}`)
+      ].join("\n"),
+      MAX_DEV_HANDOFF_CHARS
+    );
+  }
+
+  const devSteps = extractListSection(qaInstructions, "DEV_STEPS").slice(0, 4);
+  const acceptanceChecks = extractListSection(qaInstructions, "ACCEPTANCE_CHECKS").slice(0, 2);
+  const risks = extractListSection(qaInstructions, "RISKS").slice(0, 2);
+  const messageToDev = extractSection(qaInstructions, "MESSAGE_TO_DEV");
+
+  const compact = [
+    devSteps.length > 0 ? `DEV_STEPS:\n${devSteps.map((item) => `- ${item}`).join("\n")}` : "",
+    acceptanceChecks.length > 0
+      ? `ACCEPTANCE_CHECKS:\n${acceptanceChecks.map((item) => `- ${item}`).join("\n")}`
+      : "",
+    risks.length > 0 ? `RISKS:\n${risks.map((item) => `- ${item}`).join("\n")}` : "",
+    messageToDev ? `MESSAGE_TO_DEV:\n${messageToDev}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  return trimForPrompt(compact || qaInstructions, MAX_DEV_HANDOFF_CHARS);
 }
 
 function trimForPrompt(value, maxChars) {

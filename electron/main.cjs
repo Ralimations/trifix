@@ -41,14 +41,18 @@ async function loadBackend() {
   return {
     AGENTS: constants.AGENTS,
     AI_ENDPOINT: constants.AI_ENDPOINT,
+    DEV_ENDPOINT: constants.DEV_ENDPOINT,
+    ARCHITECT_ENDPOINT: constants.ARCHITECT_ENDPOINT,
     buildDefaultSandboxProject: fileSystem.buildDefaultSandboxProject,
     buildTaskSandboxProject: fileSystem.buildTaskSandboxProject,
     buildProjectTree: fileSystem.buildProjectTree,
     readSelectedProjectFiles: fileSystem.readSelectedProjectFiles,
     previewFilePatches: fileSystem.previewFilePatches,
     applyFilePatches: fileSystem.applyFilePatches,
+    applyFileOperations: fileSystem.applyFileOperations,
     getLastResult: orchestrator.getLastResult,
-    runPipeline: orchestrator.runPipeline
+    runPipeline: orchestrator.runPipeline,
+    runAgentTest: orchestrator.runAgentTest
   };
 }
 
@@ -93,7 +97,7 @@ function registerIpc() {
 
   ipcMain.handle("project:sandbox", async (_event, options = {}) => {
     if (options.path) {
-      const project = await backend.buildProjectTree(options.path);
+      const project = await backend.buildProjectTree(options.path, { ensureSandboxFolder: false });
       const tracked = await upsertProjectEntry(
         projectToTrackedEntry(project, {
           type: "sandbox-task",
@@ -117,7 +121,9 @@ function registerIpc() {
   });
 
   ipcMain.handle("project:refresh", async (_event, rootPath) => {
-    const project = await backend.buildProjectTree(rootPath);
+    const project = await backend.buildProjectTree(rootPath, {
+      ensureSandboxFolder: inferProjectType(rootPath) !== "sandbox-task"
+    });
     const tracked = await findTrackedProjectByPath(project.rootPath);
     return attachTrackedProject(project, tracked);
   });
@@ -150,12 +156,20 @@ function registerIpc() {
   );
 
   ipcMain.handle("pipeline:last", async () => backend.getLastResult());
+  ipcMain.handle("pipeline:test-agent", async (_event, payload) =>
+    backend.runAgentTest(payload)
+  );
   ipcMain.handle("projects:list", async () => listProjects());
   ipcMain.handle("projects:remove", async (_event, id) => removeTrackedProject(id));
   ipcMain.handle("projects:update", async (_event, payload) => updateTrackedProject(payload?.id, payload));
 
   ipcMain.handle("app:settings", async () => ({
     endpoint: backend.AI_ENDPOINT,
+    endpoints: {
+      dev: backend.DEV_ENDPOINT,
+      qa: backend.AI_ENDPOINT,
+      pm: backend.ARCHITECT_ENDPOINT
+    },
     agents: await getMergedAgents()
   }));
 
@@ -169,6 +183,11 @@ function registerIpc() {
 
     return {
       endpoint: backend.AI_ENDPOINT,
+      endpoints: {
+        dev: backend.DEV_ENDPOINT,
+        qa: backend.AI_ENDPOINT,
+        pm: backend.ARCHITECT_ENDPOINT
+      },
       agents: await getMergedAgents()
     };
   });
@@ -198,7 +217,8 @@ function registerIpc() {
       commandHistory: existingTrackedEntry?.commandHistory || []
     });
 
-    const result = await backend.runPipeline(
+    let activeTrackedEntry = trackedEntry;
+    let result = await backend.runPipeline(
       {
         ...payload,
         files
@@ -222,20 +242,73 @@ function registerIpc() {
       }
     );
 
-    await updateTrackedProject(trackedEntry?.id, {
-      status: "Waiting for decision",
+    if (!payload?.projectRoot) {
+      const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
+      if (fileOperations.length === 0) {
+        throw new Error("DEV proposed changes but no valid file operations were found.");
+      }
+
+      const generatedProject = await backend.applyFileOperations(
+        app.getPath("documents"),
+        result?.project?.architecture || result?.project || {},
+        fileOperations
+      );
+      result = attachGeneratedProjectResult(result, generatedProject);
+      activeTrackedEntry = await upsertProjectEntry(
+        projectToTrackedEntry(generatedProject, {
+          type: "sandbox-task",
+          name: generatedProject.projectName,
+          status: generatedProject.status,
+          loopCount: Number(result?.workflow?.loopCount || payload?.loopCount || 0),
+          lastAgent: "junior",
+          affectedFiles: generatedProject.applied.map((item) => item.path),
+          decisionStatus: "applied",
+          fsd: result?.project?.fsd || payload?.fsd || null,
+          prd: result?.project?.prd || null,
+          phases: result?.project?.phases || [],
+          tasks: result?.project?.tasks || [],
+          logs: appendProjectLog(trackedEntry?.logs, {
+            type: "files",
+            message: `Executor applied ${generatedProject.applied.length} file operation(s).`
+          })
+        })
+      );
+      result = {
+        ...result,
+        project: {
+          ...(result.project || {}),
+          projectId: activeTrackedEntry?.id || ""
+        }
+      };
+      event.sender.send("pipeline:progress", {
+        runId: payload?.runId,
+        agent: "junior",
+        stage: "file-executor",
+        status: "speaking",
+        partialResult: result
+      });
+    }
+
+    await updateTrackedProject(activeTrackedEntry?.id, {
+      status: result?.executor?.applied?.length ? "Files written" : "Waiting for decision",
       loopCount: Number(result?.workflow?.loopCount || payload?.loopCount || 0),
       lastAgent: "architect",
       lastUpdated: new Date().toISOString(),
       affectedFiles: result?.decision?.affectedFiles || [],
-      decisionStatus: "pending",
-      fsd: result?.project?.fsd || payload?.fsd || trackedEntry?.fsd || null,
-      prd: result?.project?.prd || trackedEntry?.prd || null,
-      phases: result?.project?.phases || trackedEntry?.phases || [],
-      tasks: result?.project?.tasks || trackedEntry?.tasks || [],
-      logs: appendProjectLog(trackedEntry?.logs, {
+      decisionStatus: result?.executor?.applied?.length ? "applied" : "pending",
+      fsd: result?.project?.fsd || payload?.fsd || activeTrackedEntry?.fsd || null,
+      prd: result?.project?.prd || activeTrackedEntry?.prd || null,
+      phases: result?.project?.phases || activeTrackedEntry?.phases || [],
+      tasks: result?.project?.tasks || activeTrackedEntry?.tasks || [],
+      projectSlug: result?.project?.projectSlug || activeTrackedEntry?.projectSlug || "",
+      filesCreated: result?.project?.filesCreated ?? activeTrackedEntry?.filesCreated,
+      filesModified: result?.project?.filesModified ?? activeTrackedEntry?.filesModified,
+      failedOperations: result?.project?.failedOperations || activeTrackedEntry?.failedOperations || [],
+      logs: appendProjectLog(activeTrackedEntry?.logs, {
         type: "pipeline",
-        message: "V2 team workflow reached decision review."
+        message: result?.executor?.applied?.length
+          ? "V2 team workflow wrote files to the task sandbox."
+          : "V2 team workflow reached decision review."
       })
     });
 
@@ -551,6 +624,53 @@ function appendProjectLog(logs, entry) {
   ].slice(-80);
 }
 
+function attachGeneratedProjectResult(result, generatedProject) {
+  const appliedFiles = (generatedProject.applied || []).map((item) => item.path);
+  const failedOperations = generatedProject.failedOperations || [];
+  const executor = {
+    status: appliedFiles.length > 0 ? "applied" : "failed",
+    projectName: generatedProject.projectName,
+    projectSlug: generatedProject.projectSlug,
+    rootPath: generatedProject.rootPath,
+    filesCreated: generatedProject.filesCreated || 0,
+    filesModified: generatedProject.filesModified || 0,
+    failedOperations,
+    applied: generatedProject.applied || []
+  };
+
+  return {
+    ...result,
+    executor,
+    project: {
+      ...(result?.project || {}),
+      ...generatedProject,
+      rootPath: generatedProject.rootPath,
+      projectName: generatedProject.projectName,
+      projectSlug: generatedProject.projectSlug,
+      filesCreated: executor.filesCreated,
+      filesModified: executor.filesModified,
+      failedOperations,
+      commandHistory: result?.project?.commandHistory || []
+    },
+    decision: {
+      ...(result?.decision || {}),
+      affectedFiles: appliedFiles,
+      canApply: false,
+      decisionStatus: "applied",
+      summary: `${result?.decision?.summary || "DEV wrote files."} Executor applied ${appliedFiles.length} file operation(s).`
+    },
+    workflow: {
+      ...(result?.workflow || {}),
+      folderLoaded: true,
+      contextReady: true,
+      currentStage: "file-executor",
+      decisionStatus: "applied",
+      projectStatus: failedOperations.length > 0 ? "Files written with issues" : "Files written",
+      currentTask: `Executor applied ${appliedFiles.length} file operation(s).`
+    }
+  };
+}
+
 function trimText(value, maxChars) {
   const text = String(value || "");
   if (text.length <= maxChars) {
@@ -567,6 +687,10 @@ function attachTrackedProject(project, tracked) {
   return {
     ...project,
     name: tracked?.name || path.basename(project?.rootPath || ""),
+    projectSlug: tracked?.projectSlug || project?.projectSlug || "",
+    filesCreated: tracked?.filesCreated ?? project?.filesCreated,
+    filesModified: tracked?.filesModified ?? project?.filesModified,
+    failedOperations: tracked?.failedOperations || project?.failedOperations || [],
     projectId: tracked?.id || "",
     projectType: tracked?.type || inferProjectType(project?.rootPath),
     projectStatus: tracked?.status || "Not started",
@@ -583,7 +707,7 @@ function projectToTrackedEntry(project, overrides = {}) {
   const rootPath = project?.rootPath || "";
   return {
     id: overrides.id || createTrackedProjectId(rootPath),
-    name: overrides.name || path.basename(rootPath),
+    name: overrides.name || project?.projectName || project?.name || path.basename(rootPath),
     path: rootPath,
     type: overrides.type || inferProjectType(rootPath),
     status: overrides.status || "Not started",
@@ -596,6 +720,10 @@ function projectToTrackedEntry(project, overrides = {}) {
     prd: overrides.prd || null,
     phases: overrides.phases || [],
     tasks: overrides.tasks || [],
+    projectSlug: overrides.projectSlug || project?.projectSlug || "",
+    filesCreated: overrides.filesCreated ?? project?.filesCreated,
+    filesModified: overrides.filesModified ?? project?.filesModified,
+    failedOperations: overrides.failedOperations || project?.failedOperations || [],
     logs: overrides.logs || [],
     commandHistory: overrides.commandHistory || []
   };

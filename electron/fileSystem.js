@@ -37,10 +37,13 @@ export async function buildTaskSandboxProject(parentPath, taskId = createTaskSan
   };
 }
 
-export async function buildProjectTree(rootPath) {
+export async function buildProjectTree(rootPath, options = {}) {
   const root = await normalizeRoot(rootPath);
   const sandboxPath = path.join(root, SANDBOX_FOLDER_NAME);
-  await fs.mkdir(sandboxPath, { recursive: true });
+  const ensureSandboxFolder = options.ensureSandboxFolder !== false;
+  if (ensureSandboxFolder) {
+    await fs.mkdir(sandboxPath, { recursive: true });
+  }
   let entryCount = 0;
 
   async function walk(currentPath, relativePath = "", depth = 0) {
@@ -67,7 +70,7 @@ export async function buildProjectTree(rootPath) {
 
       if (entry.isDirectory()) {
         const children = await walk(absolutePath, childRelativePath, depth + 1);
-        if (children.length > 0 || childRelativePath === SANDBOX_FOLDER_NAME) {
+        if (children.length > 0 || (ensureSandboxFolder && childRelativePath === SANDBOX_FOLDER_NAME)) {
           entryCount += 1;
           nodes.push({
             type: "directory",
@@ -243,6 +246,89 @@ export async function applyFilePatches(rootPath, patches, allowedPaths = []) {
   };
 }
 
+export async function applyFileOperations(parentPath, projectSpec = {}, operations = []) {
+  if (!parentPath || typeof parentPath !== "string") {
+    throw new Error("Sandbox parent folder is missing.");
+  }
+
+  const fileOperations = Array.isArray(operations) ? operations : [];
+  if (fileOperations.length === 0) {
+    throw new Error("DEV proposed changes but no valid file operations were found.");
+  }
+
+  const tasksRoot = path.join(parentPath, DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks");
+  const projectName = normalizeProjectName(projectSpec?.projectName, projectSpec?.projectSlug);
+  const requestedSlug = sanitizeProjectSlug(projectSpec?.projectSlug || projectName);
+  const projectSlug = await createUniqueProjectSlug(tasksRoot, requestedSlug || createTaskSandboxId());
+  const root = path.join(tasksRoot, projectSlug);
+  const applied = [];
+  const failedOperations = [];
+  let rootCreated = false;
+
+  for (const operation of fileOperations) {
+    const action = String(operation?.action || "write").toLowerCase();
+    const requestedPath = normalizeFileOperationPath(operation?.path || "", projectSlug, requestedSlug);
+
+    if (action !== "write") {
+      failedOperations.push({
+        action,
+        path: requestedPath,
+        error: `Unsupported file operation: ${action || "missing"}`
+      });
+      continue;
+    }
+
+    try {
+      if (!requestedPath) {
+        throw new Error("File path is missing.");
+      }
+
+      const absolutePath = resolveProjectWritePath(root, requestedPath);
+      const created = !(await fileExists(absolutePath));
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      rootCreated = true;
+      await fs.writeFile(absolutePath, String(operation?.content || ""), "utf8");
+      applied.push({
+        action: "write",
+        path: requestedPath,
+        created
+      });
+    } catch (error) {
+      failedOperations.push({
+        action,
+        path: requestedPath,
+        error: error?.message || "Could not write file."
+      });
+    }
+  }
+
+  if (applied.length === 0) {
+    if (rootCreated) {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+
+    throw new Error("DEV proposed changes but no valid file operations were found.");
+  }
+
+  const project = await buildProjectTree(root, { ensureSandboxFolder: false });
+  const filesCreated = applied.filter((operation) => operation.created).length;
+  const filesModified = applied.length - filesCreated;
+
+  return {
+    ...project,
+    projectName,
+    projectSlug,
+    name: projectName,
+    taskId: projectSlug,
+    projectType: "sandbox-task",
+    status: failedOperations.length > 0 ? "Files written with issues" : "Files written",
+    filesCreated,
+    filesModified,
+    failedOperations,
+    applied
+  };
+}
+
 async function normalizeRoot(rootPath) {
   if (!rootPath || typeof rootPath !== "string") {
     throw new Error("Project folder is missing.");
@@ -290,6 +376,66 @@ async function resolveInsideRoot(root, relativePath) {
   }
 
   return target;
+}
+
+function resolveProjectWritePath(root, relativePath) {
+  const targetRelativePath = toProjectPath(relativePath);
+
+  if (path.isAbsolute(relativePath)) {
+    throw new Error("Absolute paths are not allowed.");
+  }
+
+  if (targetRelativePath.split("/").includes("..")) {
+    throw new Error(`Path traversal is not allowed: ${relativePath}`);
+  }
+
+  if (isBlockedPath(targetRelativePath)) {
+    throw new Error(`Blocked path: ${targetRelativePath}`);
+  }
+
+  const baseName = path.basename(targetRelativePath);
+  if (!isAllowedFile(baseName)) {
+    throw new Error(`Unsupported file type: ${targetRelativePath}`);
+  }
+
+  const target = path.resolve(root, targetRelativePath);
+  const relativeFromRoot = path.relative(path.normalize(root), target);
+
+  if (
+    relativeFromRoot.startsWith("..") ||
+    path.isAbsolute(relativeFromRoot) ||
+    relativeFromRoot === ""
+  ) {
+    throw new Error(`Path escapes the project folder: ${targetRelativePath}`);
+  }
+
+  return target;
+}
+
+function normalizeFileOperationPath(value, projectSlug, requestedSlug = "") {
+  const targetPath = toProjectPath(value);
+  const parts = targetPath.split("/").filter(Boolean);
+
+  if (parts[0]?.toLowerCase() === SANDBOX_FOLDER_NAME.toLowerCase()) {
+    parts.shift();
+  }
+
+  if (
+    parts[0]?.toLowerCase() === "sandbox" &&
+    parts[1]?.toLowerCase() === "tasks"
+  ) {
+    parts.splice(0, 3);
+  }
+
+  if (parts[0]?.toLowerCase() === String(projectSlug || "").toLowerCase()) {
+    parts.shift();
+  }
+
+  if (parts[0]?.toLowerCase() === String(requestedSlug || "").toLowerCase()) {
+    parts.shift();
+  }
+
+  return toProjectPath(parts.join("/"));
 }
 
 function isAllowedFile(fileName) {
@@ -372,6 +518,61 @@ async function fileExists(absolutePath) {
 
     throw error;
   }
+}
+
+async function directoryExists(absolutePath) {
+  try {
+    const stat = await fs.stat(absolutePath);
+    return stat.isDirectory();
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+async function createUniqueProjectSlug(tasksRoot, requestedSlug) {
+  await fs.mkdir(tasksRoot, { recursive: true });
+  const baseSlug = sanitizeProjectSlug(requestedSlug) || createTaskSandboxId();
+  let candidate = baseSlug;
+  let suffix = 2;
+
+  while (await directoryExists(path.join(tasksRoot, candidate))) {
+    const suffixText = `-${suffix}`;
+    candidate = `${baseSlug.slice(0, Math.max(1, 40 - suffixText.length))}${suffixText}`;
+    suffix += 1;
+  }
+
+  return candidate;
+}
+
+function normalizeProjectName(projectName, projectSlug) {
+  const cleanName = String(projectName || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (cleanName) {
+    return cleanName;
+  }
+
+  const slug = sanitizeProjectSlug(projectSlug);
+  return slug || createTaskSandboxId();
+}
+
+function sanitizeProjectSlug(value) {
+  const ascii = String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+
+  return ascii || "";
 }
 
 async function readExistingPatchTarget(absolutePath, relativePath, allowCreate) {

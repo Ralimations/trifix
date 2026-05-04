@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("trifix", {
   uploadProjectContext: (payload) => ipcRenderer.invoke("project:context-upload", payload),
   runProjectCommand: (payload) => ipcRenderer.invoke("project:command", payload),
   runPipeline: (payload) => ipcRenderer.invoke("pipeline:run", payload),
+  testAgent: (payload) => ipcRenderer.invoke("pipeline:test-agent", payload),
   getLastResult: () => ipcRenderer.invoke("pipeline:last"),
   getSettings: () => ipcRenderer.invoke("app:settings"),
   saveDialogue: (dialogue) => ipcRenderer.invoke("app:dialogue:save", dialogue),

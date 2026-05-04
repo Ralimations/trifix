@@ -86,6 +86,7 @@ const CHATTER_MAX_LIFETIME = 8000;
 const CHATTER_REPLY_CHANCE = 0.28;
 const THINKING_HELP_CHANCE = 0.3;
 const ARCHITECT_ENCOURAGEMENT_CHANCE = 0.2;
+const MAX_FEASIBILITY_RETRIES = 4;
 const phraseBank = {
   general: {
     idle: [
@@ -165,6 +166,8 @@ export function App() {
   });
   const [commandLog, setCommandLog] = useState([]);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
+  const [testerResult, setTesterResult] = useState(null);
+  const [isTesterRunning, setIsTesterRunning] = useState(false);
   const [scene, setScene] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [messageQueue, setMessageQueue] = useState([]);
@@ -229,6 +232,10 @@ export function App() {
         currentStage: progress.agent,
         contextReady: true
       }));
+
+      if (progress.requestStatus?.displayText) {
+        setDecisionMessage(progress.requestStatus.displayText);
+      }
 
       if (progress.partialResult) {
         setResult((current) => mergePipelineResult(current, progress.partialResult));
@@ -628,15 +635,10 @@ export function App() {
     setError("");
     try {
       let targetProject = project;
-      if (!targetProject?.rootPath) {
-        targetProject = await window.trifix.openSandboxProject();
-        setProject(targetProject);
-        setActiveView("office");
-      }
 
       const documents = await window.trifix.uploadProjectContext({
-        projectRoot: targetProject.rootPath,
-        projectId: targetProject.projectId
+        projectRoot: targetProject?.rootPath || "",
+        projectId: targetProject?.projectId || ""
       });
       if (!documents?.length) {
         return;
@@ -645,7 +647,7 @@ export function App() {
       setContextDocuments((current) => [...current, ...documents].slice(-16));
       setWorkflow((current) => ({
         ...current,
-        folderLoaded: true,
+        folderLoaded: Boolean(targetProject?.rootPath),
         contextReady: true,
         currentStage: "context-ready",
         currentPhase: current.currentPhase || "Planning",
@@ -742,6 +744,38 @@ export function App() {
     });
   }
 
+  async function runAgentCapabilityTest() {
+    const scenario = window.prompt("Test scenario: fsd, command, or review", "fsd");
+    if (!scenario?.trim()) {
+      return;
+    }
+
+    const agentId = window.prompt("Agent to test: architect, supervisor, or junior", "architect");
+    if (!agentId?.trim()) {
+      return;
+    }
+
+    const instruction = window.prompt("Optional test instruction", codeInput.trim() || "Read the FSD and report what you can do.");
+    setIsTesterRunning(true);
+    setDecisionMessage("");
+    try {
+      const result = await window.trifix.testAgent({
+        agentId: agentId.trim(),
+        scenario: scenario.trim(),
+        instruction: instruction || "",
+        contextDocuments,
+        projectRoot: project?.rootPath || ""
+      });
+      setTesterResult(result);
+      setActiveView("reports");
+      setDecisionMessage(`${formatAgentName(result.agentId)} test completed.`);
+    } catch (testError) {
+      setDecisionMessage(testError?.message || "Capability test failed.");
+    } finally {
+      setIsTesterRunning(false);
+    }
+  }
+
   async function runOffice(nextLoopCount = workflow.loopCount, feedback = "") {
     if (!canRun && !feedback) {
       return;
@@ -757,26 +791,21 @@ export function App() {
     let runSelectedFiles = selectedFiles;
 
     try {
-      if (!runProject?.rootPath || runSelectedFiles.length === 0) {
-        runProject = await window.trifix.openSandboxProject();
+      if (!runProject?.rootPath) {
         runSelectedFiles = [];
-        if (!project?.rootPath) {
-          setProject(runProject);
-          setSelectedFiles([]);
-        }
         setActiveView("office");
         setWorkflow((current) => ({
           ...current,
-          folderLoaded: true,
+          folderLoaded: false,
           contextReady: true,
-          currentStage: "sandbox-ready"
+          currentStage: "pm-plan"
         }));
       }
 
       const runId =
         typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
       currentRunRef.current = runId;
-      setResultProject(runProject);
+      setResultProject(runProject?.rootPath ? runProject : null);
       setContextDocuments((current) => current.length > 0 ? current : runProject?.fsd?.documents || []);
 
       setDecisionMessage("");
@@ -819,10 +848,50 @@ export function App() {
         feedback,
         loopCount: nextLoopCount
       });
+      const feasibility = assessProjectFeasibility({
+        input: codeInput,
+        result: nextResult,
+        selectedFiles: runSelectedFiles,
+        hasContextDocuments: contextDocuments.length > 0
+      });
+      const filesWereApplied = (nextResult?.executor?.applied || []).length > 0;
+      if (!feasibility.ok && !filesWereApplied && nextLoopCount < MAX_FEASIBILITY_RETRIES) {
+        setDecisionMessage(`Auto-retrying: ${feasibility.reason}`);
+        enqueueAgentMessage({
+          from: "architect",
+          to: "team",
+          text: "This is not feasible yet. I'm tightening the next pass.",
+          message: "This is not feasible yet. I'm tightening the next pass.",
+          type: "status",
+          priority: "high",
+          restoreState: "thinking"
+        });
+        return await runOffice(
+          nextLoopCount + 1,
+          `The previous iteration is not yet feasible. ${feasibility.reason} Return a runnable, coherent project with valid fileOperations and necessary commands.`
+        );
+      }
+      if (!feasibility.ok) {
+        setDecisionMessage(
+          filesWereApplied
+            ? `Files were written, but the feasibility check flagged: ${feasibility.reason}`
+            : `Feasibility check failed after ${MAX_FEASIBILITY_RETRIES} attempts: ${feasibility.reason}`
+        );
+      }
+      const generatedProject = normalizeGeneratedProject(nextResult, runProject);
+      if (generatedProject?.rootPath) {
+        setProject(generatedProject);
+        setResultProject(generatedProject);
+        setSelectedFiles(generatedProject.defaultSelectedFiles || []);
+        setContextDocuments((current) => current.length > 0 ? current : generatedProject.fsd?.documents || []);
+        setCommandLog(generatedProject.commandHistory || []);
+      } else {
+        setResultProject(runProject?.rootPath ? runProject : null);
+      }
       setResult(nextResult);
       setWorkflow({
         ...(nextResult.workflow || workflow),
-        folderLoaded: Boolean(runProject?.rootPath),
+        folderLoaded: Boolean(generatedProject?.rootPath || runProject?.rootPath),
         contextReady: true
       });
       setActiveTab("decision");
@@ -830,13 +899,16 @@ export function App() {
       await refreshTrackedProjects();
     } catch (runError) {
       setError(runError?.message || "Pipeline failed.");
+      setDecisionMessage(runError?.message || "Pipeline failed.");
       setWorkflow((current) => ({
         ...current,
         currentStage: "error"
       }));
       setAgents((currentAgents) =>
         currentAgents.map((agent) =>
-          agent.status === "thinking" ? { ...agent, status: "error" } : agent
+          ["thinking", "coding", "testing", "waiting", "installing", "unpacking"].includes(agent.status)
+            ? { ...agent, status: "error" }
+            : agent
         )
       );
     } finally {
@@ -876,7 +948,11 @@ export function App() {
         priority: "high",
         restoreState: "done"
       });
-      setDecisionMessage("Decision accepted. No files were changed.");
+      setDecisionMessage(
+        result?.executor?.applied?.length
+          ? "Decision accepted. DEV file operations were already applied."
+          : "Decision accepted. No files were changed."
+      );
       await wait(1100);
       setScene(null);
       await refreshTrackedProjects();
@@ -1017,27 +1093,16 @@ export function App() {
   async function startNewTask() {
     resetTaskState({ clearProjectSelection: true });
     setActiveView("task");
-
-    if (project?.projectType === "project") {
-      return;
-    }
-
-    try {
-      const sandboxProject = await window.trifix.openSandboxProject();
-      setProject(sandboxProject);
-      setResultProject(null);
-      setContextDocuments([]);
-      setCommandLog([]);
-      setWorkflow((current) => ({
-        ...current,
-        folderLoaded: true,
-        contextReady: false,
-        currentStage: "task-ready"
-      }));
-      await refreshTrackedProjects();
-    } catch (nextError) {
-      setError(nextError?.message || "Could not create a new task sandbox.");
-    }
+    setProject(null);
+    setResultProject(null);
+    setContextDocuments([]);
+    setCommandLog([]);
+    setWorkflow((current) => ({
+      ...current,
+      folderLoaded: false,
+      contextReady: false,
+      currentStage: "task-ready"
+    }));
   }
 
   async function continueTrackedProject(entry) {
@@ -1204,7 +1269,7 @@ export function App() {
 
         <div className="sidebar-footer">
           <span className="signal-dot" />
-          <span>VPN endpoint</span>
+          <span>Agent endpoints</span>
         </div>
       </aside>
 
@@ -1245,7 +1310,9 @@ export function App() {
             onRunProject={() => runProjectControl("run")}
             onDebugProject={() => runProjectControl("debug")}
             onAddInstruction={addInstruction}
+            onRunTester={runAgentCapabilityTest}
             isCommandRunning={isCommandRunning}
+            isTesterRunning={isTesterRunning}
             onTabChange={setActiveTab}
             onDecisionReason={setDecisionReason}
             onAccept={acceptDecision}
@@ -1254,7 +1321,7 @@ export function App() {
           />
         ) : null}
 
-        {activeView === "reports" ? <ReportsView result={result} /> : null}
+        {activeView === "reports" ? <ReportsView result={result} testerResult={testerResult} /> : null}
         {activeView === "projects" ? (
           <ProjectsView
             entries={trackedProjects}
@@ -1327,7 +1394,9 @@ function OfficeView({
   onRunProject,
   onDebugProject,
   onAddInstruction,
+  onRunTester,
   isCommandRunning,
+  isTesterRunning,
   onTabChange,
   onDecisionReason,
   onAccept,
@@ -1361,6 +1430,10 @@ function OfficeView({
             <FilePlus2 size={18} />
             Add Instruction
           </button>
+          <button className="secondary-button" type="button" onClick={onRunTester} disabled={isTesterRunning}>
+            {isTesterRunning ? <Loader2 size={18} className="spin" /> : <TerminalSquare size={18} />}
+            Test Models
+          </button>
           <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
             {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
             Run Team
@@ -1390,13 +1463,13 @@ function OfficeView({
       />
 
       <div className="context-banner">
-        {selectedFiles.length > 0
+        {decisionMessage || (selectedFiles.length > 0
           ? "PM, QA, and DEV are using only queued files plus summarized uploaded context."
           : project?.projectType === "project"
             ? "No project files are queued. Prompt-only work runs inside the current task sandbox."
             : workflow.folderLoaded && workflow.contextReady
               ? "The software team is working inside the current task sandbox."
-              : "Open a project folder or start a new task to prepare context."}
+              : "Open a project folder or start a new task to prepare context.")}
       </div>
 
       {error ? (
@@ -1741,6 +1814,8 @@ function OutputBin({
             title="DEV"
             content={joinSections([
               ["Implementation Notes", result?.junior?.rationale],
+              ["File Operations", formatFileOperations(result?.dev?.fileOperations)],
+              ["Executor", formatExecutorSummary(result?.executor)],
               ["Recommendation", result?.junior?.recommendation]
             ])}
             tone="blue"
@@ -1820,6 +1895,11 @@ function DecisionPanel({
       <div className="decision-summary">
         <h3>Summary</h3>
         <p>{decision?.summary || "No decision summary yet."}</p>
+        {result?.project?.rootPath ? (
+          <p className="project-path" title={result.project.rootPath}>
+            {result.project.projectName || result.project.name || "Project"}: {result.project.rootPath}
+          </p>
+        ) : null}
       </div>
 
       <div className="decision-columns">
@@ -1848,6 +1928,16 @@ function DecisionPanel({
                 {result.dev.commandRequests.map((item, index) => (
                   <li key={`${item}-${index}`}>{item}</li>
                 ))}
+              </ul>
+            </>
+          ) : null}
+          {result?.executor ? (
+            <>
+              <h3>File Executor</h3>
+              <ul className="decision-list">
+                <li>Created: {result.executor.filesCreated || 0}</li>
+                <li>Modified: {result.executor.filesModified || 0}</li>
+                <li>Failed: {(result.executor.failedOperations || []).length}</li>
               </ul>
             </>
           ) : null}
@@ -2041,11 +2131,20 @@ function TreeNode({ node, selectedFileSet, onToggleFile }) {
   );
 }
 
-function ReportsView({ result }) {
+function ReportsView({ result, testerResult }) {
   return (
     <section className="simple-view">
       <p className="eyebrow">Reports</p>
       <h1>Last pipeline result</h1>
+      {testerResult ? (
+        <div className="output-panel tone-blue">
+          <div className="output-panel-header">
+            <span className="output-tab">Tester</span>
+            <h2>{formatAgentName(testerResult.agentId)} {testerResult.scenario}</h2>
+          </div>
+          <pre>{testerResult.output}</pre>
+        </div>
+      ) : null}
       <OutputBin
         result={result}
         activeTab="decision"
@@ -2117,6 +2216,10 @@ function ProjectListSection({ title, entries, agentNameMap, onContinue, onOpenFo
                 <span className={`status-badge ${toStatusBadgeClass(entry.status)}`}>{entry.status}</span>
               </div>
               <div className="project-stats">
+                {entry.projectSlug ? <span>Slug: {entry.projectSlug}</span> : null}
+                {typeof entry.filesCreated !== "undefined" ? <span>Created: {entry.filesCreated || 0}</span> : null}
+                {typeof entry.filesModified !== "undefined" ? <span>Modified: {entry.filesModified || 0}</span> : null}
+                {entry.failedOperations?.length ? <span>Failed: {entry.failedOperations.length}</span> : null}
                 <span>Loop: {entry.loopCount || 0}</span>
                 <span>Agent: {formatAgentName(entry.lastAgent || "team", agentNameMap)}</span>
                 <span>Decision: {entry.decisionStatus || "pending"}</span>
@@ -2212,8 +2315,16 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
       <h1>Runtime configuration</h1>
       <div className="settings-grid">
         <div className="settings-row">
-          <span>Endpoint</span>
-          <code>{settings?.endpoint || "Loading..."}</code>
+          <span>QA endpoint</span>
+          <code>{settings?.endpoints?.qa || settings?.endpoint || "Loading..."}</code>
+        </div>
+        <div className="settings-row">
+          <span>DEV endpoint</span>
+          <code>{settings?.endpoints?.dev || "Loading..."}</code>
+        </div>
+        <div className="settings-row">
+          <span>PM endpoint</span>
+          <code>{settings?.endpoints?.pm || "Loading..."}</code>
         </div>
         <div className="settings-row">
           <span>Project</span>
@@ -2227,7 +2338,7 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
                   supervisor: agentNames.supervisor || "QA",
                   architect: agentNames.architect || "PROJECT MANAGER"
                 })}</span>
-                <code>{`${agent.model} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
+                <code>{`${agent.model} | ${agent.endpoint} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
               </div>
             ))
           : null}
@@ -2245,7 +2356,7 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
         {[
           ["juniorName", "DEV"],
           ["supervisorName", "QA"],
-          ["architectName", "Project Manager"]
+          ["architectName", "PROJECT MANAGER"]
         ].map(([key, label]) => (
           <label className="dialogue-field" key={key}>
             <span>{label}</span>
@@ -2453,6 +2564,7 @@ function buildStageMessages(progress, reactionIndex) {
 
 function buildJuniorChatMessage(partialResult) {
   const detailsText = firstNonEmpty([
+    formatExecutorSummary(partialResult?.executor),
     partialResult?.junior?.recommendation,
     partialResult?.junior?.rationale,
     partialResult?.explanation
@@ -2604,6 +2716,27 @@ function mergePipelineResult(current, partial) {
   return next;
 }
 
+function normalizeGeneratedProject(result, fallbackProject) {
+  const resultProject = result?.project || {};
+  if (!resultProject.rootPath) {
+    return fallbackProject?.rootPath ? fallbackProject : null;
+  }
+
+  return {
+    ...(fallbackProject || {}),
+    ...resultProject,
+    rootPath: resultProject.rootPath,
+    projectId: resultProject.projectId || resultProject.id || fallbackProject?.projectId || "",
+    projectType: resultProject.projectType || "sandbox-task",
+    name: resultProject.projectName || resultProject.name || resultProject.projectSlug || "Task",
+    projectSlug: resultProject.projectSlug || "",
+    projectStatus: resultProject.status || result?.workflow?.projectStatus || "Files written",
+    defaultSelectedFiles: resultProject.defaultSelectedFiles || [],
+    commandHistory: resultProject.commandHistory || fallbackProject?.commandHistory || [],
+    fsd: resultProject.fsd || fallbackProject?.fsd || null
+  };
+}
+
 function buildDialogueDraft(agentsMap) {
   const draft = {};
 
@@ -2657,6 +2790,30 @@ function joinSections(sections) {
     .filter(([, content]) => content)
     .map(([label, content]) => `${label}\n${content}`)
     .join("\n\n");
+}
+
+function formatFileOperations(fileOperations = []) {
+  if (!fileOperations.length) {
+    return "";
+  }
+
+  return fileOperations
+    .slice(0, 8)
+    .map((operation) => `${operation.action || "write"} ${operation.path}`)
+    .join("\n");
+}
+
+function formatExecutorSummary(executor) {
+  if (!executor) {
+    return "";
+  }
+
+  return [
+    executor.rootPath ? `Path: ${executor.rootPath}` : "",
+    `Created: ${executor.filesCreated || 0}`,
+    `Modified: ${executor.filesModified || 0}`,
+    `Failed: ${(executor.failedOperations || []).length}`
+  ].filter(Boolean).join("\n");
 }
 
 function formatAgentName(value, agentNameMap = {}) {
@@ -2778,6 +2935,44 @@ function mapTrackedStatusToStage(status, decisionStatus) {
   }
 
   return "idle";
+}
+
+function assessProjectFeasibility({ input, result, selectedFiles, hasContextDocuments }) {
+  const patches = result?.architect?.patches || [];
+  const fileOperations = result?.dev?.fileOperations || [];
+  const appliedOperations = result?.executor?.applied || [];
+  const affectedFiles = result?.decision?.affectedFiles || result?.architect?.affectedFiles || [];
+  const lowerInput = String(input || "").toLowerCase();
+  const wantsProject =
+    /\b(project|website|web app|app|site|landing page|dashboard|tool|game)\b/.test(lowerInput) ||
+    hasContextDocuments;
+  const paths = new Set([
+    ...affectedFiles,
+    ...patches.map((patch) => patch.path),
+    ...fileOperations.map((operation) => operation.path),
+    ...appliedOperations.map((operation) => operation.path)
+  ]);
+
+  if (patches.length === 0 && fileOperations.length === 0 && appliedOperations.length === 0) {
+    return { ok: false, reason: "No valid file operations were produced." };
+  }
+
+  if (wantsProject && paths.size < 2 && selectedFiles.length === 0 && ![...paths].some((path) => /index\.html$/i.test(path))) {
+    return { ok: false, reason: "The result only produced a single file for a project-style request." };
+  }
+
+  if (wantsProject && [...paths].some((path) => /package\.json$/i.test(path)) && ![...paths].some((path) => /(src\/|index\.|main\.)/i.test(path))) {
+    return { ok: false, reason: "The result created package metadata without any runnable app files." };
+  }
+
+  const htmlOperation = fileOperations.find((operation) => /\.html$/i.test(operation.path));
+  const htmlContent = String(htmlOperation?.content || "");
+  const hasEmbeddedCssAndJs = /<style[\s>]/i.test(htmlContent) && /<script[\s>]/i.test(htmlContent);
+  if (wantsProject && [...paths].some((path) => /\.html$/i.test(path)) && !hasEmbeddedCssAndJs && ![...paths].some((path) => /\.(css|js)$/i.test(path))) {
+    return { ok: false, reason: "The result produced HTML without supporting CSS or JS assets." };
+  }
+
+  return { ok: true, reason: "" };
 }
 
 function inferRestoreState(message) {

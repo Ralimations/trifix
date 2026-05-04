@@ -1,20 +1,35 @@
 import { AGENT_CONFIGS } from "../shared/agentConfig.js";
 
-export const AI_ENDPOINT =
-  process.env.TRIFIX_AI_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat";
+const normalizeLocalEndpoint = (endpoint) =>
+  String(endpoint || "").replace("http://localhost:3010/", "http://127.0.0.1:3010/");
 
-export const ARCHITECT_ENDPOINT =
+export const AI_ENDPOINT =
+  process.env.TRIFIX_AI_ENDPOINT || AGENT_CONFIGS.supervisor.endpoint;
+
+export const ARCHITECT_ENDPOINT = normalizeLocalEndpoint(
   process.env.TRIFIX_ARCHITECT_ENDPOINT ||
-  "http://localhost:3010/api/v1/chat";
+  AGENT_CONFIGS.architect.endpoint
+);
+
+export const DEV_ENDPOINT = normalizeLocalEndpoint(
+  process.env.TRIFIX_DEV_ENDPOINT ||
+  process.env.TRIFIX_JUNIOR_ENDPOINT ||
+  AGENT_CONFIGS.junior.endpoint
+);
 
 export const ARCHITECT_MODEL =
   process.env.TRIFIX_ARCHITECT_MODEL || AGENT_CONFIGS.architect.model;
+export const DEV_MODEL =
+  process.env.TRIFIX_DEV_MODEL ||
+  process.env.TRIFIX_JUNIOR_MODEL ||
+  AGENT_CONFIGS.junior.model;
 
 export const AGENTS = {
   ...AGENT_CONFIGS,
   junior: {
     ...AGENT_CONFIGS.junior,
-    endpoint: process.env.TRIFIX_JUNIOR_ENDPOINT || AI_ENDPOINT
+    model: DEV_MODEL,
+    endpoint: DEV_ENDPOINT
   },
   supervisor: {
     ...AGENT_CONFIGS.supervisor,
@@ -23,7 +38,7 @@ export const AGENTS = {
   architect: {
     ...AGENT_CONFIGS.architect,
     model: ARCHITECT_MODEL,
-    endpoint: process.env.TRIFIX_ARCHITECT_ENDPOINT || ARCHITECT_ENDPOINT
+    endpoint: ARCHITECT_ENDPOINT
   }
 };
 

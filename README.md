@@ -15,7 +15,24 @@ npm install
 npm run dev
 ```
 
-DEV and QA use the VPN endpoint:
+DEV uses the local LM Studio-compatible endpoint:
+
+```text
+POST http://127.0.0.1:3010/api/v1/chat
+model: qwen/qwen3.5-9b
+```
+
+The request payload uses:
+
+```json
+{
+  "model": "qwen/qwen3.5-9b",
+  "system_prompt": "You are the DEV in an AI software team...",
+  "input": "..."
+}
+```
+
+QA uses the VPN endpoint:
 
 ```text
 POST http://10.8.0.3:3011/api/v1/chat
@@ -24,14 +41,16 @@ POST http://10.8.0.3:3011/api/v1/chat
 PROJECT MANAGER uses:
 
 ```text
-POST http://localhost:3010/api/v1/chat
+POST http://127.0.0.1:3010/api/v1/chat
 ```
 
 Override them when needed:
 
 ```bash
 set TRIFIX_AI_ENDPOINT=http://10.8.0.3:3011/api/v1/chat
-set TRIFIX_ARCHITECT_ENDPOINT=http://localhost:3010/api/v1/chat
+set TRIFIX_DEV_ENDPOINT=http://127.0.0.1:3010/api/v1/chat
+set TRIFIX_DEV_MODEL=qwen/qwen3.5-9b
+set TRIFIX_ARCHITECT_ENDPOINT=http://127.0.0.1:3010/api/v1/chat
 set TRIFIX_ARCHITECT_MODEL=google/gemma-4-e4b
 npm run dev
 ```
