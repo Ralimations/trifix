@@ -156,6 +156,14 @@ button {
   margin-bottom: 22px;
 }
 
+.workspace-subtitle {
+  max-width: 680px;
+  margin-top: 10px;
+  color: #9ca9bc;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .context-banner {
   display: flex;
   align-items: center;
@@ -729,6 +737,14 @@ select:focus {
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
 }
 
+.chat-panel.compact {
+  margin-bottom: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
 .chat-log {
   display: grid;
   gap: 12px;
@@ -1147,6 +1163,115 @@ select:focus {
   gap: 18px;
 }
 
+.landing-view {
+  display: grid;
+  gap: 24px;
+}
+
+.landing-hero,
+.landing-card {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  background:
+    linear-gradient(160deg, rgba(78, 127, 197, 0.12), transparent 36%),
+    rgba(18, 23, 32, 0.84);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+}
+
+.landing-hero {
+  padding: 30px;
+}
+
+.landing-copy {
+  max-width: 760px;
+  margin-top: 14px;
+  color: #a8b5c8;
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.landing-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+  gap: 18px;
+}
+
+.landing-card {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.landing-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.landing-recents {
+  display: grid;
+  gap: 12px;
+}
+
+.project-card.compact {
+  gap: 10px;
+}
+
+.floating-chat {
+  position: fixed;
+  right: 28px;
+  bottom: 28px;
+  z-index: 25;
+  display: grid;
+  justify-items: end;
+  gap: 12px;
+}
+
+.floating-chat-card {
+  width: min(440px, calc(100vw - 56px));
+  max-height: min(70vh, 640px);
+  overflow: hidden;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 18px;
+  background: rgba(20, 26, 35, 0.72);
+  backdrop-filter: blur(22px);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.32);
+}
+
+.floating-chat-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.floating-chat-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 999px;
+  color: #071018;
+  background: #d7f4e2;
+  box-shadow: 0 16px 40px rgba(69, 212, 131, 0.26);
+  cursor: pointer;
+}
+
+.tester-output {
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  border-radius: 10px;
+  background: #0c1118;
+  color: #dbe4f3;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
 .settings-grid {
   display: grid;
   gap: 12px;
@@ -1449,6 +1574,7 @@ select:focus {
 }
 
 @media (max-width: 1180px) {
+  .landing-grid,
   .office-stage,
   .work-grid,
   .output-grid {
@@ -1469,5 +1595,14 @@ select:focus {
 
   .code-panel {
     grid-column: auto;
+  }
+
+  .floating-chat {
+    right: 18px;
+    bottom: 18px;
+  }
+
+  .floating-chat-card {
+    width: min(420px, calc(100vw - 36px));
   }
 }

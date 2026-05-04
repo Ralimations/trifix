@@ -430,6 +430,41 @@ async function extractProjectContextFile(filePath) {
 
 async function runProjectCommand(payload = {}) {
   const root = await normalizeCommandRoot(payload.projectRoot);
+  const htmlEntry = await findLaunchableHtml(root);
+  if (!payload.command && payload.mode === "run" && htmlEntry) {
+    const openResult = await shell.openPath(htmlEntry.absolutePath);
+    if (openResult) {
+      throw new Error(openResult);
+    }
+
+    const entry = {
+      id: `cmd-${Date.now()}`,
+      command: `open ${htmlEntry.relativePath}`,
+      mode: payload.mode || "custom",
+      status: "passed",
+      exitCode: 0,
+      timedOut: false,
+      output: `Opened ${htmlEntry.relativePath} in the default browser.`,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString()
+    };
+
+    if (payload.projectId) {
+      const current = await findTrackedProjectByPath(root);
+      await updateTrackedProject(payload.projectId, {
+        status: "In progress",
+        commandStatus: entry.status,
+        commandHistory: [...(current?.commandHistory || []), entry].slice(-30),
+        logs: appendProjectLog(current?.logs, {
+          type: "command",
+          message: `${entry.command} ${entry.status}`
+        })
+      });
+    }
+
+    return entry;
+  }
+
   const command = await resolveProjectCommand(root, payload);
   const startedAt = new Date().toISOString();
   const result = await executeSafeCommand(command, root, payload.mode);
@@ -486,6 +521,9 @@ async function resolveProjectCommand(root, payload) {
   if (payload.mode === "debug") {
     if (scripts.build) return "npm run build";
     if (scripts.test) return "npm test";
+    if (await findLaunchableHtml(root)) {
+      throw new Error("HTML-only projects do not have a debug command. Type /debug-project only for script-based projects.");
+    }
     return "npm test";
   }
 
@@ -499,6 +537,32 @@ async function resolveProjectCommand(root, payload) {
   return "npm test";
 }
 
+async function findLaunchableHtml(root) {
+  const packageScripts = await readPackageScripts(root);
+  if (packageScripts.dev || packageScripts.start || packageScripts.build) {
+    return null;
+  }
+
+  const preferred = path.join(root, "index.html");
+  if (await fileExists(preferred)) {
+    return {
+      absolutePath: preferred,
+      relativePath: "index.html"
+    };
+  }
+
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const htmlFile = entries.find((entry) => entry.isFile() && path.extname(entry.name).toLowerCase() === ".html");
+  if (!htmlFile) {
+    return null;
+  }
+
+  return {
+    absolutePath: path.join(root, htmlFile.name),
+    relativePath: htmlFile.name
+  };
+}
+
 async function readPackageScripts(root) {
   try {
     const raw = await fs.readFile(path.join(root, "package.json"), "utf8");
@@ -506,6 +570,15 @@ async function readPackageScripts(root) {
     return parsed.scripts || {};
   } catch {
     return {};
+  }
+}
+
+async function fileExists(targetPath) {
+  try {
+    const stat = await fs.stat(targetPath);
+    return stat.isFile();
+  } catch {
+    return false;
   }
 }
 

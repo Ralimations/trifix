@@ -54,6 +54,8 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const files = Array.isArray(payload?.files) ? payload.files : [];
   const contextDocuments = Array.isArray(payload?.contextDocuments) ? payload.contextDocuments : [];
   const projectFsd = payload?.fsd || null;
+  const projectRoot = String(payload?.projectRoot || "").trim();
+  const isExistingProjectRequest = Boolean(projectRoot);
   const feedback = String(payload?.feedback || "").trim();
   const loopCount = Number(payload?.loopCount || 0);
   const runId = payload?.runId || randomUUID();
@@ -67,7 +69,15 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     size: file.size,
     extension: file.extension
   }));
-  const compactContext = buildCompactContext({ input, files, language, feedback, contextDocuments, projectFsd });
+  const compactContext = buildCompactContext({
+    input,
+    files,
+    language,
+    feedback,
+    contextDocuments,
+    projectFsd,
+    mode: isExistingProjectRequest ? "existing-project" : "new-project"
+  });
   const revisionBrief = feedback
     ? await createRevisionBrief({
         compactContext,
@@ -80,7 +90,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   let pmPlan = await callAgent({
     agent: AGENTS.architect,
     systemPrompt: buildSystemPrompt(AGENTS.architect),
-    input: buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount }),
+    input: buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }),
     onRequestStatus: (requestStatus) =>
       emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-plan", status: "thinking", requestStatus, loopCount })
   });
@@ -131,35 +141,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     }
   });
 
-  emitProgress({ runId, agent: "supervisor", stage: "qa-scope", status: "thinking" });
-  let qaInstructions = await callAgent({
-    agent: AGENTS.supervisor,
-    systemPrompt: buildSystemPrompt(AGENTS.supervisor),
-    input: buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }),
-    onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-scope", status: "thinking", requestStatus, loopCount, projectPlan })
-  });
-  let qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
+  let qaInstructions = "";
+  let qaStructureReview = null;
 
-  if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
-    emitProgress({ runId, agent: "architect", stage: "pm-revision", status: "thinking" });
-    pmPlan = await callAgent({
-      agent: AGENTS.architect,
-      systemPrompt: buildSystemPrompt(AGENTS.architect),
-      input: buildPmPlanningContext({
-        compactContext,
-        feedback,
-        revisionBrief,
-        loopCount,
-        qaFeedback: qaStructureReview.hardValidationIssues
-      }),
-      onRequestStatus: (requestStatus) =>
-        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-revision", status: "thinking", requestStatus, loopCount, projectPlan })
-    });
-    pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, pmArchitecture);
-    prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
-    projectPlan = buildProjectPlan(prd);
-
+  if (isExistingProjectRequest) {
+    qaStructureReview = buildExistingProjectQaReview({ prd, files, input });
+    qaInstructions = formatQaStructureReview(qaStructureReview);
+  } else {
+    emitProgress({ runId, agent: "supervisor", stage: "qa-scope", status: "thinking" });
     qaInstructions = await callAgent({
       agent: AGENTS.supervisor,
       systemPrompt: buildSystemPrompt(AGENTS.supervisor),
@@ -170,7 +159,37 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
 
     if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
-      throw new Error(`QA rejected PM file architecture: ${qaStructureReview.hardValidationIssues.join("; ") || "No approval returned."}`);
+      emitProgress({ runId, agent: "architect", stage: "pm-revision", status: "thinking" });
+      pmPlan = await callAgent({
+        agent: AGENTS.architect,
+        systemPrompt: buildSystemPrompt(AGENTS.architect),
+          input: buildPmPlanningContext({
+            compactContext,
+            feedback,
+            revisionBrief,
+            loopCount,
+            qaFeedback: qaStructureReview.hardValidationIssues,
+            isExistingProjectRequest
+          }),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-revision", status: "thinking", requestStatus, loopCount, projectPlan })
+      });
+      pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, pmArchitecture);
+      prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
+      projectPlan = buildProjectPlan(prd);
+
+      qaInstructions = await callAgent({
+        agent: AGENTS.supervisor,
+        systemPrompt: buildSystemPrompt(AGENTS.supervisor),
+        input: buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-scope", status: "thinking", requestStatus, loopCount, projectPlan })
+      });
+      qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
+
+      if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
+        throw new Error(`QA rejected PM file architecture: ${qaStructureReview.hardValidationIssues.join("; ") || "No approval returned."}`);
+      }
     }
   }
 
@@ -212,7 +231,19 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const devOutput = await callAgent({
     agent: AGENTS.junior,
     systemPrompt: buildSystemPrompt(AGENTS.junior),
-    input: buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions: qaDevHandoff, qaStructureReview, language, feedback, revisionBrief, loopCount }),
+    input: buildDevImplementationContext({
+      compactContext,
+      prd,
+      pmPlan,
+      pmArchitecture,
+      qaInstructions: qaDevHandoff,
+      qaStructureReview,
+      language,
+      feedback,
+      revisionBrief,
+      loopCount,
+      isExistingProjectRequest
+    }),
     onRequestStatus: (requestStatus) =>
       emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "dev-implementation", status: "coding", requestStatus, loopCount, projectPlan })
   });
@@ -299,7 +330,20 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const pmDecision = await callAgent({
     agent: AGENTS.architect,
     systemPrompt: buildSystemPrompt(AGENTS.architect),
-    input: buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions: qaDevHandoff, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount }),
+    input: buildPmDecisionContext({
+      compactContext,
+      prd,
+      pmPlan,
+      qaInstructions: qaDevHandoff,
+      devOutput,
+      qaReview,
+      devLeadResult,
+      language,
+      feedback,
+      revisionBrief,
+      loopCount,
+      isExistingProjectRequest
+    }),
     onRequestStatus: (requestStatus) =>
       emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-decision", status: "thinking", requestStatus, loopCount, projectPlan })
   });
@@ -516,7 +560,13 @@ function postJson({ endpoint, headers, body, timeoutMs }) {
   });
 }
 
-function buildCompactContext({ input, files, language, feedback, contextDocuments = [], projectFsd = null }) {
+function buildCompactContext({ input, files, language, feedback, contextDocuments = [], projectFsd = null, mode = "new-project" }) {
+  const isExistingProject = mode === "existing-project";
+  const maxInputChars = isExistingProject ? 4000 : 9000;
+  const maxDocumentSummaryChars = isExistingProject ? 3000 : 7000;
+  const maxContextCharsTotal = isExistingProject ? 14000 : MAX_CONTEXT_CHARS_TOTAL;
+  const maxContextCharsPerFile = isExistingProject ? 2800 : MAX_CONTEXT_CHARS_PER_FILE;
+  const filesForContext = isExistingProject ? files.slice(0, 4) : files;
   const chunks = [
     `LANGUAGE: ${language}`,
     [
@@ -529,12 +579,13 @@ function buildCompactContext({ input, files, language, feedback, contextDocument
   ];
 
   if (input) {
-    chunks.push(`USER_INPUT:\n${trimForPrompt(input, 9000)}`);
+    chunks.push(`USER_INPUT:\n${trimForPrompt(input, maxInputChars)}`);
   }
 
-  if (files.length > 0) {
+  if (filesForContext.length > 0) {
     chunks.push(
       `FILES_SELECTED:\n${files
+        .slice(0, filesForContext.length)
         .map((file) => `- ${file.path} (${Math.round(file.size / 1024)} KB)`)
         .join("\n")}`
     );
@@ -544,20 +595,24 @@ function buildCompactContext({ input, files, language, feedback, contextDocument
     chunks.push(`DECISION_FEEDBACK:\n${trimForPrompt(feedback, 1500)}`);
   }
 
-  const documentSummary = buildDocumentContextSummary(contextDocuments, projectFsd);
+  const documentSummary = buildDocumentContextSummary(contextDocuments, projectFsd, {
+    maxSummaryChars: maxDocumentSummaryChars,
+    maxExcerptChars: isExistingProject ? 900 : 1600,
+    maxDocSummaryChars: isExistingProject ? 700 : 1200
+  });
   if (documentSummary) {
     chunks.push(`PROJECT_CONTEXT_SUMMARY:\n${documentSummary}`);
   }
 
-  let remaining = MAX_CONTEXT_CHARS_TOTAL - chunks.join("\n\n").length;
+  let remaining = maxContextCharsTotal - chunks.join("\n\n").length;
 
-  for (const file of files) {
+  for (const file of filesForContext) {
     if (remaining <= 500) {
       break;
     }
 
     const summary = summarizeFile(file);
-    const budget = Math.min(MAX_CONTEXT_CHARS_PER_FILE, remaining);
+    const budget = Math.min(maxContextCharsPerFile, remaining);
     const chunk = trimForPrompt(
       `FILE: ${file.path}\nSUMMARY:\n${summary}\nSNIPPET:\n${file.content}`,
       budget
@@ -571,8 +626,12 @@ function buildCompactContext({ input, files, language, feedback, contextDocument
 }
 
 function buildDocumentContextSummary(contextDocuments = [], projectFsd = null) {
+  const options = arguments[2] || {};
   const docs = Array.isArray(contextDocuments) ? contextDocuments : [];
   const chunks = [];
+  const maxSummaryChars = options.maxSummaryChars || 7000;
+  const maxExcerptChars = options.maxExcerptChars || 1600;
+  const maxDocSummaryChars = options.maxDocSummaryChars || 1200;
 
   if (projectFsd?.summary) {
     chunks.push(`Existing FSD summary:\n${trimForPrompt(projectFsd.summary, 2600)}`);
@@ -582,13 +641,13 @@ function buildDocumentContextSummary(contextDocuments = [], projectFsd = null) {
     chunks.push(
       [
         `Document: ${doc.name || "context"} (${doc.type || doc.extension || "unknown"})`,
-        `Summary: ${trimForPrompt(doc.summary || "", 1200)}`,
-        doc.excerpt ? `Excerpt: ${trimForPrompt(doc.excerpt, 1600)}` : ""
+        `Summary: ${trimForPrompt(doc.summary || "", maxDocSummaryChars)}`,
+        doc.excerpt ? `Excerpt: ${trimForPrompt(doc.excerpt, maxExcerptChars)}` : ""
       ].filter(Boolean).join("\n")
     );
   }
 
-  return trimForPrompt(chunks.join("\n\n"), 7000);
+  return trimForPrompt(chunks.join("\n\n"), maxSummaryChars);
 }
 
 function summarizeFile(file) {
@@ -900,6 +959,47 @@ function normalizeQaStructureReview(parsed, pmArchitecture) {
   };
 }
 
+function buildExistingProjectQaReview({ prd, files, input }) {
+  const requestedFiles = (files || []).map((file) => file.path).filter(Boolean);
+  const devChecklist = [
+    requestedFiles.length > 0
+      ? `Edit only the queued project files unless a small supporting file is clearly required.`
+      : "Edit the smallest existing project surface that satisfies the request.",
+    "Keep the implementation aligned with the current project structure and requested scope.",
+    "Do not create a new project folder or regenerate the project architecture.",
+    "Return concise fileOperations for the files being changed."
+  ];
+
+  const requestedFeature = String(input || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (requestedFeature) {
+    devChecklist.unshift(`Implement this request: ${trimForPrompt(requestedFeature, 160)}`);
+  }
+
+  return {
+    approved: true,
+    issues: [],
+    hardValidationIssues: [],
+    devChecklist,
+    mode: "existing-project",
+    summary: `QA skipped project-creation structure review because the project already exists.${prd?.summary ? ` ${trimForPrompt(prd.summary, 180)}` : ""}`
+  };
+}
+
+function formatQaStructureReview(review) {
+  return JSON.stringify(
+    {
+      approved: Boolean(review?.approved),
+      issues: Array.isArray(review?.issues) ? review.issues : [],
+      devChecklist: Array.isArray(review?.devChecklist) ? review.devChecklist : []
+    },
+    null,
+    2
+  );
+}
+
 function normalizeFileArchitecture(fileArchitecture, requiredFiles) {
   const fromArchitecture = Array.isArray(fileArchitecture)
     ? fileArchitecture.map((item) => ({
@@ -1204,7 +1304,30 @@ async function createRevisionBrief({ compactContext, feedback, loopCount }) {
   return trimForPrompt(output, 800);
 }
 
-function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, qaFeedback = [] }) {
+function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, qaFeedback = [], isExistingProjectRequest = false }) {
+  if (isExistingProjectRequest) {
+    return [
+      trimForPrompt(compactContext, 7000),
+      feedback
+        ? `Previous result was denied in loop ${loopCount}. Address this feedback in the plan:\n${trimForPrompt(feedback, 900)}`
+        : "",
+      revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 500)}` : "",
+      [
+        "This is a follow-up request for an existing project.",
+        "Do not redesign the whole project or restate the full architecture.",
+        "Return JSON only with the smallest affected implementation plan:",
+        "{",
+        '  "projectName": "Current Project",',
+        '  "projectSlug": "current-project",',
+        '  "fileArchitecture": [{ "path": "existing/file.ext", "purpose": "Touched by this request" }],',
+        '  "implementationPlan": ["Update the touched files for this request"],',
+        '  "requiredFiles": ["existing/file.ext"],',
+        '  "qaInstruction": "Verify only the touched scope and affected files."',
+        "}"
+      ].join("\n")
+    ].filter(Boolean).join("\n\n");
+  }
+
   return [
     trimForPrompt(compactContext, 14000),
     feedback
@@ -1259,14 +1382,18 @@ function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture
   ].filter(Boolean).join("\n\n");
 }
 
-function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions, qaStructureReview, language, feedback, revisionBrief, loopCount }) {
+function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions, qaStructureReview, language, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
   return [
-    trimForPrompt(compactContext, 4500),
+    trimForPrompt(compactContext, isExistingProjectRequest ? 2800 : 4500),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
-    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 900)}`,
-    `PM_FILE_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
+    `PM_DIRECTION:\n${trimForPrompt(pmPlan, isExistingProjectRequest ? 500 : 900)}`,
+    ...(isExistingProjectRequest
+      ? []
+      : [`PM_FILE_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`]),
     `QA_DEV_STEPS:\n${trimForPrompt(qaInstructions, 1200)}`,
-    `QA_STRUCTURE_REVIEW:\n${JSON.stringify(qaStructureReview || {}, null, 2)}`,
+    ...(isExistingProjectRequest
+      ? []
+      : [`QA_STRUCTURE_REVIEW:\n${JSON.stringify(qaStructureReview || {}, null, 2)}`]),
     `Preferred language: ${language}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 800)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
@@ -1290,13 +1417,13 @@ function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitec
 
 function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, devLeadResult, feedback, revisionBrief, loopCount }) {
   return [
-    trimForPrompt(compactContext, 7000),
+    trimForPrompt(compactContext, 4500),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
-    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 1200)}`,
-    `QA_ORIGINAL_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1400)}`,
-    `DEV_OUTPUT:\n${trimForPrompt(devOutput, 3200)}`,
+    `PM_DIRECTION:\n${trimForPrompt(pmPlan, 800)}`,
+    `QA_ORIGINAL_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1000)}`,
+    `DEV_OUTPUT:\n${trimForPrompt(devOutput, 2200)}`,
     `DEV_AFFECTED_FILES:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
-    `DEV_FILE_OPERATIONS:\n${JSON.stringify(devLeadResult.fileOperations || [], null, 2).slice(0, 2200)}`,
+    `DEV_FILE_OPERATIONS:\n${JSON.stringify(devLeadResult.fileOperations || [], null, 2).slice(0, 1400)}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
     [
@@ -1315,14 +1442,14 @@ function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, dev
   ].filter(Boolean).join("\n\n");
 }
 
-function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount }) {
+function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
   return [
-    trimForPrompt(compactContext, 6500),
+    trimForPrompt(compactContext, isExistingProjectRequest ? 3600 : 6500),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
-    `PM_INITIAL_PLAN:\n${trimForPrompt(pmPlan, 1400)}`,
-    `QA_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1400)}`,
-    `DEV_IMPLEMENTATION:\n${trimForPrompt(devOutput, 2200)}`,
-    `QA_REVIEW:\n${trimForPrompt(qaReview, 1800)}`,
+    `PM_INITIAL_PLAN:\n${trimForPrompt(pmPlan, isExistingProjectRequest ? 700 : 1400)}`,
+    `QA_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, isExistingProjectRequest ? 800 : 1400)}`,
+    `DEV_IMPLEMENTATION:\n${trimForPrompt(devOutput, isExistingProjectRequest ? 1200 : 2200)}`,
+    `QA_REVIEW:\n${trimForPrompt(qaReview, isExistingProjectRequest ? 1000 : 1800)}`,
     `DEV_FILE_PATHS:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
     `Preferred language: ${language}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}` : "",

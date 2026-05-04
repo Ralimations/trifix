@@ -106,7 +106,7 @@ export async function buildProjectTree(rootPath, options = {}) {
 
   const tree = await walk(root);
   const defaultSelectedFiles = [];
-  collectSelectableFiles(tree, defaultSelectedFiles, 6);
+  collectSelectableFiles(tree, defaultSelectedFiles, 3);
 
   return {
     rootPath: root,

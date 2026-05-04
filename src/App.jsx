@@ -6,13 +6,16 @@ import {
   ChevronDown,
   ChevronRight,
   Code2,
+  FlaskConical,
   FileCode2,
   FilePlus2,
   FolderOpen,
   History,
   Loader2,
+  MessageSquare,
   Play,
   Bug,
+  Plus,
   RefreshCw,
   Settings,
   Sparkles,
@@ -136,7 +139,7 @@ const phraseBank = {
 };
 
 export function App() {
-  const [activeView, setActiveView] = useState("office");
+  const [activeView, setActiveView] = useState("landing");
   const [activeTab, setActiveTab] = useState("architect");
   const [agentCatalog, setAgentCatalog] = useState(INITIAL_AGENTS);
   const [agents, setAgents] = useState(INITIAL_AGENTS);
@@ -168,6 +171,9 @@ export function App() {
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const [testerResult, setTesterResult] = useState(null);
   const [isTesterRunning, setIsTesterRunning] = useState(false);
+  const [draftProjectName, setDraftProjectName] = useState("");
+  const [taskTitle, setTaskTitle] = useState("");
+  const [isChatOpen, setIsChatOpen] = useState(false);
   const [scene, setScene] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [messageQueue, setMessageQueue] = useState([]);
@@ -209,17 +215,17 @@ export function App() {
         setAgentCatalog(nextAgents);
         setAgents(nextAgents);
       })
-      .catch(() => {});
+      .catch(() => { });
 
     window.trifix
       .getLastResult()
       .then((cached) => cached && setResult(cached))
-      .catch(() => {});
+      .catch(() => { });
 
     window.trifix
       .listProjects()
       .then((items) => setTrackedProjects(items || []))
-      .catch(() => {});
+      .catch(() => { });
 
     return window.trifix.onPipelineProgress((progress) => {
       if (progress.runId !== currentRunRef.current) {
@@ -262,9 +268,9 @@ export function App() {
     setAgents((currentAgents) =>
       currentAgents.length > 0
         ? currentAgents.map((agent) => {
-            const updated = nextAgents.find((item) => item.id === agent.id) || agent;
-            return { ...updated, status: agent.status };
-          })
+          const updated = nextAgents.find((item) => item.id === agent.id) || agent;
+          return { ...updated, status: agent.status };
+        })
         : nextAgents
     );
   }, [agentNames, settings]);
@@ -557,7 +563,7 @@ export function App() {
     try {
       const items = await window.trifix.listProjects();
       setTrackedProjects(items || []);
-    } catch {}
+    } catch { }
   }
 
   function handleTypewriterComplete() {
@@ -590,6 +596,8 @@ export function App() {
       contextReady: defaults.length > 0,
       currentStage: "context-ready"
     }));
+    setTaskTitle("");
+    setActiveView("office");
     await refreshTrackedProjects();
   }
 
@@ -719,6 +727,15 @@ export function App() {
     }
   }
 
+  function parseInlineWorkspaceCommand(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "/debug-project" || normalized === "debug project") {
+      return "debug-project";
+    }
+
+    return "";
+  }
+
   function addInstruction() {
     const instruction = window.prompt("Add instruction for the Project Manager");
     if (!instruction?.trim()) {
@@ -776,6 +793,24 @@ export function App() {
     }
   }
 
+  function beginNewProjectFlow() {
+    resetTaskState({ clearProjectSelection: true });
+    setProject(null);
+    setResultProject(null);
+    setSelectedFiles([]);
+    setContextDocuments([]);
+    setCommandLog([]);
+    setTaskTitle(draftProjectName.trim());
+    setCodeInput("");
+    setActiveView("office");
+    setWorkflow((current) => ({
+      ...current,
+      folderLoaded: false,
+      contextReady: false,
+      currentStage: "task-ready"
+    }));
+  }
+
   async function runOffice(nextLoopCount = workflow.loopCount, feedback = "") {
     if (!canRun && !feedback) {
       return;
@@ -789,8 +824,14 @@ export function App() {
 
     let runProject = project;
     let runSelectedFiles = selectedFiles;
+    const inlineCommand = parseInlineWorkspaceCommand(codeInput);
 
     try {
+      if (!feedback && inlineCommand === "debug-project") {
+        await runProjectControl("debug");
+        return;
+      }
+
       if (!runProject?.rootPath) {
         runSelectedFiles = [];
         setActiveView("office");
@@ -807,6 +848,9 @@ export function App() {
       currentRunRef.current = runId;
       setResultProject(runProject?.rootPath ? runProject : null);
       setContextDocuments((current) => current.length > 0 ? current : runProject?.fsd?.documents || []);
+      const effectiveInput = !runProject?.rootPath && taskTitle.trim()
+        ? [`PROJECT_TITLE: ${taskTitle.trim()}`, codeInput].filter(Boolean).join("\n\n")
+        : codeInput;
 
       setDecisionMessage("");
       setDecisionPreview([]);
@@ -833,11 +877,11 @@ export function App() {
 
       const nextResult = await window.trifix.runPipeline({
         runId,
-        input: codeInput,
+        input: effectiveInput,
         language,
         projectRoot: runProject?.rootPath,
         projectId: runProject?.projectId,
-        projectName: runProject?.name || runProject?.rootPath?.split(/[\\/]/).pop(),
+        projectName: runProject?.name || taskTitle.trim() || runProject?.rootPath?.split(/[\\/]/).pop(),
         projectType: runProject?.projectType,
         selectedFiles: runSelectedFiles,
         contextDocuments,
@@ -885,6 +929,7 @@ export function App() {
         setSelectedFiles(generatedProject.defaultSelectedFiles || []);
         setContextDocuments((current) => current.length > 0 ? current : generatedProject.fsd?.documents || []);
         setCommandLog(generatedProject.commandHistory || []);
+        setTaskTitle(generatedProject.projectName || taskTitle);
       } else {
         setResultProject(runProject?.rootPath ? runProject : null);
       }
@@ -1010,8 +1055,7 @@ export function App() {
       const createdCount = applied.applied.filter((item) => item.created).length;
       const updatedCount = applied.applied.length - createdCount;
       setDecisionMessage(
-        `Applied ${applied.applied.length} file(s): ${createdCount} new, ${updatedCount} updated.${
-          applied.backupRoot ? ` Backup: ${applied.backupRoot}` : ""
+        `Applied ${applied.applied.length} file(s): ${createdCount} new, ${updatedCount} updated.${applied.backupRoot ? ` Backup: ${applied.backupRoot}` : ""
         }`
       );
       clearSpeechQueue();
@@ -1092,11 +1136,12 @@ export function App() {
 
   async function startNewTask() {
     resetTaskState({ clearProjectSelection: true });
-    setActiveView("task");
+    setActiveView("landing");
     setProject(null);
     setResultProject(null);
     setContextDocuments([]);
     setCommandLog([]);
+    setTaskTitle("");
     setWorkflow((current) => ({
       ...current,
       folderLoaded: false,
@@ -1123,6 +1168,7 @@ export function App() {
         loopCount: Number(entry?.loopCount || 0),
         decisionStatus: entry?.decisionStatus || "pending"
       }));
+      setTaskTitle(reopened.projectSlug || reopened.name || "");
       setActiveView("office");
       await refreshTrackedProjects();
     } catch (nextError) {
@@ -1236,22 +1282,16 @@ export function App() {
 
         <nav className="nav-list" aria-label="Primary">
           <SidebarButton
-            active={activeView === "task"}
-            icon={<TerminalSquare size={18} />}
-            label="New Task"
-            onClick={startNewTask}
+            active={activeView === "landing"}
+            icon={<Plus size={18} />}
+            label="Home"
+            onClick={() => setActiveView("landing")}
           />
           <SidebarButton
             active={activeView === "office"}
             icon={<BriefcaseBusiness size={18} />}
-            label="Office"
+            label="Workspace"
             onClick={() => setActiveView("office")}
-          />
-          <SidebarButton
-            active={activeView === "projects"}
-            icon={<FolderOpen size={18} />}
-            label="Projects"
-            onClick={() => setActiveView("projects")}
           />
           <SidebarButton
             active={activeView === "reports"}
@@ -1274,11 +1314,24 @@ export function App() {
       </aside>
 
       <main className="main-view">
-        {activeView === "office" || activeView === "task" ? (
+        {activeView === "landing" ? (
+          <LandingView
+            entries={trackedProjects}
+            draftProjectName={draftProjectName}
+            onDraftProjectName={setDraftProjectName}
+            onCreateNewProject={beginNewProjectFlow}
+            onOpenProject={openProject}
+            onContinue={continueTrackedProject}
+            onOpenFolder={(folderPath) => window.trifix.openFolderPath(folderPath)}
+          />
+        ) : null}
+
+        {activeView === "office" ? (
           <OfficeView
             agents={agents}
             agentNameMap={agentNameMap}
             project={project}
+            taskTitle={taskTitle}
             contextDocuments={contextDocuments}
             commandLog={commandLog}
             selectedFiles={selectedFiles}
@@ -1308,11 +1361,9 @@ export function App() {
             onLanguage={setLanguage}
             onRun={() => runOffice(workflow.loopCount, "")}
             onRunProject={() => runProjectControl("run")}
-            onDebugProject={() => runProjectControl("debug")}
-            onAddInstruction={addInstruction}
-            onRunTester={runAgentCapabilityTest}
             isCommandRunning={isCommandRunning}
-            isTesterRunning={isTesterRunning}
+            isChatOpen={isChatOpen}
+            onToggleChat={() => setIsChatOpen((current) => !current)}
             onTabChange={setActiveTab}
             onDecisionReason={setDecisionReason}
             onAccept={acceptDecision}
@@ -1322,20 +1373,14 @@ export function App() {
         ) : null}
 
         {activeView === "reports" ? <ReportsView result={result} testerResult={testerResult} /> : null}
-        {activeView === "projects" ? (
-          <ProjectsView
-            entries={trackedProjects}
-            agentNameMap={agentNameMap}
-            onContinue={continueTrackedProject}
-            onOpenFolder={(folderPath) => window.trifix.openFolderPath(folderPath)}
-            onRemove={removeTrackedProject}
-          />
-        ) : null}
         {activeView === "settings" ? (
           <SettingsView
             settings={settings}
             project={project}
+            testerResult={testerResult}
+            isTesterRunning={isTesterRunning}
             agentNames={agentNames}
+            onRunTester={runAgentCapabilityTest}
             onSettingsChange={(nextSettings) => {
               setSettings(nextSettings);
               const nextAgents = toAgentList(nextSettings?.agents, agentNames);
@@ -1363,6 +1408,7 @@ function OfficeView({
   agents,
   agentNameMap,
   project,
+  taskTitle,
   contextDocuments,
   commandLog = [],
   selectedFiles,
@@ -1392,11 +1438,9 @@ function OfficeView({
   onLanguage,
   onRun,
   onRunProject,
-  onDebugProject,
-  onAddInstruction,
-  onRunTester,
   isCommandRunning,
-  isTesterRunning,
+  isChatOpen,
+  onToggleChat,
   onTabChange,
   onDecisionReason,
   onAccept,
@@ -1414,25 +1458,18 @@ function OfficeView({
     <>
       <header className="workspace-header">
         <div>
-          <p className="eyebrow">AI Software Team Simulator V2</p>
-          <h1>PM, QA, and DEV working through one software workflow.</h1>
+          <p className="eyebrow">TriFix AI Workspace</p>
+          <h1>{project?.name || taskTitle || "Start the next build"}</h1>
+          <p className="workspace-subtitle">
+            {project?.rootPath
+              ? "Continue the current project with explicit files and context."
+              : "Name the task, describe the work, and let the team create the project sandbox when it is ready."}
+          </p>
         </div>
         <div className="button-row">
           <button className="secondary-button" type="button" onClick={onRunProject} disabled={isCommandRunning || !project?.rootPath}>
             {isCommandRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
             Run Project
-          </button>
-          <button className="secondary-button" type="button" onClick={onDebugProject} disabled={isCommandRunning || !project?.rootPath}>
-            <Bug size={18} />
-            Debug Project
-          </button>
-          <button className="secondary-button" type="button" onClick={onAddInstruction}>
-            <FilePlus2 size={18} />
-            Add Instruction
-          </button>
-          <button className="secondary-button" type="button" onClick={onRunTester} disabled={isTesterRunning}>
-            {isTesterRunning ? <Loader2 size={18} className="spin" /> : <TerminalSquare size={18} />}
-            Test Models
           </button>
           <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
             {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
@@ -1455,7 +1492,9 @@ function OfficeView({
         ))}
       </section>
 
-      <ChatPanel
+      <FloatingChatDock
+        isOpen={isChatOpen}
+        onToggle={onToggleChat}
         chatMessages={chatMessages}
         agentNameMap={agentNameMap}
         chatScrollRef={chatScrollRef}
@@ -1504,7 +1543,7 @@ function OfficeView({
             value={codeInput}
             onChange={(event) => onCodeInput(event.target.value)}
             spellCheck="false"
-            placeholder="Paste an FSD, product request, bug report, or instruction for the Project Manager..."
+            placeholder={`Paste an FSD, product request, bug report, or instruction for the Project Manager...${project?.rootPath ? "\n\nType /debug-project to run project checks from text." : ""}`}
           />
           {contextDocuments.length > 0 ? (
             <div className="context-doc-list">
@@ -1591,9 +1630,8 @@ function AgentCard({ agent, chatMessage, onTypewriterComplete, isActive, isDimme
 
   return (
     <article
-      className={`agent-card ${agent.color} status-${agent.status} ${isActive ? "is-active" : ""} ${
-        isDimmed ? "is-dimmed" : ""
-      }`}
+      className={`agent-card ${agent.color} status-${agent.status} ${isActive ? "is-active" : ""} ${isDimmed ? "is-dimmed" : ""
+        }`}
     >
       <div className="agent-card-glow" />
       <div className="agent-topline">
@@ -1652,14 +1690,45 @@ function AgentSpeechBubble({ agent, bubble, onComplete }) {
   );
 }
 
+function FloatingChatDock({ isOpen, onToggle, chatMessages, agentNameMap, chatScrollRef, onTypewriterComplete }) {
+  return (
+    <div className={`floating-chat ${isOpen ? "open" : ""}`}>
+      {isOpen ? (
+        <div className="floating-chat-card">
+          <div className="floating-chat-header">
+            <div>
+              <p className="eyebrow">Agent Chat</p>
+              <h2>Team conversation</h2>
+            </div>
+            <button className="icon-button" type="button" onClick={onToggle} title="Close chat">
+              <XCircle size={18} />
+            </button>
+          </div>
+          <ChatPanel
+            chatMessages={chatMessages}
+            agentNameMap={agentNameMap}
+            chatScrollRef={chatScrollRef}
+            onTypewriterComplete={onTypewriterComplete}
+            compact
+          />
+        </div>
+      ) : null}
+      <button className="floating-chat-toggle" type="button" onClick={onToggle} aria-label="Toggle agent chat">
+        <MessageSquare size={18} />
+      </button>
+    </div>
+  );
+}
+
 function ChatPanel({
   chatMessages,
   agentNameMap,
   chatScrollRef,
-  onTypewriterComplete
+  onTypewriterComplete,
+  compact = false
 }) {
   return (
-    <section className="chat-panel" aria-label="Agent chat">
+    <section className={`chat-panel ${compact ? "compact" : ""}`} aria-label="Agent chat">
       <div className="output-section-header">
         <div>
           <p className="eyebrow">Agent Chat</p>
@@ -1674,9 +1743,8 @@ function ChatPanel({
           chatMessages.map((message) => (
             <article
               key={message.id}
-              className={`chat-message ${message.from} ${message.type === "chatter" ? "is-chatter" : ""} ${
-                message.status === "typing" ? "is-active" : ""
-              }`}
+              className={`chat-message ${message.from} ${message.type === "chatter" ? "is-chatter" : ""} ${message.status === "typing" ? "is-active" : ""
+                }`}
             >
               <div className="chat-head">
                 <strong>{formatAgentName(message.from, agentNameMap)}</strong>
@@ -1708,7 +1776,7 @@ function TypewriterText({ text, active, speed = TYPE_SPEED, onComplete }) {
   useEffect(() => {
     if (!active) {
       setVisibleCount(words.length);
-      return () => {};
+      return () => { };
     }
 
     let cancelled = false;
@@ -1737,7 +1805,7 @@ function TypewriterText({ text, active, speed = TYPE_SPEED, onComplete }) {
 
     if (words.length === 0) {
       onComplete?.();
-      return () => {};
+      return () => { };
     }
 
     timeoutId = setTimeout(() => tick(0), speed);
@@ -2153,12 +2221,98 @@ function ReportsView({ result, testerResult }) {
         decisionReason=""
         decisionMessage=""
         isDecisionBusy={false}
-        onTabChange={() => {}}
-        onDecisionReason={() => {}}
-        onAccept={() => {}}
-        onAcceptAndApply={() => {}}
-        onDeny={() => {}}
+        onTabChange={() => { }}
+        onDecisionReason={() => { }}
+        onAccept={() => { }}
+        onAcceptAndApply={() => { }}
+        onDeny={() => { }}
       />
+    </section>
+  );
+}
+
+function LandingView({ entries, draftProjectName, onDraftProjectName, onCreateNewProject, onOpenProject, onContinue, onOpenFolder }) {
+  const recentEntries = [...(entries || [])]
+    .sort((left, right) => String(right.lastUpdated || "").localeCompare(String(left.lastUpdated || "")))
+    .slice(0, 6);
+
+  return (
+    <section className="landing-view">
+      <div className="landing-hero">
+        <p className="eyebrow">TriFix AI</p>
+        <h1>Choose a workspace before the team starts.</h1>
+        <p className="landing-copy">
+          Start a titled sandbox task, reopen a recent project, or open a folder without auto-queueing files.
+        </p>
+      </div>
+
+      <div className="landing-grid">
+        <div className="landing-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">New Project</p>
+              <h2>Create a titled sandbox task</h2>
+            </div>
+          </div>
+          <label className="dialogue-field">
+            <span>Sandbox name</span>
+            <input
+              type="text"
+              value={draftProjectName}
+              onChange={(event) => onDraftProjectName(event.target.value)}
+              placeholder="SimpleDash"
+            />
+          </label>
+          <div className="landing-actions">
+            <button className="primary-button" type="button" onClick={onCreateNewProject}>
+              <Plus size={16} />
+              Create New Project
+            </button>
+            <button className="secondary-button" type="button" onClick={onOpenProject}>
+              <FolderOpen size={16} />
+              Open Folder
+            </button>
+          </div>
+        </div>
+
+        <div className="landing-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Recents</p>
+              <h2>Continue existing work</h2>
+            </div>
+          </div>
+          {recentEntries.length === 0 ? (
+            <div className="empty-output">No recent projects yet.</div>
+          ) : (
+            <div className="landing-recents">
+              {recentEntries.map((entry) => (
+                <article key={entry.id} className="project-card compact">
+                  <div className="project-card-top">
+                    <div>
+                      <h2>{entry.name}</h2>
+                      <div className="project-path" title={entry.path}>{entry.path}</div>
+                    </div>
+                    <span className={`status-badge ${toStatusBadgeClass(entry.status)}`}>{entry.status}</span>
+                  </div>
+                  <div className="project-stats">
+                    {entry.projectSlug ? <span>Slug: {entry.projectSlug}</span> : null}
+                    <span>Updated: {formatTimestamp(entry.lastUpdated)}</span>
+                  </div>
+                  <div className="landing-actions">
+                    <button className="primary-button" type="button" onClick={() => onContinue(entry)}>
+                      Continue
+                    </button>
+                    <button className="secondary-button" type="button" onClick={() => onOpenFolder(entry.path)}>
+                      Open Folder
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </section>
   );
 }
@@ -2264,7 +2418,7 @@ function SceneOverlay({ scene }) {
   );
 }
 
-function SettingsView({ settings, project, agentNames, onSettingsChange, onAgentNamesChange }) {
+function SettingsView({ settings, project, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
   const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
   const [nameDraft, setNameDraft] = useState(() => ({
     juniorName: agentNames.junior || "",
@@ -2332,16 +2486,29 @@ function SettingsView({ settings, project, agentNames, onSettingsChange, onAgent
         </div>
         {settings?.agents
           ? Object.values(settings.agents).map((agent) => (
-              <div className="settings-row" key={agent.id}>
-                <span>{formatAgentName(agent.id, {
-                  junior: agentNames.junior || "DEV",
-                  supervisor: agentNames.supervisor || "QA",
-                  architect: agentNames.architect || "PROJECT MANAGER"
-                })}</span>
-                <code>{`${agent.model} | ${agent.endpoint} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
-              </div>
-            ))
+            <div className="settings-row" key={agent.id}>
+              <span>{formatAgentName(agent.id, {
+                junior: agentNames.junior || "DEV",
+                supervisor: agentNames.supervisor || "QA",
+                architect: agentNames.architect || "PROJECT MANAGER"
+              })}</span>
+              <code>{`${agent.model} | ${agent.endpoint} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
+            </div>
+          ))
           : null}
+      </div>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Model Test</p>
+            <h2>Check agent responses</h2>
+          </div>
+          <button className="secondary-button" type="button" onClick={onRunTester} disabled={isTesterRunning}>
+            {isTesterRunning ? <Loader2 size={18} className="spin" /> : <FlaskConical size={18} />}
+            Test Models
+          </button>
+        </div>
+        {testerResult ? <pre className="tester-output">{testerResult.output}</pre> : <p className="muted">Run a quick capability test from here.</p>}
       </div>
       <div className="dialogue-editor">
         <div className="panel-heading">
