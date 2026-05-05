@@ -43,6 +43,7 @@ async function loadBackend() {
     AI_ENDPOINT: constants.AI_ENDPOINT,
     DEV_ENDPOINT: constants.DEV_ENDPOINT,
     ARCHITECT_ENDPOINT: constants.ARCHITECT_ENDPOINT,
+    DEFAULT_SANDBOX_PROJECT_NAME: constants.DEFAULT_SANDBOX_PROJECT_NAME,
     buildDefaultSandboxProject: fileSystem.buildDefaultSandboxProject,
     buildTaskSandboxProject: fileSystem.buildTaskSandboxProject,
     buildProjectTree: fileSystem.buildProjectTree,
@@ -262,7 +263,7 @@ function registerIpc() {
           loopCount: Number(result?.workflow?.loopCount || payload?.loopCount || 0),
           lastAgent: "junior",
           affectedFiles: generatedProject.applied.map((item) => item.path),
-          decisionStatus: "applied",
+          decisionStatus: "pending",
           fsd: result?.project?.fsd || payload?.fsd || null,
           prd: result?.project?.prd || null,
           phases: result?.project?.phases || [],
@@ -290,12 +291,12 @@ function registerIpc() {
     }
 
     await updateTrackedProject(activeTrackedEntry?.id, {
-      status: result?.executor?.applied?.length ? "Files written" : "Waiting for decision",
+      status: result?.executor?.applied?.length ? "Output ready" : "Waiting for decision",
       loopCount: Number(result?.workflow?.loopCount || payload?.loopCount || 0),
       lastAgent: "architect",
       lastUpdated: new Date().toISOString(),
       affectedFiles: result?.decision?.affectedFiles || [],
-      decisionStatus: result?.executor?.applied?.length ? "applied" : "pending",
+      decisionStatus: "pending",
       fsd: result?.project?.fsd || payload?.fsd || activeTrackedEntry?.fsd || null,
       prd: result?.project?.prd || activeTrackedEntry?.prd || null,
       phases: result?.project?.phases || activeTrackedEntry?.phases || [],
@@ -351,6 +352,10 @@ function registerIpc() {
     });
     return applied;
   });
+
+  ipcMain.handle("decision:discard-output", async (_event, payload = {}) =>
+    discardGeneratedOutput(payload)
+  );
 }
 
 async function uploadProjectContext(payload = {}) {
@@ -431,6 +436,35 @@ async function extractProjectContextFile(filePath) {
 async function runProjectCommand(payload = {}) {
   const root = await normalizeCommandRoot(payload.projectRoot);
   const htmlEntry = await findLaunchableHtml(root);
+  if (!payload.command && payload.mode === "validate" && htmlEntry) {
+    const entry = {
+      id: `cmd-${Date.now()}`,
+      command: `validate ${htmlEntry.relativePath}`,
+      mode: "validate",
+      status: "passed",
+      exitCode: 0,
+      timedOut: false,
+      output: `Found launchable HTML entry: ${htmlEntry.relativePath}.`,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString()
+    };
+
+    if (payload.projectId) {
+      const current = await findTrackedProjectByPath(root);
+      await updateTrackedProject(payload.projectId, {
+        status: "In progress",
+        commandStatus: entry.status,
+        commandHistory: [...(current?.commandHistory || []), entry].slice(-30),
+        logs: appendProjectLog(current?.logs, {
+          type: "command",
+          message: `${entry.command} ${entry.status}`
+        })
+      });
+    }
+
+    return entry;
+  }
+
   if (!payload.command && payload.mode === "run" && htmlEntry) {
     const openResult = await shell.openPath(htmlEntry.absolutePath);
     if (openResult) {
@@ -496,6 +530,34 @@ async function runProjectCommand(payload = {}) {
   return entry;
 }
 
+async function discardGeneratedOutput(payload = {}) {
+  const rootPath = String(payload?.projectRoot || "").trim();
+  if (!rootPath) {
+    throw new Error("No generated output folder was provided.");
+  }
+
+  const root = await fs.realpath(rootPath);
+  const tasksRoot = path.join(app.getPath("documents"), backend.DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks");
+  const resolvedTasksRoot = await fs.realpath(tasksRoot);
+  const relative = path.relative(resolvedTasksRoot, root);
+
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Only generated task sandbox output can be discarded.");
+  }
+
+  await fs.rm(root, { recursive: true, force: true });
+
+  if (payload.projectId) {
+    await removeTrackedProject(payload.projectId);
+  }
+
+  return {
+    discarded: true,
+    rootPath: root,
+    discardedAt: new Date().toISOString()
+  };
+}
+
 async function normalizeCommandRoot(rootPath) {
   if (!rootPath || typeof rootPath !== "string") {
     throw new Error("Project folder is missing.");
@@ -525,6 +587,12 @@ async function resolveProjectCommand(root, payload) {
       throw new Error("HTML-only projects do not have a debug command. Type /debug-project only for script-based projects.");
     }
     return "npm test";
+  }
+
+  if (payload.mode === "validate") {
+    if (scripts.build) return "npm run build";
+    if (scripts.test) return "npm test";
+    throw new Error("No validation command is available for this project.");
   }
 
   if (payload.mode === "install") {
@@ -616,6 +684,11 @@ async function executeSafeCommand(command, root, mode) {
   const normalized = normalizeSuggestedCommand(command);
   validateSafeCommand(normalized, root);
   const parts = splitCommand(normalized);
+  const isLongRunningRun =
+    mode === "run" &&
+    parts[0] === "npm" &&
+    parts[1] === "run" &&
+    ["dev", "start"].includes(parts[2]);
 
   if (parts[0] === "mkdir") {
     const target = path.resolve(root, parts.slice(1).join(" "));
@@ -633,7 +706,7 @@ async function executeSafeCommand(command, root, mode) {
   const args = process.platform === "win32" && parts[0] === "npm"
     ? ["/d", "/s", "/c", normalized]
     : parts.slice(1);
-  const timeoutMs = mode === "run" ? 20000 : 120000;
+  const timeoutMs = isLongRunningRun ? 10000 : (mode === "run" ? 20000 : 120000);
 
   return new Promise((resolve) => {
     let child;
@@ -641,8 +714,13 @@ async function executeSafeCommand(command, root, mode) {
       child = spawn(executable, args, {
         cwd: root,
         shell: false,
-        windowsHide: true
+        windowsHide: true,
+        detached: isLongRunningRun,
+        stdio: isLongRunningRun ? "ignore" : ["ignore", "pipe", "pipe"]
       });
+      if (isLongRunningRun) {
+        child.unref();
+      }
     } catch (error) {
       resolve({
         exitCode: 1,
@@ -655,14 +733,23 @@ async function executeSafeCommand(command, root, mode) {
     let settled = false;
     const timeout = setTimeout(() => {
       settled = true;
+      if (isLongRunningRun) {
+        resolve({
+          exitCode: 0,
+          timedOut: false,
+          output: `${output}\n[TriFix started "${normalized}" as a long-running project process.]`
+        });
+        return;
+      }
+
       child.kill();
       resolve({ exitCode: 124, timedOut: true, output: `${output}\n[TriFix stopped the command after ${timeoutMs / 1000}s.]` });
     }, timeoutMs);
 
-    child.stdout.on("data", (chunk) => {
+    child.stdout?.on("data", (chunk) => {
       output += chunk.toString();
     });
-    child.stderr.on("data", (chunk) => {
+    child.stderr?.on("data", (chunk) => {
       output += chunk.toString();
     });
     child.on("error", (error) => {
@@ -754,7 +841,7 @@ function attachGeneratedProjectResult(result, generatedProject) {
       ...(result?.decision || {}),
       affectedFiles: appliedFiles,
       canApply: false,
-      decisionStatus: "applied",
+      decisionStatus: "pending",
       summary: `${result?.decision?.summary || "DEV wrote files."} Executor applied ${appliedFiles.length} file operation(s).`
     },
     workflow: {
@@ -762,9 +849,9 @@ function attachGeneratedProjectResult(result, generatedProject) {
       folderLoaded: true,
       contextReady: true,
       currentStage: "file-executor",
-      decisionStatus: "applied",
-      projectStatus: failedOperations.length > 0 ? "Files written with issues" : "Files written",
-      currentTask: `Executor applied ${appliedFiles.length} file operation(s).`
+      decisionStatus: "pending",
+      projectStatus: failedOperations.length > 0 ? "Output ready with issues" : "Output ready",
+      currentTask: `Review ${appliedFiles.length} written file operation(s).`
     }
   };
 }

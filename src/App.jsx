@@ -25,7 +25,6 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
-  TerminalSquare,
   TriangleAlert,
   ArrowUpDown,
   XCircle
@@ -202,6 +201,7 @@ export function App() {
   const chatterReplyTimeoutRef = useRef(null);
   const chatterHardTimeoutRef = useRef(null);
   const chatScrollRef = useRef(null);
+  const autoRequiredStepsKeyRef = useRef("");
   const selectedFileSet = useMemo(() => new Set(selectedFiles), [selectedFiles]);
   const canRun =
     !isRunning &&
@@ -281,6 +281,37 @@ export function App() {
         : nextAgents
     );
   }, [agentNames, settings]);
+
+  useEffect(() => {
+    const targetProject = resultProject || project || normalizeGeneratedProject(result, null);
+    const shouldRun =
+      shouldShowCycleReview({ result, workflow, isRunning }) &&
+      !isCommandRunning &&
+      Boolean(targetProject?.rootPath);
+
+    if (!shouldRun || workflow.commandStatus === "running") {
+      return;
+    }
+
+    const commandKey = uniqueStrings([
+      ...(result?.pm?.commandRequests || []),
+      ...(result?.dev?.commandRequests || [])
+    ]).join("|");
+    const runKey = [
+      targetProject.rootPath,
+      workflow.loopCount || 0,
+      result?.decision?.summary || "",
+      result?.executor?.applied?.length || 0,
+      commandKey
+    ].join("::");
+
+    if (!runKey.trim() || autoRequiredStepsKeyRef.current === runKey) {
+      return;
+    }
+
+    autoRequiredStepsKeyRef.current = runKey;
+    void runRequiredSteps();
+  }, [result, resultProject, project, workflow, isRunning, isCommandRunning]);
 
   useEffect(() => {
     if (isTyping || activeMessage || messageQueue.length === 0) {
@@ -688,6 +719,11 @@ export function App() {
       commandStatus: mode === "debug" ? "debugging" : "running",
       projectStatus: mode === "debug" ? "Debugging" : "Running"
     }));
+    setDecisionMessage(
+      mode === "debug"
+        ? "Debug request started. The app is collecting command output from this sandbox."
+        : "Run request started. The app is running the project from its sandbox."
+    );
     enqueueAgentMessage({
       from: mode === "debug" ? "supervisor" : "junior",
       to: "team",
@@ -752,6 +788,7 @@ export function App() {
       commandStatus: "running",
       projectStatus: "Running setup command"
     }));
+    setDecisionMessage(`Setup command started: ${normalized}`);
     enqueueAgentMessage({
       from: "architect",
       to: "junior",
@@ -783,6 +820,82 @@ export function App() {
         ...current,
         commandStatus: "error",
         projectStatus: "Setup command failed"
+      }));
+    } finally {
+      setIsCommandRunning(false);
+    }
+  }
+
+  async function runRequiredSteps() {
+    const targetProject = resultProject || project || normalizeGeneratedProject(result, null);
+    if (!targetProject?.rootPath) {
+      setDecisionMessage("Open or create a project before running automatic checks.");
+      return;
+    }
+
+    const commands = uniqueStrings([
+      ...(result?.pm?.commandRequests || []),
+      ...(result?.dev?.commandRequests || [])
+    ]);
+
+    setIsCommandRunning(true);
+    setWorkflow((current) => ({
+      ...current,
+      commandStatus: "running",
+      projectStatus: "Running automatic checks"
+    }));
+    setDecisionMessage("Automatic checks started. The app is running setup and validation inside the sandbox.");
+    enqueueAgentMessage({
+      from: "architect",
+      to: "team",
+      text: "Running setup and validation automatically.",
+      message: "Running setup and validation automatically.",
+      type: "status",
+      priority: "high",
+      restoreState: "installing"
+    });
+
+    try {
+      const entries = [];
+      for (const command of commands) {
+        const entry = await window.trifix.runProjectCommand({
+          projectRoot: targetProject.rootPath,
+          projectId: targetProject.projectId,
+          mode: "custom",
+          command
+        });
+        entries.push(entry);
+        setCommandLog((current) => [...current, entry].slice(-30));
+        if (entry.status !== "passed") {
+          throw new Error(`${entry.command} failed.`);
+        }
+      }
+
+      const validationEntry = await window.trifix.runProjectCommand({
+        projectRoot: targetProject.rootPath,
+        projectId: targetProject.projectId,
+        mode: "validate"
+      });
+      entries.push(validationEntry);
+      setCommandLog((current) => [...current, validationEntry].slice(-30));
+
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: validationEntry.status,
+        projectStatus: validationEntry.status === "passed" ? "Automatic checks passed" : "Validation failed"
+      }));
+      setDecisionMessage(
+        validationEntry.status === "passed"
+          ? `Automatic checks passed (${entries.length} step(s)).`
+          : `${validationEntry.command} failed.`
+      );
+      await refreshTrackedProjects();
+    } catch (commandError) {
+      setDecisionMessage(commandError?.message || "Automatic checks failed.");
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: "error",
+        projectStatus: "Automatic checks failed"
       }));
     } finally {
       setIsCommandRunning(false);
@@ -913,8 +1026,13 @@ export function App() {
       const effectiveInput = !runProject?.rootPath && taskTitle.trim()
         ? [`PROJECT_TITLE: ${taskTitle.trim()}`, codeInput].filter(Boolean).join("\n\n")
         : codeInput;
+      const runStartMessage = feedback
+        ? "Patch run started. The team will edit the current sandbox output in place."
+        : runProject?.rootPath
+          ? "Run request started. The team is working inside the selected sandbox."
+          : "Run request started. The team will create output files inside a new sandbox.";
 
-      setDecisionMessage("");
+      setDecisionMessage(runStartMessage);
       setDecisionPreview([]);
       setActiveTab("architect");
       setResult(null);
@@ -936,6 +1054,15 @@ export function App() {
         projectStatus: "In progress",
         commandStatus: "idle"
       }));
+      enqueueAgentMessage({
+        from: "architect",
+        to: "team",
+        text: runStartMessage,
+        message: runStartMessage,
+        type: "status",
+        priority: "high",
+        restoreState: "thinking"
+      });
 
       const nextResult = await window.trifix.runPipeline({
         runId,
@@ -986,9 +1113,10 @@ export function App() {
       }
       const generatedProject = normalizeGeneratedProject(nextResult, runProject);
       if (generatedProject?.rootPath) {
+        const outputFiles = getResultOutputFiles(nextResult);
         setProject(generatedProject);
         setResultProject(generatedProject);
-        setSelectedFiles(generatedProject.defaultSelectedFiles || []);
+        setSelectedFiles(outputFiles.length > 0 ? outputFiles : (generatedProject.defaultSelectedFiles || []));
         setContextDocuments((current) => current.length > 0 ? current : generatedProject.fsd?.documents || []);
         setCommandLog(generatedProject.commandHistory || []);
         setTaskTitle(generatedProject.projectName || taskTitle);
@@ -1056,6 +1184,24 @@ export function App() {
         phases: planState.phases,
         tasks: planState.tasks
       });
+      const outputFiles = getResultOutputFiles(result);
+      const activeProject = resultProject || project || normalizeGeneratedProject(result, null);
+      if (activeProject?.rootPath) {
+        const refreshed = await window.trifix.refreshProject(activeProject.rootPath);
+        const nextSelectedFiles = outputFiles.filter((filePath) => hasPath(refreshed.tree, filePath));
+        const nextProject = {
+          ...refreshed,
+          ...(activeProject || {}),
+          tree: refreshed.tree,
+          defaultSelectedFiles: refreshed.defaultSelectedFiles || activeProject.defaultSelectedFiles || [],
+          phases: planState.phases,
+          tasks: planState.tasks
+        };
+        setProject(nextProject);
+        setResultProject(nextProject);
+        setSelectedFiles(nextSelectedFiles.length > 0 ? nextSelectedFiles : (refreshed.defaultSelectedFiles || []));
+        setCommandLog(refreshed.commandHistory || activeProject.commandHistory || []);
+      }
       setWorkflow((current) => ({
         ...current,
         decisionStatus: "accepted",
@@ -1235,6 +1381,49 @@ export function App() {
     await refreshTrackedProjects();
 
     await runOffice(workflow.loopCount + 1, reason);
+  }
+
+  async function discardOutputDecision() {
+    const outputProject = resultProject || project || normalizeGeneratedProject(result, null);
+    if (!canDiscardGeneratedOutput(outputProject, result)) {
+      setDecisionMessage("Only generated sandbox output can be discarded automatically.");
+      return;
+    }
+
+    const confirmed = window.confirm(`Discard generated output "${outputProject.name || outputProject.projectName || "this sandbox"}"? This deletes the files from disk.`);
+    if (!confirmed) {
+      setDecisionMessage("Discard cancelled.");
+      return;
+    }
+
+    setIsDecisionBusy(true);
+    try {
+      await window.trifix.discardOutput({
+        projectRoot: outputProject.rootPath,
+        projectId: outputProject.projectId
+      });
+      setDecisionMessage("Generated output discarded.");
+      setResult(null);
+      setProject(null);
+      setResultProject(null);
+      setSelectedFiles([]);
+      setCommandLog([]);
+      setDecisionPreview([]);
+      setWorkflow((current) => ({
+        ...current,
+        folderLoaded: false,
+        contextReady: contextDocuments.length > 0 || codeInput.trim().length > 0,
+        currentStage: "discarded",
+        decisionStatus: "denied",
+        projectStatus: "Output discarded",
+        commandStatus: "idle"
+      }));
+      await refreshTrackedProjects();
+    } catch (discardError) {
+      setDecisionMessage(discardError?.message || "Could not discard generated output.");
+    } finally {
+      setIsDecisionBusy(false);
+    }
   }
 
   async function startNewTask() {
@@ -1512,9 +1701,9 @@ export function App() {
             onDecisionReason={setDecisionReason}
         onAccept={finishCycle}
         onAcceptAndApply={previewAndApply}
-        onRunCommand={runSuggestedCommand}
         onAdvanceCycle={proceedToNextPhase}
-        onDeny={denyDecision}
+        onNeedsPatch={denyDecision}
+        onDiscardOutput={discardOutputDecision}
       />
         ) : null}
 
@@ -1591,9 +1780,9 @@ function OfficeView({
   onDecisionReason,
   onAccept,
   onAcceptAndApply,
-  onRunCommand,
   onAdvanceCycle,
-  onDeny
+  onNeedsPatch,
+  onDiscardOutput
 }) {
   const activeAgentId = getVisibleActiveAgentId(agents, activeMessage, isRunning);
   const displayAgents = agents.map((agent) => ({
@@ -1602,19 +1791,49 @@ function OfficeView({
   }));
   const focusedSpeakerId = activeMessage && isImportantVisualMessage(activeMessage) ? activeAgentId : "";
   const showCycleReview = shouldShowCycleReview({ result, workflow, isRunning });
+  const [isCycleReviewOpen, setIsCycleReviewOpen] = useState(false);
+  const lastOpenedReviewKey = useRef("");
+  const reviewKey = `${workflow?.loopCount || 0}:${workflow?.decisionStatus || ""}:${result?.decision?.summary || ""}`;
+
+  useEffect(() => {
+    if (!showCycleReview) {
+      setIsCycleReviewOpen(false);
+      return;
+    }
+
+    if (lastOpenedReviewKey.current !== reviewKey) {
+      lastOpenedReviewKey.current = reviewKey;
+      setIsCycleReviewOpen(true);
+    }
+  }, [reviewKey, showCycleReview]);
 
   return (
     <>
       {showCycleReview ? (
-        <CycleReviewCard
-          result={result}
-          workflow={workflow}
-          isBusy={isDecisionBusy}
-          onAdvanceCycle={onAdvanceCycle}
-          onFinishCycle={onAccept}
-          onNeedsPatch={onDeny}
-          onRunCommand={onRunCommand}
-        />
+        <CycleReviewLauncher result={result} workflow={workflow} onOpen={() => setIsCycleReviewOpen(true)} />
+      ) : null}
+
+      {showCycleReview && isCycleReviewOpen ? (
+        <div className="cycle-review-overlay" role="presentation" onMouseDown={() => setIsCycleReviewOpen(false)}>
+          <div
+            className="cycle-review-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cycle review"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <CycleReviewCard
+              result={result}
+              workflow={workflow}
+              isBusy={isDecisionBusy}
+              onAdvanceCycle={onAdvanceCycle}
+              onFinishCycle={onAccept}
+              onNeedsPatch={onNeedsPatch}
+              onDiscardOutput={onDiscardOutput}
+            onClose={() => setIsCycleReviewOpen(false)}
+          />
+          </div>
+        </div>
       ) : null}
 
       <header className="workspace-header">
@@ -1774,9 +1993,9 @@ function OfficeView({
         onDecisionReason={onDecisionReason}
         onAccept={onAccept}
         onAcceptAndApply={onAcceptAndApply}
-        onRunCommand={onRunCommand}
         onAdvanceCycle={onAdvanceCycle}
-        onDeny={onDeny}
+        onNeedsPatch={onNeedsPatch}
+        onDiscardOutput={onDiscardOutput}
       />
     </>
   );
@@ -2007,9 +2226,9 @@ function OutputBin({
   onDecisionReason,
   onAccept,
   onAcceptAndApply,
-  onRunCommand,
   onAdvanceCycle,
-  onDeny
+  onNeedsPatch,
+  onDiscardOutput
 }) {
   return (
     <section className="output-section" aria-label="Output Bin">
@@ -2060,7 +2279,7 @@ function OutputBin({
             content={joinSections([
               ["Review", result?.supervisor?.critique],
               ["Suggested Changes", result?.supervisor?.suggestedChanges],
-              ["Instructions", result?.qa?.instructions]
+              ["Review Notes", result?.qa?.instructions]
             ])}
             tone="red"
           />
@@ -2071,7 +2290,6 @@ function OutputBin({
             content={joinSections([
               ["Summary", result?.architect?.summary],
               ["PRD / Direction", result?.pm?.plan],
-              ["Setup Commands", (result?.pm?.commandRequests || []).join("\n")],
               ["Decision", result?.architect?.recommendation]
             ])}
             tone="green"
@@ -2097,9 +2315,9 @@ function OutputBin({
             onDecisionReason={onDecisionReason}
             onAccept={onAccept}
             onAcceptAndApply={onAcceptAndApply}
-            onRunCommand={onRunCommand}
             onAdvanceCycle={onAdvanceCycle}
-            onDeny={onDeny}
+            onNeedsPatch={onNeedsPatch}
+            onDiscardOutput={onDiscardOutput}
           />
         ) : null}
       </div>
@@ -2117,9 +2335,9 @@ function DecisionPanel({
   onDecisionReason,
   onAccept,
   onAcceptAndApply,
-  onRunCommand,
   onAdvanceCycle,
-  onDeny
+  onNeedsPatch,
+  onDiscardOutput
 }) {
   const decision = result?.decision;
 
@@ -2159,33 +2377,6 @@ function DecisionPanel({
               <li key={`${item}-${index}`}>{item}</li>
             ))}
           </ul>
-          {result?.dev?.commandRequests?.length ? (
-            <>
-              <h3>Junior Dev Command Requests</h3>
-              <ul className="decision-list">
-                {result.dev.commandRequests.map((item, index) => (
-                  <li key={`${item}-${index}`}>{item}</li>
-                ))}
-              </ul>
-            </>
-          ) : null}
-          {result?.pm?.commandRequests?.length ? (
-            <>
-              <h3>Supervisor Setup Commands</h3>
-              <ul className="decision-list">
-                {result.pm.commandRequests.map((item, index) => (
-                  <li key={`${item}-${index}`}>
-                    <div className="decision-command-row">
-                      <code>{item}</code>
-                      <button className="secondary-button" type="button" onClick={() => onRunCommand(item)} disabled={isDecisionBusy}>
-                        Run
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </>
-          ) : null}
           {result?.executor ? (
             <>
               <h3>File Executor</h3>
@@ -2208,18 +2399,18 @@ function DecisionPanel({
           <CheckCircle2 size={16} />
           Finish Cycle
         </button>
-        <button className="primary-button" type="button" onClick={onAcceptAndApply} disabled={isDecisionBusy}>
-          {isDecisionBusy ? <Loader2 size={16} className="spin" /> : <Play size={16} />}
-          Accept and Apply
-        </button>
-        <button className="secondary-button danger" type="button" onClick={onDeny} disabled={isDecisionBusy}>
+        <button className="secondary-button" type="button" onClick={onNeedsPatch} disabled={isDecisionBusy}>
           <XCircle size={16} />
-          Deny
+          Needs Patch
+        </button>
+        <button className="secondary-button danger" type="button" onClick={onDiscardOutput} disabled={isDecisionBusy}>
+          <XCircle size={16} />
+          Discard Output
         </button>
       </div>
 
       <label className="deny-reason">
-        <span>Deny reason / correction feedback</span>
+        <span>Patch request / correction feedback</span>
         <textarea
           value={decisionReason}
           onChange={(event) => onDecisionReason(event.target.value)}
@@ -2253,9 +2444,23 @@ function DecisionPanel({
   );
 }
 
-function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCycle, onNeedsPatch, onRunCommand }) {
+function CycleReviewLauncher({ result, workflow, onOpen }) {
   const affectedFiles = result?.decision?.affectedFiles || [];
-  const setupCommands = result?.pm?.commandRequests || [];
+  const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
+
+  return (
+    <button className="cycle-review-launcher" type="button" onClick={onOpen} aria-label="Open cycle review">
+      <span>
+        <strong>Cycle ready</strong>
+        <small>{affectedFiles.length} file(s) affected{nextPhase ? ` - Next: ${nextPhase}` : ""}</small>
+      </span>
+      <CheckCircle2 size={18} />
+    </button>
+  );
+}
+
+function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCycle, onNeedsPatch, onDiscardOutput, onClose }) {
+  const affectedFiles = result?.decision?.affectedFiles || [];
   const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
 
   return (
@@ -2265,7 +2470,12 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
           <p className="eyebrow">Cycle Review</p>
           <h2>{result?.decision?.summary || "Cycle finished and is ready for review."}</h2>
         </div>
-        <span className="cycle-review-badge">{workflow.currentPhase || result?.project?.phases?.[0]?.name || "Phase 1"}</span>
+        <div className="cycle-review-header-actions">
+          <span className="cycle-review-badge">{workflow.currentPhase || result?.project?.phases?.[0]?.name || "Phase 1"}</span>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close cycle review">
+            <XCircle size={18} />
+          </button>
+        </div>
       </div>
 
       <div className="cycle-review-grid">
@@ -2290,22 +2500,6 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
         </div>
       </div>
 
-      {setupCommands.length > 0 ? (
-        <div className="cycle-review-commands">
-          <h3>Setup commands</h3>
-          <div className="cycle-review-command-list">
-            {setupCommands.map((command) => (
-              <div className="decision-command-row" key={command}>
-                <code>{command}</code>
-                <button className="secondary-button" type="button" onClick={() => onRunCommand(command)} disabled={isBusy}>
-                  Run
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
       <div className="cycle-review-footer">
         <div className="cycle-review-meta">
           <span>{affectedFiles.length} file(s) affected</span>
@@ -2320,9 +2514,13 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
             <CheckCircle2 size={16} />
             Finish Cycle
           </button>
-          <button className="secondary-button danger" type="button" onClick={onNeedsPatch} disabled={isBusy}>
+          <button className="secondary-button" type="button" onClick={onNeedsPatch} disabled={isBusy}>
             <XCircle size={16} />
             Needs Patch
+          </button>
+          <button className="secondary-button danger" type="button" onClick={onDiscardOutput} disabled={isBusy}>
+            <XCircle size={16} />
+            Discard Output
           </button>
         </div>
       </div>
@@ -2504,9 +2702,9 @@ function ReportsView({ result, testerResult }) {
         onDecisionReason={() => { }}
         onAccept={() => { }}
         onAcceptAndApply={() => { }}
-        onRunCommand={() => { }}
         onAdvanceCycle={() => { }}
-        onDeny={() => { }}
+        onNeedsPatch={() => { }}
+        onDiscardOutput={() => { }}
       />
     </section>
   );
@@ -3368,12 +3566,28 @@ function normalizeGeneratedProject(result, fallbackProject) {
   };
 }
 
+function getResultOutputFiles(result) {
+  return uniqueStrings([
+    ...(result?.executor?.applied || []).map((operation) => operation?.path),
+    ...(result?.dev?.fileOperations || []).map((operation) => operation?.path),
+    ...(result?.decision?.affectedFiles || [])
+  ]).filter(Boolean);
+}
+
 function shouldShowCycleReview({ result, workflow, isRunning }) {
   if (isRunning || !result?.decision?.summary) {
     return false;
   }
 
   return ["pending", "applied", "accepted"].includes(String(workflow?.decisionStatus || "pending"));
+}
+
+function canDiscardGeneratedOutput(project, result) {
+  return Boolean(
+    project?.rootPath &&
+    (project?.projectType === "sandbox-task" || result?.project?.projectType === "sandbox-task") &&
+    (result?.executor?.applied || []).length > 0
+  );
 }
 
 function getUpcomingPhaseName(phases = []) {
@@ -3383,6 +3597,21 @@ function getUpcomingPhaseName(phases = []) {
   }
 
   return phases.find((phase) => phase.status === "not_started")?.name || "";
+}
+
+function uniqueStrings(items = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of items) {
+    const value = String(item || "").trim();
+    const key = value.toLowerCase();
+    if (!value || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(value);
+  }
+  return unique;
 }
 
 function transitionProjectPlan(phases = [], tasks = [], mode = "finish") {

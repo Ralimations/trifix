@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld("trifix", {
   removeProject: (id) => ipcRenderer.invoke("projects:remove", id),
   updateProject: (payload) => ipcRenderer.invoke("projects:update", payload),
   acceptDecision: (payload) => ipcRenderer.invoke("decision:accept", payload),
+  discardOutput: (payload) => ipcRenderer.invoke("decision:discard-output", payload),
   previewApply: (payload) => ipcRenderer.invoke("decision:preview-apply", payload),
   applyDecision: (payload) => ipcRenderer.invoke("decision:apply", payload),
   onPipelineProgress: (callback) => {

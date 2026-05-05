@@ -223,7 +223,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
 
   const juniorInitialOutput = juniorInitialSettled.value;
-  const juniorInitialLeadResult = parseLeadOutput(juniorInitialOutput, filesAnalyzed);
+  const juniorInitialLeadResult = parseLeadOutput(juniorInitialOutput, filesAnalyzed, pmArchitecture);
   const juniorInitialResult = buildJuniorResult(juniorInitialOutput);
   emitStage({
     agent: "junior",
@@ -343,7 +343,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         onRequestStatus: (requestStatus) =>
           emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-patch", status: "coding", requestStatus, loopCount, projectPlan })
       });
-      finalLeadResult = mergeLeadResults(juniorInitialLeadResult, parseLeadOutput(juniorPatchOutput, filesAnalyzed));
+      finalLeadResult = mergeLeadResults(juniorInitialLeadResult, parseLeadOutput(juniorPatchOutput, filesAnalyzed, pmArchitecture));
       addParallelLog("Patch pass finished");
     } catch (error) {
       juniorPatchOutput = `Junior patch pass skipped after error: ${formatAgentFailure(error)}`;
@@ -1023,7 +1023,7 @@ function parseServerError(body) {
   }
 }
 
-function parseLeadOutput(output, filesAnalyzed = []) {
+function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null) {
   const parsedJson = extractJsonObject(output);
   const summary = extractSection(output, "SUMMARY");
   const rationale = extractSection(output, "RATIONALE");
@@ -1031,16 +1031,28 @@ function parseLeadOutput(output, filesAnalyzed = []) {
   const recommendation = extractSection(output, "RECOMMENDATION");
   const affectedFiles = extractListSection(output, "AFFECTED_FILES");
   const commandRequests = extractListSection(output, "COMMAND_REQUESTS");
-  const patches = extractPatches(output);
+  const expectedPaths = normalizeExpectedFilePaths(filesAnalyzed, expectedArchitecture);
+  const patches = [
+    ...extractPatches(output),
+    ...extractPathLabeledCodeBlocks(output)
+  ];
   const fallbackCodeFence = output.match(/```[\w+-]*\n([\s\S]*?)```/);
-  const jsonFileOperations = normalizeFileOperations(parsedJson?.fileOperations);
+  const jsonFileOperations = mergeByPath(
+    normalizeFileOperations(parsedJson?.fileOperations),
+    normalizeFileOperations(parsedJson?.operations),
+    normalizeFileOperations(parsedJson?.patches),
+    normalizeFileOperations(parsedJson?.files),
+    fileOperationsFromObjectMap(parsedJson?.files),
+    fileOperationsFromObjectMap(parsedJson?.changedFiles),
+    fileOperationsFromObjectMap(parsedJson?.filesChanged)
+  );
   const jsonCommands = normalizeStringArray(parsedJson?.commands);
 
   let normalizedPatches = patches;
-  if (normalizedPatches.length === 0 && filesAnalyzed.length === 1 && fallbackCodeFence?.[1]) {
+  if (normalizedPatches.length === 0 && expectedPaths.length === 1 && fallbackCodeFence?.[1]) {
     normalizedPatches = [
       {
-        path: filesAnalyzed[0].path,
+        path: expectedPaths[0],
         content: cleanCode(fallbackCodeFence[1])
       }
     ];
@@ -1261,11 +1273,21 @@ function normalizeFileOperations(fileOperations) {
   }
 
   return fileOperations
-    .map((operation) => ({
-      action: String(operation?.action || "write").toLowerCase(),
-      path: toProjectPath(operation?.path || ""),
-      content: typeof operation?.content === "string" ? operation.content : String(operation?.content || "")
-    }))
+    .map((operation) => {
+      const content =
+        operation?.content ??
+        operation?.code ??
+        operation?.source ??
+        operation?.text ??
+        operation?.body ??
+        "";
+
+      return {
+        action: String(operation?.action || "write").toLowerCase(),
+        path: toProjectPath(operation?.path || operation?.file || operation?.filename || operation?.name || ""),
+        content: typeof content === "string" ? content : String(content || "")
+      };
+    })
     .filter((operation) => operation.action === "write" && operation.path);
 }
 
@@ -1277,6 +1299,30 @@ function fileOperationsFromPatches(patches) {
       content: String(patch.content || "")
     }))
     .filter((operation) => operation.path);
+}
+
+function fileOperationsFromObjectMap(value) {
+  if (!value || Array.isArray(value) || typeof value !== "object") {
+    return [];
+  }
+
+  return Object.entries(value)
+    .map(([filePath, content]) => ({
+      action: "write",
+      path: toProjectPath(filePath),
+      content: typeof content === "string" ? content : String(content?.content || content?.code || content?.source || "")
+    }))
+    .filter((operation) => operation.path);
+}
+
+function normalizeExpectedFilePaths(filesAnalyzed = [], expectedArchitecture = null) {
+  return uniqueStrings([
+    ...(filesAnalyzed || []).map((file) => file?.path),
+    ...(expectedArchitecture?.fileArchitecture || []).map((file) => file?.path || file),
+    ...(expectedArchitecture?.requiredFiles || [])
+  ])
+    .map(toProjectPath)
+    .filter(Boolean);
 }
 
 function normalizeStringArray(value) {
@@ -1683,10 +1729,10 @@ function mergeLeadResults(initialResult, patchResult) {
   };
 }
 
-function mergeByPath(firstItems, secondItems) {
+function mergeByPath(...itemGroups) {
   const merged = new Map();
 
-  for (const item of [...(firstItems || []), ...(secondItems || [])]) {
+  for (const item of itemGroups.flatMap((items) => items || [])) {
     const path = toProjectPath(item?.path || "");
     if (!path) {
       continue;
@@ -2283,6 +2329,35 @@ function extractPatches(output) {
     path: match[1].trim(),
     content: cleanCode(match[2])
   }));
+}
+
+function extractPathLabeledCodeBlocks(output) {
+  const text = String(output || "");
+  const blocks = [];
+  const codeBlockPattern = /```(?!json\b)[\w+-]*\n([\s\S]*?)```/gi;
+  let match;
+
+  while ((match = codeBlockPattern.exec(text))) {
+    const preceding = text.slice(Math.max(0, match.index - 240), match.index);
+    const labelLine = preceding
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .at(-1) || "";
+    const pathMatch = labelLine.match(/`?([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)`?\s*:?$/);
+    const filePath = toProjectPath(pathMatch?.[1] || "");
+
+    if (!filePath || blocks.some((block) => block.path.toLowerCase() === filePath.toLowerCase())) {
+      continue;
+    }
+
+    blocks.push({
+      path: filePath,
+      content: cleanCode(match[1])
+    });
+  }
+
+  return blocks;
 }
 
 function toPublicRationale(value) {
