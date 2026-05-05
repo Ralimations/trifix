@@ -106,7 +106,7 @@ export async function buildProjectTree(rootPath, options = {}) {
 
   const tree = await walk(root);
   const defaultSelectedFiles = [];
-  collectSelectableFiles(tree, defaultSelectedFiles, 3);
+  collectSelectableFiles(tree, defaultSelectedFiles, 6);
 
   return {
     rootPath: root,
@@ -623,20 +623,51 @@ function toProjectPath(value) {
 }
 
 function collectSelectableFiles(nodes, output, limit) {
-  for (const node of nodes || []) {
-    if (output.length >= limit) {
-      return;
-    }
+  const candidates = [];
+  collectSelectableCandidates(nodes, candidates);
+  candidates
+    .sort((left, right) => {
+      const scoreDiff = scoreSelectableFile(right.path) - scoreSelectableFile(left.path);
+      if (scoreDiff !== 0) {
+        return scoreDiff;
+      }
 
+      const depthDiff = left.path.split("/").length - right.path.split("/").length;
+      if (depthDiff !== 0) {
+        return depthDiff;
+      }
+
+      return left.path.localeCompare(right.path);
+    })
+    .slice(0, limit)
+    .forEach((node) => output.push(node.path));
+}
+
+function collectSelectableCandidates(nodes, output) {
+  for (const node of nodes || []) {
     if (node.type === "file" && node.selectable) {
-      output.push(node.path);
+      output.push(node);
       continue;
     }
 
     if (node.children) {
-      collectSelectableFiles(node.children, output, limit);
+      collectSelectableCandidates(node.children, output);
     }
   }
+}
+
+function scoreSelectableFile(filePath) {
+  const normalized = toProjectPath(filePath).toLowerCase();
+
+  if (normalized === "package.json") return 100;
+  if (["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb"].includes(normalized)) return 96;
+  if (["tsconfig.json", "jsconfig.json", "vite.config.ts", "vite.config.js", "vite.config.mjs", "next.config.js", "next.config.mjs"].includes(normalized)) return 92;
+  if (["index.html", "src/main.tsx", "src/main.jsx", "src/index.tsx", "src/index.jsx", "src/app.tsx", "src/app.jsx"].includes(normalized)) return 88;
+  if (normalized === "readme.md") return 84;
+  if (/^src\/.*\.(tsx|jsx|ts|js|css|html)$/.test(normalized)) return 60;
+  if (/\.(tsx|jsx|ts|js|css|html|json|md)$/.test(normalized)) return 40;
+
+  return 10;
 }
 
 function createDiffPreview(previousContent, nextContent) {

@@ -2,19 +2,19 @@ export const AGENT_CONFIGS = {
   junior: {
     id: "junior",
     key: "r",
-    name: "DEV",
-    title: "DEV",
-    roleLabel: "dev / implementation",
-    summary: "uses Qwen 3.5 9B to implement scoped code changes and patches",
+    name: "Junior Dev",
+    title: "Junior Dev",
+    roleLabel: "junior dev / local patch applier",
+    summary: "uses Qwen 3.5 9B to implement scoped code changes and apply patches",
     endpoint: "http://127.0.0.1:3010/api/v1/chat",
     model: "qwen/qwen3.5-9b",
     timeoutMs: 1800000,
     color: "blue",
     prompts: {
       system:
-        "You are DEV in an AI software team. Implement the current QA-scoped task, write concise code-focused output, produce complete replacement patches, and request only safe project commands when needed.",
+        "You are Junior Dev and local patch applier. Implement the Supervisor spec, edit only listed or relevant files, avoid redesigns, and return concise code-focused output.",
       output:
-        "Return patches first. Keep notes minimal: affected files, command requests if needed, and a short recommendation. Do not manage scope, review QA, make PRD decisions, or include hidden reasoning."
+        "Return changed files, fileOperations when creating or editing files, command requests if needed, and a short summary. Do not manage scope, review QA, make PRD decisions, or include hidden reasoning."
     },
     speech: {
       prefix: "",
@@ -44,19 +44,19 @@ export const AGENT_CONFIGS = {
   supervisor: {
     id: "supervisor",
     key: "j",
-    name: "QA",
-    title: "QA",
-    roleLabel: "qa / review + testing",
-    summary: "strictly reviews DEV work, finds bugs, and verifies checklist alignment",
+    name: "Senior Dev / QA",
+    title: "Senior Dev / QA",
+    roleLabel: "senior dev / parallel review + testing",
+    summary: "reviews in parallel, predicts bugs, suggests fixes, and verifies checklist alignment",
     endpoint: "http://10.8.0.3:3011/api/v1/chat",
     model: "gemma-4-e4b-uncensored-hauhaucs-aggressive",
     timeoutMs: 1800000,
     color: "red",
     prompts: {
       system:
-        "You are QA in an AI software team. Convert PM direction into a strict DEV checklist, review DEV output, find bugs, identify missing tests, and flag PRD/FSD alignment issues.",
+        "You are Senior Dev / QA in an AI software team. Work read-only, review Supervisor specs, predict bugs and edge cases, suggest targeted fixes, and verify final output.",
       output:
-        "Return concise DEV instructions or QA review notes as checklists with bugs, risks, required tests, and PM-facing status. Do not write implementation code."
+        "Return concise review notes with risks, edge cases, files to check, patch suggestions, tests, and final PASS/NEEDS PATCH status. Do not write implementation code or edit files."
     },
     speech: {
       prefix: "Bai",
@@ -86,19 +86,19 @@ export const AGENT_CONFIGS = {
   architect: {
     id: "architect",
     key: "a",
-    name: "PROJECT MANAGER",
-    title: "PROJECT MANAGER",
-    roleLabel: "pm / planning + alignment",
-    summary: "plans work, owns FSD/PRD alignment, and makes final scope decisions",
+    name: "Supervisor / PM",
+    title: "Supervisor / PM",
+    roleLabel: "supervisor / planning + task routing",
+    summary: "routes work, creates concise specs, owns FSD/PRD alignment, and makes final decisions",
     endpoint: "http://127.0.0.1:3010/api/v1/chat",
     model: "google/gemma-4-e4b",
     timeoutMs: 1800000,
     color: "green",
     prompts: {
       system:
-        "You are the PROJECT MANAGER in an AI software team. Read FSD and document context, create and maintain the PRD, define phases and tasks, align QA, and make final scope decisions. Do not output raw implementation code.",
+        "You are the Supervisor/PM in an AI software team. Read FSD and document context, create concise implementation specs, route work, maintain PRD alignment, and make final scope decisions. Do not output raw implementation code.",
       output:
-        "Return structured PM planning, PRD goals, phases, tasks, constraints, QA direction, and final decision summaries. No raw code."
+        "Return concise task specs, expected files, constraints, acceptance checks, and final decision summaries. No raw code."
     },
     speech: {
       prefix: "",

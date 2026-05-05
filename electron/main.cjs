@@ -511,7 +511,7 @@ async function normalizeCommandRoot(rootPath) {
 }
 
 async function resolveProjectCommand(root, payload) {
-  const explicit = String(payload.command || "").trim();
+  const explicit = normalizeSuggestedCommand(payload.command);
   if (explicit) {
     validateSafeCommand(explicit, root);
     return explicit;
@@ -583,7 +583,7 @@ async function fileExists(targetPath) {
 }
 
 function validateSafeCommand(command, root) {
-  const normalized = command.trim();
+  const normalized = normalizeSuggestedCommand(command);
   if (!normalized) {
     throw new Error("Command is empty.");
   }
@@ -613,8 +613,9 @@ function validateSafeCommand(command, root) {
 }
 
 async function executeSafeCommand(command, root, mode) {
-  validateSafeCommand(command, root);
-  const parts = splitCommand(command);
+  const normalized = normalizeSuggestedCommand(command);
+  validateSafeCommand(normalized, root);
+  const parts = splitCommand(normalized);
 
   if (parts[0] === "mkdir") {
     const target = path.resolve(root, parts.slice(1).join(" "));
@@ -626,15 +627,30 @@ async function executeSafeCommand(command, root, mode) {
     return { exitCode: 0, timedOut: false, output: `Created ${relative}` };
   }
 
-  const executable = process.platform === "win32" && parts[0] === "npm" ? "npm.cmd" : parts[0];
+  const executable = process.platform === "win32" && parts[0] === "npm"
+    ? (process.env.ComSpec || "cmd.exe")
+    : (process.platform === "win32" && parts[0] === "python" ? "python.exe" : parts[0]);
+  const args = process.platform === "win32" && parts[0] === "npm"
+    ? ["/d", "/s", "/c", normalized]
+    : parts.slice(1);
   const timeoutMs = mode === "run" ? 20000 : 120000;
 
   return new Promise((resolve) => {
-    const child = spawn(executable, parts.slice(1), {
-      cwd: root,
-      shell: false,
-      windowsHide: true
-    });
+    let child;
+    try {
+      child = spawn(executable, args, {
+        cwd: root,
+        shell: false,
+        windowsHide: true
+      });
+    } catch (error) {
+      resolve({
+        exitCode: 1,
+        timedOut: false,
+        output: `Could not start command "${normalized}": ${error?.message || error}`
+      });
+      return;
+    }
     let output = "";
     let settled = false;
     const timeout = setTimeout(() => {
@@ -666,6 +682,15 @@ async function executeSafeCommand(command, root, mode) {
 
 function splitCommand(command) {
   return String(command || "").match(/"[^"]+"|'[^']+'|\S+/g)?.map((part) => part.replace(/^["']|["']$/g, "")) || [];
+}
+
+function normalizeSuggestedCommand(command) {
+  return String(command || "")
+    .replace(/^[\s`*-]+/, "")
+    .replace(/[`]+/g, "")
+    .replace(/\r?\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function summarizeContextDocuments(documents) {

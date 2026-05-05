@@ -86,152 +86,110 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       })
     : "";
 
-  emitProgress({ runId, agent: "architect", stage: "pm-plan", status: "thinking" });
-  let pmPlan = await callAgent({
-    agent: AGENTS.architect,
-    systemPrompt: buildSystemPrompt(AGENTS.architect),
-    input: buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }),
-    onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-plan", status: "thinking", requestStatus, loopCount })
-  });
-  let pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input);
-  let prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
-  let projectPlan = buildProjectPlan(prd);
-  emitProgress({
-    runId,
-    agent: "architect",
-    stage: "pm-plan",
-    status: "speaking",
-    partialResult: {
-      architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
-      project: {
-        projectName: pmArchitecture.projectName,
-        projectSlug: pmArchitecture.projectSlug,
-        fileArchitecture: pmArchitecture.fileArchitecture,
-        implementationPlan: pmArchitecture.implementationPlan,
-        requiredFiles: pmArchitecture.requiredFiles,
-        fsd: buildFsdState(projectFsd, contextDocuments),
-        prd,
-        phases: projectPlan.phases,
-        tasks: projectPlan.tasks
-      },
-      workflow: buildV2Workflow({ loopCount, currentStage: "pm-plan", projectPlan })
-    }
-  });
-  await delay(SPEAKING_DELAY_MS);
-  emitProgress({
-    runId,
-    agent: "architect",
-    stage: "pm-plan",
-    status: "done",
-    partialResult: {
-      architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
-      project: {
-        projectName: pmArchitecture.projectName,
-        projectSlug: pmArchitecture.projectSlug,
-        fileArchitecture: pmArchitecture.fileArchitecture,
-        implementationPlan: pmArchitecture.implementationPlan,
-        requiredFiles: pmArchitecture.requiredFiles,
-        fsd: buildFsdState(projectFsd, contextDocuments),
-        prd,
-        phases: projectPlan.phases,
-        tasks: projectPlan.tasks
-      },
-      workflow: buildV2Workflow({ loopCount, currentStage: "qa-scope", projectPlan })
-    }
-  });
-
-  let qaInstructions = "";
-  let qaStructureReview = null;
-
-  if (isExistingProjectRequest) {
-    qaStructureReview = buildExistingProjectQaReview({ prd, files, input });
-    qaInstructions = formatQaStructureReview(qaStructureReview);
-  } else {
-    emitProgress({ runId, agent: "supervisor", stage: "qa-scope", status: "thinking" });
-    qaInstructions = await callAgent({
-      agent: AGENTS.supervisor,
-      systemPrompt: buildSystemPrompt(AGENTS.supervisor),
-      input: buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }),
-      onRequestStatus: (requestStatus) =>
-        emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-scope", status: "thinking", requestStatus, loopCount, projectPlan })
+  const parallelLogs = [];
+  const addParallelLog = (message) => {
+    parallelLogs.push({ at: new Date().toISOString(), message });
+  };
+  const emitStage = ({ agent, stage, status, projectPlan: activeProjectPlan = null, partialResult = {}, requestStatus = null }) =>
+    emitProgress({
+      runId,
+      agent,
+      stage,
+      status,
+      requestStatus,
+      partialResult: {
+        ...partialResult,
+        parallel: {
+          ...(partialResult.parallel || {}),
+          logs: parallelLogs
+        },
+        workflow: partialResult.workflow || buildV2Workflow({ loopCount, currentStage: stage, projectPlan: activeProjectPlan })
+      }
     });
-    qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
 
-    if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
-      emitProgress({ runId, agent: "architect", stage: "pm-revision", status: "thinking" });
-      pmPlan = await callAgent({
-        agent: AGENTS.architect,
-        systemPrompt: buildSystemPrompt(AGENTS.architect),
-          input: buildPmPlanningContext({
-            compactContext,
-            feedback,
-            revisionBrief,
-            loopCount,
-            qaFeedback: qaStructureReview.hardValidationIssues,
-            isExistingProjectRequest
-          }),
-        onRequestStatus: (requestStatus) =>
-          emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-revision", status: "thinking", requestStatus, loopCount, projectPlan })
-      });
-      pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, pmArchitecture);
-      prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
-      projectPlan = buildProjectPlan(prd);
+  emitStage({ agent: "architect", stage: "supervisor-spec", status: "thinking" });
+  const pmPlan = await callAgent({
+    agent: AGENTS.architect,
+    systemPrompt: buildSupervisorSpecSystemPrompt(),
+    input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }),
+    onRequestStatus: (requestStatus) =>
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount })
+  });
+  addParallelLog("Supervisor spec created");
 
-      qaInstructions = await callAgent({
-        agent: AGENTS.supervisor,
-        systemPrompt: buildSystemPrompt(AGENTS.supervisor),
-        input: buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }),
-        onRequestStatus: (requestStatus) =>
-          emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-scope", status: "thinking", requestStatus, loopCount, projectPlan })
-      });
-      qaStructureReview = normalizeQaStructureReview(extractJsonObject(qaInstructions), pmArchitecture);
+  const pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, null, pmPlan);
+  const prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
+  const projectPlan = buildProjectPlan(prd);
+  const qaStructureReview = isExistingProjectRequest
+    ? buildExistingProjectQaReview({ prd, files, input })
+    : normalizeQaStructureReview(null, pmArchitecture);
+  const qaInstructions = formatQaStructureReview(qaStructureReview);
+  const qaDevHandoff = buildDevHandoffFromQa(qaInstructions, qaStructureReview);
 
-      if (!qaStructureReview.approved && qaStructureReview.hardValidationIssues?.length) {
-        throw new Error(`QA rejected PM file architecture: ${qaStructureReview.hardValidationIssues.join("; ") || "No approval returned."}`);
+  emitStage({
+    agent: "architect",
+    stage: "supervisor-spec",
+    status: "speaking",
+    projectPlan,
+    partialResult: {
+      architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
+      project: {
+        projectName: pmArchitecture.projectName,
+        projectSlug: pmArchitecture.projectSlug,
+        fileArchitecture: pmArchitecture.fileArchitecture,
+        implementationPlan: pmArchitecture.implementationPlan,
+        requiredFiles: pmArchitecture.requiredFiles,
+        fsd: buildFsdState(projectFsd, contextDocuments),
+        prd,
+        phases: projectPlan.phases,
+        tasks: projectPlan.tasks
       }
     }
-  }
-
-  const qaDevHandoff = buildDevHandoffFromQa(qaInstructions, qaStructureReview);
-  const qaInstructionResult = buildSupervisorResult(qaInstructions);
-  emitProgress({
-    runId,
-    agent: "supervisor",
-    stage: "qa-scope",
-    status: "speaking",
-    partialResult: {
-      supervisor: qaInstructionResult,
-      critique: qaInstructions.trim(),
-      qa: {
-        structureReview: qaStructureReview,
-        instructions: qaInstructions.trim()
-      },
-      workflow: buildV2Workflow({ loopCount, currentStage: "qa-scope", projectPlan })
-    }
   });
   await delay(SPEAKING_DELAY_MS);
-  emitProgress({
-    runId,
-    agent: "supervisor",
-    stage: "qa-scope",
+  emitStage({
+    agent: "architect",
+    stage: "supervisor-spec",
     status: "done",
+    projectPlan,
     partialResult: {
-      supervisor: qaInstructionResult,
-      critique: qaInstructions.trim(),
-      qa: {
-        structureReview: qaStructureReview,
-        instructions: qaInstructions.trim()
-      },
-      workflow: buildV2Workflow({ loopCount, currentStage: "dev-implementation", projectPlan })
+      architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
+      project: {
+        projectName: pmArchitecture.projectName,
+        projectSlug: pmArchitecture.projectSlug,
+        fileArchitecture: pmArchitecture.fileArchitecture,
+        implementationPlan: pmArchitecture.implementationPlan,
+        requiredFiles: pmArchitecture.requiredFiles,
+        fsd: buildFsdState(projectFsd, contextDocuments),
+        prd,
+        phases: projectPlan.phases,
+        tasks: projectPlan.tasks
+      }
     }
   });
 
-  emitProgress({ runId, agent: "junior", stage: "dev-implementation", status: "coding" });
-  const devOutput = await callAgent({
+  const qaInstructionResult = buildSupervisorResult(qaDevHandoff);
+  emitStage({
+    agent: "supervisor",
+    stage: "senior-parallel-review",
+    status: "thinking",
+    projectPlan,
+    partialResult: {
+      supervisor: qaInstructionResult,
+      critique: qaDevHandoff.trim(),
+      qa: {
+        structureReview: qaStructureReview,
+        instructions: qaDevHandoff.trim()
+      }
+    }
+  });
+
+  addParallelLog("Junior Dev started");
+  emitStage({ agent: "junior", stage: "junior-initial", status: "coding", projectPlan });
+  const juniorInitialTask = trackAgentCall(callAgent({
     agent: AGENTS.junior,
-    systemPrompt: buildSystemPrompt(AGENTS.junior),
-    input: buildDevImplementationContext({
+    systemPrompt: buildJuniorInitialSystemPrompt(),
+    input: buildJuniorInitialContext({
       compactContext,
       prd,
       pmPlan,
@@ -245,118 +203,250 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       isExistingProjectRequest
     }),
     onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "dev-implementation", status: "coding", requestStatus, loopCount, projectPlan })
-  });
-  const devLeadResult = parseLeadOutput(devOutput, filesAnalyzed);
-  const devResult = buildJuniorResult(devOutput);
-  emitProgress({
-    runId,
-    agent: "junior",
-    stage: "dev-implementation",
-    status: "speaking",
-    partialResult: {
-      junior: devResult,
-      explanation: devOutput.trim(),
-      architect: {
-        affectedFiles: devLeadResult.affectedFiles,
-        patches: devLeadResult.patches,
-        fixedCode: devLeadResult.fixedCode,
-        proposedChanges: devLeadResult.proposedChanges
-      },
-      dev: {
-        fileOperations: devLeadResult.fileOperations,
-        commandRequests: devLeadResult.commandRequests
-      },
-      workflow: buildV2Workflow({ loopCount, currentStage: "dev-implementation", projectPlan })
-    }
-  });
-  await delay(SPEAKING_DELAY_MS);
-  emitProgress({
-    runId,
-    agent: "junior",
-    stage: "dev-implementation",
-    status: "done",
-    partialResult: {
-      junior: devResult,
-      explanation: devOutput.trim(),
-      architect: {
-        affectedFiles: devLeadResult.affectedFiles,
-        patches: devLeadResult.patches,
-        fixedCode: devLeadResult.fixedCode,
-        proposedChanges: devLeadResult.proposedChanges
-      },
-      dev: {
-        fileOperations: devLeadResult.fileOperations,
-        commandRequests: devLeadResult.commandRequests
-      },
-      workflow: buildV2Workflow({ loopCount, currentStage: "qa-review", projectPlan })
-    }
-  });
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-initial", status: "coding", requestStatus, loopCount, projectPlan })
+  }));
 
-  emitProgress({ runId, agent: "supervisor", stage: "qa-review", status: "testing" });
-  const qaReview = await callAgent({
+  addParallelLog("Senior Dev started");
+  emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "testing", projectPlan });
+  const seniorParallelTask = trackAgentCall(callAgent({
     agent: AGENTS.supervisor,
-    systemPrompt: buildSystemPrompt(AGENTS.supervisor),
-    input: buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions: qaDevHandoff, devOutput, devLeadResult, feedback, revisionBrief, loopCount }),
+    systemPrompt: buildSeniorParallelSystemPrompt(),
+    input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }),
     onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "qa-review", status: "testing", requestStatus, loopCount, projectPlan })
-  });
-  const qaReviewResult = buildSupervisorResult(qaReview);
-  emitProgress({
-    runId,
-    agent: "supervisor",
-    stage: "qa-review",
+      emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
+  }));
+
+  const juniorInitialSettled = await juniorInitialTask.promise;
+  addParallelLog("Junior Dev finished");
+  if (juniorInitialSettled.status === "rejected") {
+    throw new Error(`Junior Dev failed before producing file changes: ${formatAgentFailure(juniorInitialSettled.reason)}`);
+  }
+
+  const juniorInitialOutput = juniorInitialSettled.value;
+  const juniorInitialLeadResult = parseLeadOutput(juniorInitialOutput, filesAnalyzed);
+  const juniorInitialResult = buildJuniorResult(juniorInitialOutput);
+  emitStage({
+    agent: "junior",
+    stage: "junior-initial",
     status: "speaking",
+    projectPlan,
     partialResult: {
-      supervisor: qaReviewResult,
-      critique: qaReview.trim(),
-      workflow: buildV2Workflow({ loopCount, currentStage: "qa-review", projectPlan })
+      junior: juniorInitialResult,
+      explanation: juniorInitialOutput.trim(),
+      architect: {
+        affectedFiles: juniorInitialLeadResult.affectedFiles,
+        patches: juniorInitialLeadResult.patches,
+        fixedCode: juniorInitialLeadResult.fixedCode,
+        proposedChanges: juniorInitialLeadResult.proposedChanges
+      },
+      dev: {
+        fileOperations: juniorInitialLeadResult.fileOperations,
+        commandRequests: juniorInitialLeadResult.commandRequests
+      }
     }
   });
   await delay(SPEAKING_DELAY_MS);
-  emitProgress({
-    runId,
-    agent: "supervisor",
-    stage: "qa-review",
+  emitStage({
+    agent: "junior",
+    stage: "junior-initial",
     status: "done",
+    projectPlan,
     partialResult: {
-      supervisor: qaReviewResult,
-      critique: qaReview.trim(),
-      workflow: buildV2Workflow({ loopCount, currentStage: "pm-decision", projectPlan })
+      junior: juniorInitialResult,
+      explanation: juniorInitialOutput.trim(),
+      architect: {
+        affectedFiles: juniorInitialLeadResult.affectedFiles,
+        patches: juniorInitialLeadResult.patches,
+        fixedCode: juniorInitialLeadResult.fixedCode,
+        proposedChanges: juniorInitialLeadResult.proposedChanges
+      },
+      dev: {
+        fileOperations: juniorInitialLeadResult.fileOperations,
+        commandRequests: juniorInitialLeadResult.commandRequests
+      }
     }
   });
 
-  emitProgress({ runId, agent: "architect", stage: "pm-decision", status: "thinking" });
-  const pmDecision = await callAgent({
-    agent: AGENTS.architect,
-    systemPrompt: buildSystemPrompt(AGENTS.architect),
-    input: buildPmDecisionContext({
-      compactContext,
-      prd,
-      pmPlan,
-      qaInstructions: qaDevHandoff,
-      devOutput,
-      qaReview,
-      devLeadResult,
-      language,
-      feedback,
-      revisionBrief,
-      loopCount,
-      isExistingProjectRequest
-    }),
-    onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "pm-decision", status: "thinking", requestStatus, loopCount, projectPlan })
+  let seniorParallelSettled = await waitForTrackedAgent(seniorParallelTask, 15000);
+  if (!seniorParallelSettled) {
+    addParallelLog("Senior Dev still running; continuing without blocking patch pass");
+  }
+
+  let seniorParallelReview = "";
+  let seniorParallelAvailable = false;
+  if (seniorParallelSettled?.status === "fulfilled") {
+    seniorParallelReview = seniorParallelSettled.value;
+    seniorParallelAvailable = true;
+    addParallelLog("Senior Dev finished");
+  } else if (seniorParallelSettled?.status === "rejected") {
+    seniorParallelReview = `Senior Dev parallel review unavailable: ${formatAgentFailure(seniorParallelSettled.reason)}`;
+    addParallelLog("Senior Dev failed; continuing with Junior Dev output");
+  } else {
+    seniorParallelReview = "Senior Dev parallel review was not ready before the patch pass.";
+  }
+
+  const seniorParallelResult = buildSupervisorResult(seniorParallelReview);
+  emitStage({
+    agent: "supervisor",
+    stage: "senior-parallel-review",
+    status: "speaking",
+    projectPlan,
+    partialResult: {
+      supervisor: seniorParallelResult,
+      critique: seniorParallelReview.trim(),
+      qa: {
+        structureReview: qaStructureReview,
+        instructions: qaDevHandoff.trim(),
+        parallelReview: seniorParallelReview.trim()
+      }
+    }
   });
-  const pmDecisionResult = buildPmResult(pmDecision, devLeadResult.summary);
+  await delay(SPEAKING_DELAY_MS);
+  emitStage({
+    agent: "supervisor",
+    stage: "senior-parallel-review",
+    status: "done",
+    projectPlan,
+    partialResult: {
+      supervisor: seniorParallelResult,
+      critique: seniorParallelReview.trim(),
+      qa: {
+        structureReview: qaStructureReview,
+        instructions: qaDevHandoff.trim(),
+        parallelReview: seniorParallelReview.trim()
+      }
+    }
+  });
+
+  let juniorPatchOutput = "";
+  let finalLeadResult = juniorInitialLeadResult;
+  if (seniorParallelAvailable) {
+    addParallelLog("Patch pass started");
+    emitStage({ agent: "junior", stage: "junior-patch", status: "coding", projectPlan });
+    try {
+      juniorPatchOutput = await callAgent({
+        agent: AGENTS.junior,
+        systemPrompt: buildJuniorPatchSystemPrompt(),
+        input: buildJuniorPatchContext({
+          compactContext,
+          prd,
+          pmPlan,
+          pmArchitecture,
+          juniorInitialOutput,
+          juniorInitialLeadResult,
+          seniorParallelReview,
+          feedback,
+          revisionBrief,
+          loopCount,
+          isExistingProjectRequest
+        }),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-patch", status: "coding", requestStatus, loopCount, projectPlan })
+      });
+      finalLeadResult = mergeLeadResults(juniorInitialLeadResult, parseLeadOutput(juniorPatchOutput, filesAnalyzed));
+      addParallelLog("Patch pass finished");
+    } catch (error) {
+      juniorPatchOutput = `Junior patch pass skipped after error: ${formatAgentFailure(error)}`;
+      addParallelLog("Patch pass failed; using Junior initial output");
+    }
+  } else {
+    juniorPatchOutput = "Junior patch pass skipped because Senior Dev notes were unavailable.";
+  }
+
+  const finalDevOutput = [juniorInitialOutput, juniorPatchOutput].filter(Boolean).join("\n\nPATCH PASS:\n");
+  emitStage({
+    agent: "junior",
+    stage: "junior-patch",
+    status: "done",
+    projectPlan,
+    partialResult: {
+      junior: buildJuniorResult(finalDevOutput),
+      explanation: finalDevOutput.trim(),
+      architect: {
+        affectedFiles: finalLeadResult.affectedFiles,
+        patches: finalLeadResult.patches,
+        fixedCode: finalLeadResult.fixedCode,
+        proposedChanges: finalLeadResult.proposedChanges
+      },
+      dev: {
+        fileOperations: finalLeadResult.fileOperations,
+        commandRequests: finalLeadResult.commandRequests
+      }
+    }
+  });
+
+  addParallelLog("Final review started");
+  emitStage({ agent: "supervisor", stage: "senior-final-review", status: "testing", projectPlan });
+  let seniorFinalReview = "";
+  if (seniorParallelAvailable) {
+    try {
+      seniorFinalReview = await callAgent({
+        agent: AGENTS.supervisor,
+        systemPrompt: buildSeniorFinalReviewSystemPrompt(),
+        input: buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, seniorParallelReview, finalDevOutput, finalLeadResult, feedback, revisionBrief, loopCount }),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-final-review", status: "testing", requestStatus, loopCount, projectPlan })
+      });
+      addParallelLog("Senior Dev final review finished");
+    } catch (error) {
+      seniorFinalReview = `FINAL REVIEW:\nNEEDS PATCH\n\nISSUES:\n- Senior Dev final review failed: ${formatAgentFailure(error)}\n\nREQUIRED FIXES:\n- Supervisor must decide from Junior output.`;
+      addParallelLog("Senior Dev final review failed");
+    }
+  } else {
+    seniorFinalReview = "FINAL REVIEW:\nNEEDS PATCH\n\nISSUES:\n- Senior Dev review unavailable.\n\nREQUIRED FIXES:\n- Supervisor must decide from Junior output.";
+  }
+
+  emitStage({
+    agent: "supervisor",
+    stage: "senior-final-review",
+    status: "done",
+    projectPlan,
+    partialResult: {
+      supervisor: buildSupervisorResult(seniorFinalReview),
+      critique: seniorFinalReview.trim()
+    }
+  });
+
+  addParallelLog("Final status started");
+  emitStage({ agent: "architect", stage: "supervisor-final", status: "thinking", projectPlan });
+  let pmDecision = "";
+  try {
+    pmDecision = await callAgent({
+      agent: AGENTS.architect,
+      systemPrompt: buildSupervisorFinalSystemPrompt(),
+      input: buildSupervisorFinalContext({
+        compactContext,
+        prd,
+        pmPlan,
+        qaInstructions: qaDevHandoff,
+        devOutput: finalDevOutput,
+        qaReview: seniorFinalReview,
+        devLeadResult: finalLeadResult,
+        language,
+        feedback,
+        revisionBrief,
+        loopCount,
+        isExistingProjectRequest
+      }),
+      onRequestStatus: (requestStatus) =>
+        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
+    });
+    addParallelLog("Final status finished");
+  } catch (error) {
+    pmDecision = `FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSupervisor final status failed: ${formatAgentFailure(error)}`;
+    addParallelLog("Final status failed");
+  }
+
+  const pmDecisionResult = buildPmResult(pmDecision, finalLeadResult.summary);
   const pipelineResult = buildPipelineResult({
-    explanation: devOutput,
-    critique: qaReview,
+    explanation: finalDevOutput,
+    critique: seniorFinalReview,
     files,
     filesAnalyzed,
     leadResult: {
-      ...devLeadResult,
-      summary: pmDecisionResult.summary || devLeadResult.summary,
-      rationale: pmDecisionResult.rationale || qaReview,
+      ...finalLeadResult,
+      summary: pmDecisionResult.summary || finalLeadResult.summary,
+      rationale: pmDecisionResult.rationale || seniorFinalReview,
       recommendation: pmDecisionResult.recommendation || pmDecision
     },
     loopCount,
@@ -377,9 +467,29 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     pmPlan,
     pmDecision
   });
-  emitProgress({ runId, agent: "architect", stage: "pm-decision", status: "speaking", partialResult: pipelineResult });
+  pipelineResult.parallel = {
+    supervisor_spec: pmPlan,
+    junior_initial_output: juniorInitialOutput,
+    senior_parallel_review: seniorParallelReview,
+    junior_patch_output: juniorPatchOutput,
+    senior_final_review: seniorFinalReview,
+    supervisor_final_status: pmDecision,
+    logs: parallelLogs
+  };
+  pipelineResult.qa = {
+    ...pipelineResult.qa,
+    parallelReview: seniorParallelReview,
+    finalReview: seniorFinalReview
+  };
+  pipelineResult.dev = {
+    ...pipelineResult.dev,
+    initialImplementation: juniorInitialOutput,
+    patchOutput: juniorPatchOutput
+  };
+
+  emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "speaking", partialResult: pipelineResult });
   await delay(SPEAKING_DELAY_MS);
-  emitProgress({ runId, agent: "architect", stage: "pm-decision", status: "done", partialResult: pipelineResult });
+  emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "done", partialResult: pipelineResult });
 
   lastResult = pipelineResult;
 
@@ -693,7 +803,11 @@ function parseChatResponse(responseText) {
     const json = JSON.parse(responseText);
     const text = readChatText(json);
     if (!text) {
-      throw new Error("Bad response format: no public message content was returned.");
+      const structuredPayload = readStructuredPayload(json);
+      if (structuredPayload) {
+        return structuredPayload;
+      }
+      return responseText;
     }
     return text;
   } catch (error) {
@@ -747,6 +861,92 @@ function readChatText(value) {
   }
 
   return readChatText(value.content);
+}
+
+function readStructuredPayload(value) {
+  const candidate = findStructuredPayload(value);
+  if (!candidate) {
+    return "";
+  }
+
+  return typeof candidate === "string" ? candidate : JSON.stringify(candidate, null, 2);
+}
+
+function looksLikeAgentPayload(value) {
+  const keys = new Set(Object.keys(value || {}));
+  const markerGroups = [
+    ["summary", "fileOperations"],
+    ["summary", "recommendation"],
+    ["projectName", "projectSlug"],
+    ["fileArchitecture", "implementationPlan"],
+    ["approved", "devChecklist"],
+    ["approved", "issues"]
+  ];
+
+  return markerGroups.some((group) => group.every((key) => keys.has(key)));
+}
+
+function findStructuredPayload(value, visited = new Set()) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      return findStructuredPayload(parsed, visited) || trimmed;
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  if (visited.has(value)) {
+    return null;
+  }
+  visited.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findStructuredPayload(item, visited);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  if (isReasoningItem(value)) {
+    return null;
+  }
+
+  if (looksLikeAgentPayload(value)) {
+    return value;
+  }
+
+  for (const key of ["output", "result", "response", "data", "message", "content", "choices"]) {
+    const found = findStructuredPayload(value[key], visited);
+    if (found) {
+      return found;
+    }
+  }
+
+  for (const nestedValue of Object.values(value)) {
+    const found = findStructuredPayload(nestedValue, visited);
+    if (found) {
+      return found;
+    }
+  }
+
+  return null;
 }
 
 function isReasoningItem(value) {
@@ -908,12 +1108,23 @@ function extractJsonObject(output) {
   return null;
 }
 
-function normalizePmArchitecture(parsed, input, previous = null) {
+function normalizePmArchitecture(parsed, input, previous = null, rawOutput = "") {
   const fallbackName = deriveProjectName(input);
-  const projectName = normalizeTitle(parsed?.projectName || previous?.projectName || fallbackName);
+  const taskName = extractSection(rawOutput, "TASK").split(/\r?\n/)[0];
+  const projectName = normalizeTitle(parsed?.projectName || previous?.projectName || taskName || fallbackName);
   const projectSlug = sanitizeProjectSlug(parsed?.projectSlug || projectName) || sanitizeProjectSlug(previous?.projectSlug) || createFallbackTaskSlug();
-  const fileArchitecture = normalizeFileArchitecture(parsed?.fileArchitecture, parsed?.requiredFiles);
-  const implementationPlan = normalizeStringArray(parsed?.implementationPlan);
+  const sectionFiles = parseFileArchitectureFromSection(rawOutput);
+  const fileArchitecture = normalizeFileArchitecture(
+    parsed?.fileArchitecture || (sectionFiles.length > 0 ? sectionFiles : null),
+    parsed?.requiredFiles
+  );
+  const sectionPlan = [
+    ...extractListSection(rawOutput, "ACCEPTANCE"),
+    ...extractListSection(rawOutput, "NOTES")
+  ];
+  const implementationPlan = normalizeStringArray(parsed?.implementationPlan).length > 0
+    ? normalizeStringArray(parsed?.implementationPlan)
+    : sectionPlan;
   const requiredFiles = normalizeStringArray(parsed?.requiredFiles).length > 0
     ? normalizeStringArray(parsed?.requiredFiles)
     : fileArchitecture.map((file) => file.path);
@@ -929,6 +1140,21 @@ function normalizePmArchitecture(parsed, input, previous = null) {
     qaInstruction:
       String(parsed?.qaInstruction || previous?.qaInstruction || "Verify required files and FSD alignment.").trim()
   };
+}
+
+function parseFileArchitectureFromSection(output) {
+  return extractListSection(output, "FILES")
+    .map((item) => {
+      const text = String(item || "").trim();
+      const pathMatch = text.match(/`?([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)`?/);
+      const path = toProjectPath(pathMatch?.[1] || text.split(/\s+-\s+|\s+--\s+|\s+purpose\s*:/i)[0]);
+
+      return {
+        path,
+        purpose: text.replace(pathMatch?.[0] || path, "").replace(/^[-:\s]+/, "").trim() || "Required project file"
+      };
+    })
+    .filter((item) => item.path);
 }
 
 function normalizeQaStructureReview(parsed, pmArchitecture) {
@@ -1172,10 +1398,14 @@ function buildProjectPlan(prd) {
 
 function buildPmResult(output, fallbackSummary) {
   return {
-    summary: extractSection(output, "SUMMARY") || extractSection(output, "QA_INSTRUCTION") || fallbackSummary,
-    rationale: extractSection(output, "RATIONALE") || toPublicRationale(output),
+    summary: extractSection(output, "SUMMARY") || extractSection(output, "FINAL_STATUS") || extractSection(output, "FINAL STATUS") || extractSection(output, "QA_INSTRUCTION") || fallbackSummary,
+    rationale: extractSection(output, "RATIONALE") || extractSection(output, "REASON") || toPublicRationale(output),
     affectedFiles: extractListSection(output, "AFFECTED_FILES"),
     proposedChanges: extractListSection(output, "PROPOSED_CHANGES"),
+    commandRequests: uniqueStrings([
+      ...extractListSection(output, "COMMAND_REQUESTS"),
+      ...extractListSection(output, "SETUP_COMMANDS")
+    ]),
     patches: [],
     recommendation: extractSection(output, "RECOMMENDATION") || output.trim(),
     fixedCode: ""
@@ -1254,7 +1484,8 @@ function buildPipelineResult({ explanation, critique, files, filesAnalyzed, lead
     project,
     pm: {
       plan: pmPlan,
-      decision: pmDecision
+      decision: pmDecision,
+      commandRequests: leadResult.commandRequests || []
     },
     qa: {
       instructions: qaInstructions,
@@ -1290,6 +1521,204 @@ function buildSystemPrompt(agent) {
   return parts.filter(Boolean).join(" ");
 }
 
+function buildSupervisorSpecSystemPrompt() {
+  return [
+    "You are the Supervisor/PM.",
+    "Create a concise implementation spec for the dev pipeline.",
+    "Do not write code. Do not over-explain.",
+    "Name expected files and folders. Define acceptance tests.",
+    "If project setup commands are required, include only safe setup commands such as npm install or npm run build.",
+    "Keep output under 300 tokens.",
+    "Output format:",
+    "TASK:",
+    "FILES:",
+    "CONSTRAINTS:",
+    "ACCEPTANCE:",
+    "COMMAND_REQUESTS:",
+    "NOTES:"
+  ].join("\n");
+}
+
+function buildJuniorInitialSystemPrompt() {
+  return [
+    "You are Junior Dev and local patch applier.",
+    "Implement the Supervisor spec.",
+    "Edit only listed/relevant files.",
+    "Do not create extra folders. Do not rename files unless required.",
+    "Do not redesign the app.",
+    "No long explanations.",
+    "Return machine-readable fileOperations when creating or editing files.",
+    "Max output: 800 tokens."
+  ].join("\n");
+}
+
+function buildSeniorParallelSystemPrompt() {
+  return [
+    "You are Senior Dev / QA.",
+    "Work in parallel with Junior Dev.",
+    "Review the Supervisor spec.",
+    "Predict bugs, missing requirements, edge cases, and likely implementation mistakes.",
+    "Suggest exact fixes and tests.",
+    "Do not edit files directly. Do not rewrite the whole project.",
+    "Keep output under 600 tokens.",
+    "Output format:",
+    "PASS/FAIL RISK:",
+    "RISKS:",
+    "EDGE CASES:",
+    "FILES TO CHECK:",
+    "PATCH SUGGESTIONS:",
+    "TESTS:"
+  ].join("\n");
+}
+
+function buildJuniorPatchSystemPrompt() {
+  return [
+    "You are Junior Dev applying Senior Dev review.",
+    "Use the original Supervisor spec and Senior Dev notes.",
+    "Apply only necessary fixes.",
+    "Do not rewrite completed work.",
+    "Do not create new folders unless required.",
+    "Return only changed files and concise summary.",
+    "Return machine-readable fileOperations for changed files.",
+    "Max output: 700 tokens."
+  ].join("\n");
+}
+
+function buildSeniorFinalReviewSystemPrompt() {
+  return [
+    "You are Senior Dev / QA performing final verification.",
+    "Check the final output against the original task, acceptance checklist, changed files, and known risks.",
+    "Do not edit files directly. Do not output code.",
+    "Return only:",
+    "FINAL REVIEW:",
+    "PASS / NEEDS PATCH",
+    "ISSUES:",
+    "- none / issue list",
+    "REQUIRED FIXES:",
+    "- none / exact fixes"
+  ].join("\n");
+}
+
+function buildSupervisorFinalSystemPrompt() {
+  return [
+    "You are the Supervisor/PM.",
+    "Check if the result satisfies acceptance.",
+    "Do not write code. Keep the decision short.",
+    "Return only:",
+    "FINAL STATUS:",
+    "PASS / NEEDS PATCH",
+    "REASON:",
+    "short reason"
+  ].join("\n");
+}
+
+function trackAgentCall(promise) {
+  const task = {
+    settled: false,
+    result: null,
+    promise: null
+  };
+
+  task.promise = promise.then(
+    (value) => {
+      task.settled = true;
+      task.result = { status: "fulfilled", value };
+      return task.result;
+    },
+    (reason) => {
+      task.settled = true;
+      task.result = { status: "rejected", reason };
+      return task.result;
+    }
+  );
+
+  return task;
+}
+
+async function waitForTrackedAgent(task, timeoutMs) {
+  if (!task) {
+    return null;
+  }
+
+  if (task.settled) {
+    return task.result;
+  }
+
+  if (!timeoutMs || timeoutMs <= 0) {
+    return null;
+  }
+
+  return Promise.race([task.promise, delay(timeoutMs).then(() => null)]);
+}
+
+function formatAgentFailure(error) {
+  return String(error?.message || error || "Unknown agent failure").trim();
+}
+
+function mergeLeadResults(initialResult, patchResult) {
+  const initial = initialResult || {};
+  const patch = patchResult || {};
+  const fileOperations = mergeByPath(initial.fileOperations || [], patch.fileOperations || []);
+  const patches = fileOperations.length > 0
+    ? fileOperations.map((operation) => ({ path: operation.path, content: operation.content }))
+    : mergeByPath(initial.patches || [], patch.patches || []);
+  const affectedFiles = uniqueStrings([
+    ...(initial.affectedFiles || []),
+    ...(patch.affectedFiles || []),
+    ...fileOperations.map((operation) => operation.path)
+  ]);
+
+  return {
+    ...initial,
+    ...patch,
+    summary: patch.summary && patch.summary !== "DEV completed an implementation pass." ? patch.summary : initial.summary,
+    rationale: patch.rationale || initial.rationale,
+    proposedChanges: uniqueStrings([...(initial.proposedChanges || []), ...(patch.proposedChanges || [])]),
+    affectedFiles,
+    commandRequests: uniqueStrings([...(initial.commandRequests || []), ...(patch.commandRequests || [])]),
+    patches,
+    fileOperations,
+    fixedCode: fileOperations[0]?.content || patches[0]?.content || patch.fixedCode || initial.fixedCode || "",
+    recommendation: patch.recommendation || initial.recommendation
+  };
+}
+
+function mergeByPath(firstItems, secondItems) {
+  const merged = new Map();
+
+  for (const item of [...(firstItems || []), ...(secondItems || [])]) {
+    const path = toProjectPath(item?.path || "");
+    if (!path) {
+      continue;
+    }
+
+    merged.set(path.toLowerCase(), {
+      ...item,
+      path
+    });
+  }
+
+  return [...merged.values()];
+}
+
+function uniqueStrings(items) {
+  const seen = new Set();
+  const unique = [];
+
+  for (const item of items || []) {
+    const value = String(item || "").trim();
+    const key = value.toLowerCase();
+    if (!value || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    unique.push(value);
+  }
+
+  return unique;
+}
+
 async function createRevisionBrief({ compactContext, feedback, loopCount }) {
   const output = await callAgent({
     agent: AGENTS.architect,
@@ -1302,6 +1731,160 @@ async function createRevisionBrief({ compactContext, feedback, loopCount }) {
   });
 
   return trimForPrompt(output, 800);
+}
+
+function buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
+  return [
+    trimForPrompt(compactContext, isExistingProjectRequest ? 7000 : 12000),
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 900)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 500)}` : "",
+    [
+      isExistingProjectRequest
+        ? "This is a follow-up request for an existing project. Do not create a new project folder."
+        : "This is a project creation or FSD task. Choose a short contextual project name and expected files.",
+      "Name only the smallest expected files/folders.",
+      "Keep constraints strict so Junior Dev does not redesign or create random folders.",
+      "Add COMMAND_REQUESTS only for necessary project setup steps, such as installing dependencies or running a build check.",
+      "For FILES, list project-relative paths only.",
+      "No raw code."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildJuniorInitialContext({
+  compactContext,
+  prd,
+  pmPlan,
+  pmArchitecture,
+  qaInstructions,
+  qaStructureReview,
+  language,
+  feedback,
+  revisionBrief,
+  loopCount,
+  isExistingProjectRequest = false
+}) {
+  return [
+    trimForPrompt(compactContext, isExistingProjectRequest ? 3200 : 5200),
+    `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1200)}`,
+    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    ...(isExistingProjectRequest
+      ? []
+      : [`EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`]),
+    `DEV_CHECKLIST:\n${trimForPrompt(qaInstructions, 1200)}`,
+    ...(isExistingProjectRequest
+      ? []
+      : [`LOCAL_STRUCTURE_CHECK:\n${JSON.stringify(qaStructureReview || {}, null, 2)}`]),
+    `Preferred language: ${language}`,
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 700)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 700)}` : "",
+    [
+      "Implement only the current task scope.",
+      "Only Junior Dev may create/edit files.",
+      "Use project-relative paths only, such as index.html or src/main.js.",
+      "Do not include sandbox/tasks or absolute paths.",
+      "Return JSON only:",
+      "{",
+      '  "summary": "short summary",',
+      '  "fileOperations": [{ "action": "write", "path": "index.html", "content": "<!DOCTYPE html>..." }],',
+      '  "commands": [],',
+      '  "recommendation": "short recommendation"',
+      "}"
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }) {
+  return [
+    trimForPrompt(compactContext, 6500),
+    `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1400)}`,
+    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    `EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
+    `LOCAL_DEV_CHECKLIST:\n${trimForPrompt(qaDevHandoff, 900)}`,
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 800)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 700)}` : "",
+    [
+      "You are read-only. Do not return full files.",
+      "Focus on likely Junior Dev mistakes, edge cases, and exact tests.",
+      "Patch suggestions must be small and targeted."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildJuniorPatchContext({
+  compactContext,
+  prd,
+  pmPlan,
+  pmArchitecture,
+  juniorInitialOutput,
+  juniorInitialLeadResult,
+  seniorParallelReview,
+  feedback,
+  revisionBrief,
+  loopCount,
+  isExistingProjectRequest = false
+}) {
+  return [
+    trimForPrompt(compactContext, isExistingProjectRequest ? 2400 : 3400),
+    `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1000)}`,
+    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    ...(isExistingProjectRequest
+      ? []
+      : [`EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`]),
+    `JUNIOR_INITIAL_CHANGED_FILES:\n${(juniorInitialLeadResult.affectedFiles || []).join("\n")}`,
+    `JUNIOR_INITIAL_OUTPUT:\n${trimForPrompt(juniorInitialOutput, 5200)}`,
+    `SENIOR_DEV_NOTES:\n${trimForPrompt(seniorParallelReview, 2400)}`,
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 700)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 700)}` : "",
+    [
+      "Apply only necessary fixes from Senior Dev notes.",
+      "If no fixes are needed, return an empty fileOperations array.",
+      "When changing a file, return full replacement content for that file.",
+      "Return JSON only with summary, fileOperations, commands, recommendation."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, seniorParallelReview, finalDevOutput, finalLeadResult, feedback, revisionBrief, loopCount }) {
+  return [
+    trimForPrompt(compactContext, 4200),
+    `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1100)}`,
+    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    `SENIOR_PARALLEL_NOTES:\n${trimForPrompt(seniorParallelReview, 1200)}`,
+    `FINAL_CHANGED_FILES:\n${(finalLeadResult.affectedFiles || []).join("\n")}`,
+    `FINAL_FILE_OPERATIONS:\n${trimForPrompt(JSON.stringify(finalLeadResult.fileOperations || [], null, 2), 3200)}`,
+    `FINAL_DEV_OUTPUT:\n${trimForPrompt(finalDevOutput, 2800)}`,
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 700)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 700)}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildSupervisorFinalContext({
+  compactContext,
+  prd,
+  pmPlan,
+  qaInstructions,
+  devOutput,
+  qaReview,
+  devLeadResult,
+  language,
+  feedback,
+  revisionBrief,
+  loopCount,
+  isExistingProjectRequest = false
+}) {
+  return [
+    trimForPrompt(compactContext, isExistingProjectRequest ? 3000 : 4200),
+    `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1000)}`,
+    `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
+    `DEV_CHECKLIST:\n${trimForPrompt(qaInstructions, 800)}`,
+    `JUNIOR_DEV_OUTPUT:\n${trimForPrompt(devOutput, 1800)}`,
+    `SENIOR_FINAL_REVIEW:\n${trimForPrompt(qaReview, 1400)}`,
+    `CHANGED_FILES:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
+    `Preferred language: ${language}`,
+    feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 700)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 700)}` : ""
+  ].filter(Boolean).join("\n\n");
 }
 
 function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, qaFeedback = [], isExistingProjectRequest = false }) {

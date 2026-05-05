@@ -1,26 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Box,
   Bot,
   BriefcaseBusiness,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Clock3,
   Code2,
   FlaskConical,
   FileCode2,
   FilePlus2,
+  FolderClosed,
   FolderOpen,
   History,
   Loader2,
   MessageSquare,
+  MoreHorizontal,
   Play,
   Bug,
   Plus,
   RefreshCw,
+  Search,
   Settings,
+  SlidersHorizontal,
   Sparkles,
   TerminalSquare,
   TriangleAlert,
+  ArrowUpDown,
   XCircle
 } from "lucide-react";
 import { INITIAL_AGENTS } from "./agentViewModels.js";
@@ -727,6 +734,61 @@ export function App() {
     }
   }
 
+  async function runSuggestedCommand(command) {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath) {
+      setDecisionMessage("Open or create a project before running commands.");
+      return;
+    }
+
+    const normalized = String(command || "").trim();
+    if (!normalized) {
+      return;
+    }
+
+    setIsCommandRunning(true);
+    setWorkflow((current) => ({
+      ...current,
+      commandStatus: "running",
+      projectStatus: "Running setup command"
+    }));
+    enqueueAgentMessage({
+      from: "architect",
+      to: "junior",
+      text: `Running PM setup command: ${normalized}`,
+      message: `Running PM setup command: ${normalized}`,
+      type: "status",
+      priority: "high",
+      restoreState: "installing"
+    });
+
+    try {
+      const entry = await window.trifix.runProjectCommand({
+        projectRoot: targetProject.rootPath,
+        projectId: targetProject.projectId,
+        mode: "custom",
+        command: normalized
+      });
+      setCommandLog((current) => [...current, entry].slice(-30));
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: entry.status,
+        projectStatus: entry.status === "passed" ? "Setup command passed" : "Setup command failed"
+      }));
+      setDecisionMessage(`${entry.command} ${entry.status}.`);
+      await refreshTrackedProjects();
+    } catch (commandError) {
+      setDecisionMessage(commandError?.message || "Command failed.");
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: "error",
+        projectStatus: "Setup command failed"
+      }));
+    } finally {
+      setIsCommandRunning(false);
+    }
+  }
+
   function parseInlineWorkspaceCommand(value) {
     const normalized = String(value || "").trim().toLowerCase();
     if (normalized === "/debug-project" || normalized === "debug project") {
@@ -839,7 +901,7 @@ export function App() {
           ...current,
           folderLoaded: false,
           contextReady: true,
-          currentStage: "pm-plan"
+          currentStage: "supervisor-spec"
         }));
       }
 
@@ -865,11 +927,11 @@ export function App() {
       setWorkflow((current) => ({
         ...current,
         contextReady: true,
-        currentStage: "pm-plan",
+        currentStage: "supervisor-spec",
         loopCount: nextLoopCount,
         decisionStatus: "pending",
         currentPhase: "Planning",
-        currentTask: "PM scoping",
+        currentTask: "Supervisor scoping",
         iterationCount: nextLoopCount,
         projectStatus: "In progress",
         commandStatus: "idle"
@@ -961,7 +1023,7 @@ export function App() {
     }
   }
 
-  async function acceptDecision() {
+  async function acceptDecision({ advancePhase = false } = {}) {
     if (!result?.decision) {
       return;
     }
@@ -969,6 +1031,11 @@ export function App() {
     setIsDecisionBusy(true);
     setDecisionMessage("");
     try {
+      const planState = transitionProjectPlan(
+        result?.project?.phases || project?.phases || [],
+        result?.project?.tasks || project?.tasks || [],
+        advancePhase ? "advance" : "finish"
+      );
       clearSpeechQueue();
       setAgents((currentAgents) => currentAgents.map((agent) => ({ ...agent, status: "idle" })));
       setScene({ type: "success", message: SUCCESS_SCENE_MESSAGE });
@@ -979,11 +1046,45 @@ export function App() {
         projectId: resultProject?.projectId || project?.projectId,
         affectedFiles: result?.decision?.affectedFiles || []
       });
+      await window.trifix.updateProject({
+        id: resultProject?.projectId || project?.projectId,
+        status: advancePhase ? "In progress" : "Accepted",
+        decisionStatus: "accepted",
+        loopCount: workflow.loopCount,
+        lastAgent: "architect",
+        affectedFiles: result?.decision?.affectedFiles || [],
+        phases: planState.phases,
+        tasks: planState.tasks
+      });
       setWorkflow((current) => ({
         ...current,
         decisionStatus: "accepted",
-        currentStage: "accepted"
+        currentStage: advancePhase ? "phase-ready" : "accepted",
+        currentPhase: planState.currentPhase,
+        currentTask: planState.currentTask,
+        projectStatus: advancePhase ? `Ready for ${planState.currentPhase}` : "Cycle finished"
       }));
+      setResult((current) => current ? ({
+        ...current,
+        project: {
+          ...(current.project || {}),
+          phases: planState.phases,
+          tasks: planState.tasks
+        },
+        workflow: {
+          ...(current.workflow || {}),
+          decisionStatus: "accepted",
+          currentStage: advancePhase ? "phase-ready" : "accepted",
+          currentPhase: planState.currentPhase,
+          currentTask: planState.currentTask,
+          projectStatus: advancePhase ? `Ready for ${planState.currentPhase}` : "Cycle finished"
+        }
+      }) : current);
+      setProject((current) => current ? ({
+        ...current,
+        phases: planState.phases,
+        tasks: planState.tasks
+      }) : current);
       enqueueAgentMessage({
         from: "architect",
         to: "team",
@@ -994,9 +1095,11 @@ export function App() {
         restoreState: "done"
       });
       setDecisionMessage(
-        result?.executor?.applied?.length
-          ? "Decision accepted. DEV file operations were already applied."
-          : "Decision accepted. No files were changed."
+        advancePhase
+          ? `Cycle accepted. Proceed to ${planState.currentPhase}.`
+          : (result?.executor?.applied?.length
+              ? "Cycle finished. Junior Dev file operations were already applied."
+              : "Cycle finished. No files were changed.")
       );
       await wait(1100);
       setScene(null);
@@ -1181,6 +1284,42 @@ export function App() {
     await refreshTrackedProjects();
   }
 
+  async function proceedToNextPhase() {
+    await acceptDecision({ advancePhase: true });
+  }
+
+  async function finishCycle() {
+    await acceptDecision({ advancePhase: false });
+  }
+
+  async function renameTrackedProject(entry) {
+    const currentName = String(entry?.name || "").trim();
+    const nextName = window.prompt("Rename sandbox", currentName);
+    if (!nextName) {
+      return;
+    }
+
+    const trimmedName = nextName.trim();
+    if (!trimmedName || trimmedName === currentName) {
+      return;
+    }
+
+    await window.trifix.updateProject({
+      id: entry.id,
+      name: trimmedName
+    });
+    await refreshTrackedProjects();
+  }
+
+  async function deleteTrackedProject(entry) {
+    const confirmed = window.confirm(`Delete "${entry?.name || "this sandbox"}" from recents?`);
+    if (!confirmed) {
+      return;
+    }
+
+    await removeTrackedProject(entry.id);
+  }
+
   function resetTaskState({ clearProjectSelection = false } = {}) {
     setError("");
     setResult(null);
@@ -1268,50 +1407,52 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">
-            <Sparkles size={19} />
+    <div className={`app-shell ${activeView === "landing" ? "landing-shell" : ""}`}>
+      {activeView === "landing" ? null : (
+        <aside className="sidebar">
+          <div className="brand">
+            <div className="brand-mark">
+              <Sparkles size={19} />
+            </div>
+            <div>
+              <strong>TriFix AI</strong>
+              <span>Software Team V2</span>
+            </div>
           </div>
-          <div>
-            <strong>TriFix AI</strong>
-            <span>Software Team V2</span>
+
+          <nav className="nav-list" aria-label="Primary">
+            <SidebarButton
+              active={activeView === "landing"}
+              icon={<Plus size={18} />}
+              label="Home"
+              onClick={() => setActiveView("landing")}
+            />
+            <SidebarButton
+              active={activeView === "office"}
+              icon={<BriefcaseBusiness size={18} />}
+              label="Workspace"
+              onClick={() => setActiveView("office")}
+            />
+            <SidebarButton
+              active={activeView === "reports"}
+              icon={<History size={18} />}
+              label="Reports"
+              onClick={() => setActiveView("reports")}
+            />
+            <SidebarButton
+              active={activeView === "settings"}
+              icon={<Settings size={18} />}
+              label="Settings"
+              onClick={() => setActiveView("settings")}
+            />
+          </nav>
+
+          <div className="sidebar-footer">
+            <span className="signal-dot" />
+            <span>Agent endpoints</span>
           </div>
-        </div>
-
-        <nav className="nav-list" aria-label="Primary">
-          <SidebarButton
-            active={activeView === "landing"}
-            icon={<Plus size={18} />}
-            label="Home"
-            onClick={() => setActiveView("landing")}
-          />
-          <SidebarButton
-            active={activeView === "office"}
-            icon={<BriefcaseBusiness size={18} />}
-            label="Workspace"
-            onClick={() => setActiveView("office")}
-          />
-          <SidebarButton
-            active={activeView === "reports"}
-            icon={<History size={18} />}
-            label="Reports"
-            onClick={() => setActiveView("reports")}
-          />
-          <SidebarButton
-            active={activeView === "settings"}
-            icon={<Settings size={18} />}
-            label="Settings"
-            onClick={() => setActiveView("settings")}
-          />
-        </nav>
-
-        <div className="sidebar-footer">
-          <span className="signal-dot" />
-          <span>Agent endpoints</span>
-        </div>
-      </aside>
+        </aside>
+      )}
 
       <main className="main-view">
         {activeView === "landing" ? (
@@ -1323,6 +1464,9 @@ export function App() {
             onOpenProject={openProject}
             onContinue={continueTrackedProject}
             onOpenFolder={(folderPath) => window.trifix.openFolderPath(folderPath)}
+            onRefresh={refreshTrackedProjects}
+            onRename={renameTrackedProject}
+            onDelete={deleteTrackedProject}
           />
         ) : null}
 
@@ -1366,10 +1510,12 @@ export function App() {
             onToggleChat={() => setIsChatOpen((current) => !current)}
             onTabChange={setActiveTab}
             onDecisionReason={setDecisionReason}
-            onAccept={acceptDecision}
-            onAcceptAndApply={previewAndApply}
-            onDeny={denyDecision}
-          />
+        onAccept={finishCycle}
+        onAcceptAndApply={previewAndApply}
+        onRunCommand={runSuggestedCommand}
+        onAdvanceCycle={proceedToNextPhase}
+        onDeny={denyDecision}
+      />
         ) : null}
 
         {activeView === "reports" ? <ReportsView result={result} testerResult={testerResult} /> : null}
@@ -1445,6 +1591,8 @@ function OfficeView({
   onDecisionReason,
   onAccept,
   onAcceptAndApply,
+  onRunCommand,
+  onAdvanceCycle,
   onDeny
 }) {
   const activeAgentId = getVisibleActiveAgentId(agents, activeMessage, isRunning);
@@ -1453,9 +1601,22 @@ function OfficeView({
     status: getDisplayAgentStatus(agent, activeMessage)
   }));
   const focusedSpeakerId = activeMessage && isImportantVisualMessage(activeMessage) ? activeAgentId : "";
+  const showCycleReview = shouldShowCycleReview({ result, workflow, isRunning });
 
   return (
     <>
+      {showCycleReview ? (
+        <CycleReviewCard
+          result={result}
+          workflow={workflow}
+          isBusy={isDecisionBusy}
+          onAdvanceCycle={onAdvanceCycle}
+          onFinishCycle={onAccept}
+          onNeedsPatch={onDeny}
+          onRunCommand={onRunCommand}
+        />
+      ) : null}
+
       <header className="workspace-header">
         <div>
           <p className="eyebrow">TriFix AI Workspace</p>
@@ -1503,7 +1664,7 @@ function OfficeView({
 
       <div className="context-banner">
         {decisionMessage || (selectedFiles.length > 0
-          ? "PM, QA, and DEV are using only queued files plus summarized uploaded context."
+          ? "Supervisor, Senior Dev, and Junior Dev are using only queued files plus summarized uploaded context."
           : project?.projectType === "project"
             ? "No project files are queued. Prompt-only work runs inside the current task sandbox."
             : workflow.folderLoaded && workflow.contextReady
@@ -1613,6 +1774,8 @@ function OfficeView({
         onDecisionReason={onDecisionReason}
         onAccept={onAccept}
         onAcceptAndApply={onAcceptAndApply}
+        onRunCommand={onRunCommand}
+        onAdvanceCycle={onAdvanceCycle}
         onDeny={onDeny}
       />
     </>
@@ -1844,6 +2007,8 @@ function OutputBin({
   onDecisionReason,
   onAccept,
   onAcceptAndApply,
+  onRunCommand,
+  onAdvanceCycle,
   onDeny
 }) {
   return (
@@ -1879,7 +2044,7 @@ function OutputBin({
       <div className="output-grid single">
         {activeTab === "junior" ? (
           <OutputPanel
-            title="DEV"
+            title="Junior Dev"
             content={joinSections([
               ["Implementation Notes", result?.junior?.rationale],
               ["File Operations", formatFileOperations(result?.dev?.fileOperations)],
@@ -1891,7 +2056,7 @@ function OutputBin({
         ) : null}
         {activeTab === "supervisor" ? (
           <OutputPanel
-            title="QA"
+            title="Senior Dev / QA"
             content={joinSections([
               ["Review", result?.supervisor?.critique],
               ["Suggested Changes", result?.supervisor?.suggestedChanges],
@@ -1902,10 +2067,11 @@ function OutputBin({
         ) : null}
         {activeTab === "architect" ? (
           <OutputPanel
-            title="Project Manager"
+            title="Supervisor / PM"
             content={joinSections([
               ["Summary", result?.architect?.summary],
               ["PRD / Direction", result?.pm?.plan],
+              ["Setup Commands", (result?.pm?.commandRequests || []).join("\n")],
               ["Decision", result?.architect?.recommendation]
             ])}
             tone="green"
@@ -1931,6 +2097,8 @@ function OutputBin({
             onDecisionReason={onDecisionReason}
             onAccept={onAccept}
             onAcceptAndApply={onAcceptAndApply}
+            onRunCommand={onRunCommand}
+            onAdvanceCycle={onAdvanceCycle}
             onDeny={onDeny}
           />
         ) : null}
@@ -1949,6 +2117,8 @@ function DecisionPanel({
   onDecisionReason,
   onAccept,
   onAcceptAndApply,
+  onRunCommand,
+  onAdvanceCycle,
   onDeny
 }) {
   const decision = result?.decision;
@@ -1991,10 +2161,27 @@ function DecisionPanel({
           </ul>
           {result?.dev?.commandRequests?.length ? (
             <>
-              <h3>DEV Command Requests</h3>
+              <h3>Junior Dev Command Requests</h3>
               <ul className="decision-list">
                 {result.dev.commandRequests.map((item, index) => (
                   <li key={`${item}-${index}`}>{item}</li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+          {result?.pm?.commandRequests?.length ? (
+            <>
+              <h3>Supervisor Setup Commands</h3>
+              <ul className="decision-list">
+                {result.pm.commandRequests.map((item, index) => (
+                  <li key={`${item}-${index}`}>
+                    <div className="decision-command-row">
+                      <code>{item}</code>
+                      <button className="secondary-button" type="button" onClick={() => onRunCommand(item)} disabled={isDecisionBusy}>
+                        Run
+                      </button>
+                    </div>
+                  </li>
                 ))}
               </ul>
             </>
@@ -2013,9 +2200,13 @@ function DecisionPanel({
       </div>
 
       <div className="decision-actions">
+        <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isDecisionBusy}>
+          <Play size={16} />
+          Proceed to Next Phase
+        </button>
         <button className="secondary-button" type="button" onClick={onAccept} disabled={isDecisionBusy}>
           <CheckCircle2 size={16} />
-          Accept
+          Finish Cycle
         </button>
         <button className="primary-button" type="button" onClick={onAcceptAndApply} disabled={isDecisionBusy}>
           {isDecisionBusy ? <Loader2 size={16} className="spin" /> : <Play size={16} />}
@@ -2062,6 +2253,83 @@ function DecisionPanel({
   );
 }
 
+function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCycle, onNeedsPatch, onRunCommand }) {
+  const affectedFiles = result?.decision?.affectedFiles || [];
+  const setupCommands = result?.pm?.commandRequests || [];
+  const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
+
+  return (
+    <section className="cycle-review-card" aria-label="Cycle review">
+      <div className="cycle-review-header">
+        <div>
+          <p className="eyebrow">Cycle Review</p>
+          <h2>{result?.decision?.summary || "Cycle finished and is ready for review."}</h2>
+        </div>
+        <span className="cycle-review-badge">{workflow.currentPhase || result?.project?.phases?.[0]?.name || "Phase 1"}</span>
+      </div>
+
+      <div className="cycle-review-grid">
+        <div>
+          <h3>What changed</h3>
+          <ul className="decision-list">
+            {(result?.decision?.proposedChanges || []).slice(0, 5).map((item, index) => (
+              <li key={`${item}-${index}`}>{item}</li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <h3>Files</h3>
+          <ul className="affected-files">
+            {affectedFiles.slice(0, 6).map((file) => (
+              <li key={file}>
+                <FileCode2 size={16} />
+                <span>{file}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+
+      {setupCommands.length > 0 ? (
+        <div className="cycle-review-commands">
+          <h3>Setup commands</h3>
+          <div className="cycle-review-command-list">
+            {setupCommands.map((command) => (
+              <div className="decision-command-row" key={command}>
+                <code>{command}</code>
+                <button className="secondary-button" type="button" onClick={() => onRunCommand(command)} disabled={isBusy}>
+                  Run
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="cycle-review-footer">
+        <div className="cycle-review-meta">
+          <span>{affectedFiles.length} file(s) affected</span>
+          <span>{nextPhase ? `Next: ${nextPhase}` : "No next phase planned"}</span>
+        </div>
+        <div className="decision-actions">
+          <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isBusy || !nextPhase}>
+            <Play size={16} />
+            Proceed to Next Phase
+          </button>
+          <button className="secondary-button" type="button" onClick={onFinishCycle} disabled={isBusy}>
+            <CheckCircle2 size={16} />
+            Finish Cycle
+          </button>
+          <button className="secondary-button danger" type="button" onClick={onNeedsPatch} disabled={isBusy}>
+            <XCircle size={16} />
+            Needs Patch
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function PrdPanel({ prd }) {
   return (
     <div className="output-panel tone-green">
@@ -2098,12 +2366,23 @@ function TasksPanel({ phases = [], tasks = [] }) {
 
 function CommandLogPanel({ commandLog = [], result }) {
   const logs = commandLog.length > 0 ? commandLog : result?.project?.commandHistory || [];
+  const pipelineLogs = Array.isArray(result?.parallel?.logs) ? result.parallel.logs : [];
   return (
     <div className="output-panel tone-red">
       <div className="output-panel-header">
         <span className="output-tab">Logs</span>
-        <h2>Command history</h2>
+        <h2>Pipeline and command history</h2>
       </div>
+      {pipelineLogs.length > 0 ? (
+        <div className="command-log-list">
+          {pipelineLogs.map((entry, index) => (
+            <div className="command-log-card" key={`${entry.at || "pipeline"}-${index}`}>
+              <strong>{entry.message}</strong>
+              <span>{entry.at || "pipeline"}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {logs.length > 0 ? (
         <div className="command-log-list">
           {logs.map((entry) => (
@@ -2114,9 +2393,9 @@ function CommandLogPanel({ commandLog = [], result }) {
             </div>
           ))}
         </div>
-      ) : (
+      ) : pipelineLogs.length === 0 ? (
         <p>No commands have been run yet.</p>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -2225,37 +2504,149 @@ function ReportsView({ result, testerResult }) {
         onDecisionReason={() => { }}
         onAccept={() => { }}
         onAcceptAndApply={() => { }}
+        onRunCommand={() => { }}
+        onAdvanceCycle={() => { }}
         onDeny={() => { }}
       />
     </section>
   );
 }
 
-function LandingView({ entries, draftProjectName, onDraftProjectName, onCreateNewProject, onOpenProject, onContinue, onOpenFolder }) {
-  const recentEntries = [...(entries || [])]
-    .sort((left, right) => String(right.lastUpdated || "").localeCompare(String(left.lastUpdated || "")))
-    .slice(0, 6);
+function LandingView({
+  entries,
+  draftProjectName,
+  onDraftProjectName,
+  onCreateNewProject,
+  onOpenProject,
+  onContinue,
+  onOpenFolder,
+  onRefresh,
+  onRename,
+  onDelete
+}) {
+  const [searchValue, setSearchValue] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [sortMode, setSortMode] = useState("updated-desc");
+  const [openMenuId, setOpenMenuId] = useState("");
+  const statusOptions = [
+    { key: "all", label: "All" },
+    { key: "active", label: "Active" },
+    { key: "waiting", label: "Waiting" },
+    { key: "not-started", label: "Not started" },
+    { key: "completed", label: "Completed" }
+  ];
+
+  const statusCounts = useMemo(() => {
+    const counts = {
+      all: (entries || []).length,
+      active: 0,
+      waiting: 0,
+      "not-started": 0,
+      completed: 0
+    };
+
+    for (const entry of entries || []) {
+      const key = toLandingStatusKey(entry?.status, entry?.decisionStatus);
+      if (counts[key] !== undefined) {
+        counts[key] += 1;
+      }
+    }
+
+    return counts;
+  }, [entries]);
+
+  const recentEntries = useMemo(() => {
+    const query = searchValue.trim().toLowerCase();
+    const filtered = [...(entries || [])].filter((entry) => {
+      const key = toLandingStatusKey(entry?.status, entry?.decisionStatus);
+      const searchable = [entry?.name, entry?.path, entry?.projectSlug, entry?.status].join(" ").toLowerCase();
+      const matchesSearch = !query || searchable.includes(query);
+      const matchesFilter = statusFilter === "all" || statusFilter === key;
+      return matchesSearch && matchesFilter;
+    });
+
+    filtered.sort((left, right) => {
+      if (sortMode === "name") {
+        return String(left?.name || "").localeCompare(String(right?.name || ""));
+      }
+
+      const leftTime = new Date(left?.lastUpdated || 0).getTime();
+      const rightTime = new Date(right?.lastUpdated || 0).getTime();
+      return sortMode === "updated-asc" ? leftTime - rightTime : rightTime - leftTime;
+    });
+
+    return filtered.slice(0, 8);
+  }, [entries, searchValue, sortMode, statusFilter]);
 
   return (
     <section className="landing-view">
-      <div className="landing-hero">
-        <p className="eyebrow">TriFix AI</p>
-        <h1>Choose a workspace before the team starts.</h1>
-        <p className="landing-copy">
-          Start a titled sandbox task, reopen a recent project, or open a folder without auto-queueing files.
-        </p>
+      <div className="landing-toolbar">
+        <div className="landing-branding">
+          <div className="landing-brand-mark">
+            <Box size={28} />
+          </div>
+          <div className="landing-brand-copy">
+            <h1>TriFix AI</h1>
+            <p>Tiny Office Mode</p>
+          </div>
+        </div>
+
+        <div className="landing-toolbar-row">
+          <label className="landing-search">
+            <Search size={18} />
+            <input
+              type="text"
+              value={searchValue}
+              onChange={(event) => setSearchValue(event.target.value)}
+              placeholder="Search sandboxes..."
+            />
+            <span className="landing-shortcut">Ctrl + K</span>
+          </label>
+
+          <div className="landing-toolbar-actions">
+            <label className="landing-select">
+              <SlidersHorizontal size={16} />
+              <span>Filter</span>
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+                {statusOptions.map((option) => (
+                  <option key={option.key} value={option.key}>{option.label}</option>
+                ))}
+              </select>
+              <ChevronDown size={16} />
+            </label>
+
+            <label className="landing-select wide">
+              <ArrowUpDown size={16} />
+              <span>Sort</span>
+              <select value={sortMode} onChange={(event) => setSortMode(event.target.value)}>
+                <option value="updated-desc">Updated (Newest)</option>
+                <option value="updated-asc">Updated (Oldest)</option>
+                <option value="name">Name</option>
+              </select>
+              <ChevronDown size={16} />
+            </label>
+
+            <button className="icon-button landing-refresh" type="button" onClick={onRefresh} aria-label="Refresh sandboxes">
+              <RefreshCw size={18} />
+            </button>
+          </div>
+        </div>
       </div>
 
       <div className="landing-grid">
-        <div className="landing-card">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">New Project</p>
-              <h2>Create a titled sandbox task</h2>
+        <aside className="landing-rail">
+          <div className="landing-panel landing-panel-intro">
+            <div className="landing-panel-icon">
+              <Box size={32} />
+            </div>
+            <div className="landing-panel-copy">
+              <p className="eyebrow">New Sandbox</p>
+              <h2>Create a new sandbox project to experiment, build, and iterate safely.</h2>
             </div>
           </div>
-          <label className="dialogue-field">
-            <span>Sandbox name</span>
+
+          <label className="landing-field">
+            <span>Sandbox Name</span>
             <input
               type="text"
               value={draftProjectName}
@@ -2263,52 +2654,125 @@ function LandingView({ entries, draftProjectName, onDraftProjectName, onCreateNe
               placeholder="SimpleDash"
             />
           </label>
-          <div className="landing-actions">
-            <button className="primary-button" type="button" onClick={onCreateNewProject}>
+
+          <div className="landing-rail-actions">
+            <button className="primary-button landing-primary-button" type="button" onClick={onCreateNewProject}>
               <Plus size={16} />
               Create New Project
             </button>
-            <button className="secondary-button" type="button" onClick={onOpenProject}>
+            <button className="secondary-button landing-open-folder-button" type="button" onClick={onOpenProject}>
               <FolderOpen size={16} />
               Open Folder
             </button>
           </div>
-        </div>
 
-        <div className="landing-card">
-          <div className="panel-heading">
+          <div className="landing-note-card">
+            <div className="landing-note-icon">
+              <CheckCircle2 size={18} />
+            </div>
             <div>
-              <p className="eyebrow">Recents</p>
-              <h2>Continue existing work</h2>
+              <h3>Isolated &amp; Safe</h3>
+              <p>All sandboxes run in isolated environments so your workspace stays clean and secure.</p>
             </div>
           </div>
+        </aside>
+
+        <div className="landing-panel landing-panel-recents">
+          <div className="landing-panel-header">
+            <div>
+              <h2>Recent Sandboxes</h2>
+              <p>Manage and resume your sandbox projects.</p>
+            </div>
+            <span className="landing-project-count">{statusCounts.all} Projects</span>
+          </div>
+
+          <div className="landing-status-row">
+            {statusOptions.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={`landing-filter-pill ${statusFilter === option.key ? "active" : ""}`}
+                onClick={() => setStatusFilter(option.key)}
+              >
+                {option.key === "all" ? null : <span className={`status-dot ${option.key}`} />}
+                <span>{option.label}</span>
+              </button>
+            ))}
+          </div>
+
           {recentEntries.length === 0 ? (
-            <div className="empty-output">No recent projects yet.</div>
+            <div className="landing-empty">No matching sandboxes found.</div>
           ) : (
             <div className="landing-recents">
-              {recentEntries.map((entry) => (
-                <article key={entry.id} className="project-card compact">
-                  <div className="project-card-top">
-                    <div>
-                      <h2>{entry.name}</h2>
-                      <div className="project-path" title={entry.path}>{entry.path}</div>
+              {recentEntries.map((entry) => {
+                const statusKey = toLandingStatusKey(entry?.status, entry?.decisionStatus);
+                return (
+                  <article key={entry.id} className="landing-recent-card">
+                    <div className="landing-recent-main">
+                      <div className={`landing-folder-icon ${statusKey}`}>
+                        <FolderClosed size={22} />
+                      </div>
+                      <div className="landing-recent-copy">
+                        <h3>{entry.name}</h3>
+                        <div className="project-path" title={entry.path}>{entry.path}</div>
+                        <div className="landing-recent-meta">
+                          <span className="landing-meta-item">
+                            <Clock3 size={14} />
+                            Updated: {formatTimestamp(entry.lastUpdated)}
+                          </span>
+                        </div>
+                      </div>
                     </div>
-                    <span className={`status-badge ${toStatusBadgeClass(entry.status)}`}>{entry.status}</span>
-                  </div>
-                  <div className="project-stats">
-                    {entry.projectSlug ? <span>Slug: {entry.projectSlug}</span> : null}
-                    <span>Updated: {formatTimestamp(entry.lastUpdated)}</span>
-                  </div>
-                  <div className="landing-actions">
-                    <button className="primary-button" type="button" onClick={() => onContinue(entry)}>
-                      Continue
-                    </button>
-                    <button className="secondary-button" type="button" onClick={() => onOpenFolder(entry.path)}>
-                      Open Folder
-                    </button>
-                  </div>
-                </article>
-              ))}
+
+                    <div className="landing-recent-actions">
+                      <span className={`landing-status-chip ${statusKey}`}>{toLandingStatusLabel(entry?.status, entry?.decisionStatus)}</span>
+                      <button className="primary-button landing-continue-button" type="button" onClick={() => onContinue(entry)}>
+                        <Play size={15} />
+                        Continue
+                      </button>
+                      <button className="secondary-button landing-open-button" type="button" onClick={() => onOpenFolder(entry.path)}>
+                        <FolderOpen size={15} />
+                        Open Folder
+                      </button>
+                      <div className="landing-more-wrap">
+                        <button
+                          className="icon-button landing-more-button"
+                          type="button"
+                          aria-label={`More actions for ${entry.name}`}
+                          aria-expanded={openMenuId === entry.id}
+                          onClick={() => setOpenMenuId((current) => current === entry.id ? "" : entry.id)}
+                        >
+                          <MoreHorizontal size={18} />
+                        </button>
+                        {openMenuId === entry.id ? (
+                          <div className="landing-more-menu">
+                            <button
+                              type="button"
+                              className="landing-menu-item"
+                              onClick={() => {
+                                setOpenMenuId("");
+                                void onRename(entry);
+                              }}
+                            >
+                              Rename
+                            </button>
+                            <button
+                              type="button"
+                              className="landing-menu-item danger"
+                              onClick={() => {
+                                setOpenMenuId("");
+                                void onDelete(entry);
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           )}
         </div>
@@ -2469,15 +2933,15 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
       <h1>Runtime configuration</h1>
       <div className="settings-grid">
         <div className="settings-row">
-          <span>QA endpoint</span>
+          <span>Senior Dev endpoint</span>
           <code>{settings?.endpoints?.qa || settings?.endpoint || "Loading..."}</code>
         </div>
         <div className="settings-row">
-          <span>DEV endpoint</span>
+          <span>Junior Dev endpoint</span>
           <code>{settings?.endpoints?.dev || "Loading..."}</code>
         </div>
         <div className="settings-row">
-          <span>PM endpoint</span>
+          <span>Supervisor endpoint</span>
           <code>{settings?.endpoints?.pm || "Loading..."}</code>
         </div>
         <div className="settings-row">
@@ -2488,9 +2952,9 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
           ? Object.values(settings.agents).map((agent) => (
             <div className="settings-row" key={agent.id}>
               <span>{formatAgentName(agent.id, {
-                junior: agentNames.junior || "DEV",
-                supervisor: agentNames.supervisor || "QA",
-                architect: agentNames.architect || "PROJECT MANAGER"
+                junior: agentNames.junior || "Junior Dev",
+                supervisor: agentNames.supervisor || "Senior Dev / QA",
+                architect: agentNames.architect || "Supervisor / PM"
               })}</span>
               <code>{`${agent.model} | ${agent.endpoint} | ${agent.summary}${agent.speech?.prefix ? ` | says "${agent.speech.prefix}"` : ""}`}</code>
             </div>
@@ -2521,9 +2985,9 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
           </button>
         </div>
         {[
-          ["juniorName", "DEV"],
-          ["supervisorName", "QA"],
-          ["architectName", "PROJECT MANAGER"]
+          ["juniorName", "Junior Dev"],
+          ["supervisorName", "Senior Dev / QA"],
+          ["architectName", "Supervisor / PM"]
         ].map(([key, label]) => (
           <label className="dialogue-field" key={key}>
             <span>{label}</span>
@@ -2549,9 +3013,9 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
         {Object.values(settings?.agents || {}).map((agent) => (
           <div className="dialogue-block" key={agent.id}>
             <h2>{formatAgentName(agent.id, {
-              junior: agentNames.junior || "DEV",
-              supervisor: agentNames.supervisor || "QA",
-              architect: agentNames.architect || "PROJECT MANAGER"
+              junior: agentNames.junior || "Junior Dev",
+              supervisor: agentNames.supervisor || "Senior Dev / QA",
+              architect: agentNames.architect || "Supervisor / PM"
             })}</h2>
             {AGENT_STATUS_KEYS.map((status) => (
               <label className="dialogue-field" key={`${agent.id}-${status}`}>
@@ -2654,16 +3118,16 @@ function buildStageMessages(progress, reactionIndex) {
     const juniorMessage = buildJuniorChatMessage(partialResult);
     return [
       {
-        id: `${runId}:${progress.stage || "dev-implementation"}:junior:message`,
+        id: `${runId}:${progress.stage || "junior-initial"}:junior:message`,
         from: "junior",
         to: "supervisor",
         role: "implementation",
-        stage: progress.stage || "dev-implementation",
+        stage: progress.stage || "junior-initial",
         timestamp,
         message: juniorMessage.detailsText,
         bubbleText: juniorMessage.bubbleText,
         detailsText: juniorMessage.detailsText,
-        detailLabel: "Show DEV notes",
+        detailLabel: "Show Junior Dev notes",
         status: "queued",
         renderedText: ""
       }
@@ -2674,22 +3138,22 @@ function buildStageMessages(progress, reactionIndex) {
     const supervisorMessage = buildSupervisorChatMessage(partialResult);
     return [
       {
-        id: `${runId}:${progress.stage || "qa-review"}:supervisor:message`,
+        id: `${runId}:${progress.stage || "senior-final-review"}:supervisor:message`,
         from: "supervisor",
-        to: progress.stage === "qa-scope" ? "junior" : "architect",
-        role: progress.stage === "qa-scope" ? "qa instruction" : "qa review",
-        stage: progress.stage || "qa-review",
+        to: progress.stage === "senior-parallel-review" ? "junior" : "architect",
+        role: progress.stage === "senior-parallel-review" ? "parallel review" : "final review",
+        stage: progress.stage || "senior-final-review",
         timestamp,
         message: supervisorMessage.detailsText,
         bubbleText: supervisorMessage.bubbleText,
         detailsText: supervisorMessage.detailsText,
-        detailLabel: "Show QA notes",
+        detailLabel: "Show Senior Dev notes",
         startDelayMs: STAGE_DELAY,
         status: "queued",
         renderedText: ""
       },
       {
-        id: `${runId}:${progress.stage || "qa-review"}:junior:reaction`,
+        id: `${runId}:${progress.stage || "senior-final-review"}:junior:reaction`,
         from: "junior",
         to: "supervisor",
         role: "reaction",
@@ -2709,16 +3173,16 @@ function buildStageMessages(progress, reactionIndex) {
     const architectMessage = buildArchitectChatMessage(partialResult);
     return [
       {
-        id: `${runId}:${progress.stage || "pm-decision"}:architect:message`,
+        id: `${runId}:${progress.stage || "supervisor-final"}:architect:message`,
         from: "architect",
         to: "team",
-        role: progress.stage === "pm-plan" ? "planning" : "decision",
-        stage: progress.stage || "pm-decision",
+        role: progress.stage === "supervisor-spec" ? "planning" : "decision",
+        stage: progress.stage || "supervisor-final",
         timestamp,
         message: architectMessage.detailsText,
         bubbleText: architectMessage.bubbleText,
         detailsText: architectMessage.detailsText,
-        detailLabel: "Show PM notes",
+        detailLabel: "Show Supervisor notes",
         startDelayMs: STAGE_DELAY,
         status: "queued",
         renderedText: ""
@@ -2749,7 +3213,7 @@ function buildSupervisorChatMessage(partialResult) {
     partialResult?.critique
   ]);
   return {
-    bubbleText: toBulletSummary(detailsText || "QA is checking this against the PRD.", 4),
+    bubbleText: toBulletSummary(detailsText || "Senior Dev is checking this against the PRD.", 4),
     detailsText
   };
 }
@@ -2904,6 +3368,67 @@ function normalizeGeneratedProject(result, fallbackProject) {
   };
 }
 
+function shouldShowCycleReview({ result, workflow, isRunning }) {
+  if (isRunning || !result?.decision?.summary) {
+    return false;
+  }
+
+  return ["pending", "applied", "accepted"].includes(String(workflow?.decisionStatus || "pending"));
+}
+
+function getUpcomingPhaseName(phases = []) {
+  const currentIndex = phases.findIndex((phase) => phase.status === "in_progress");
+  if (currentIndex >= 0 && phases[currentIndex + 1]) {
+    return phases[currentIndex + 1].name;
+  }
+
+  return phases.find((phase) => phase.status === "not_started")?.name || "";
+}
+
+function transitionProjectPlan(phases = [], tasks = [], mode = "finish") {
+  const nextPhases = (phases || []).map((phase) => ({ ...phase }));
+  const nextTasks = (tasks || []).map((task) => ({ ...task }));
+  const currentPhaseIndex = nextPhases.findIndex((phase) => phase.status === "in_progress");
+  const resolvedPhaseIndex = currentPhaseIndex >= 0 ? currentPhaseIndex : (nextPhases.length > 0 ? 0 : -1);
+  const currentPhaseName = resolvedPhaseIndex >= 0 ? nextPhases[resolvedPhaseIndex]?.name || "" : "";
+
+  if (resolvedPhaseIndex >= 0) {
+    nextPhases.forEach((phase, index) => {
+      if (index === resolvedPhaseIndex) {
+        phase.status = "done";
+      } else if (phase.status === "in_progress") {
+        phase.status = "not_started";
+      }
+    });
+
+    nextTasks.forEach((task) => {
+      if (task.phase === currentPhaseName && task.status !== "done") {
+        task.status = "done";
+      }
+    });
+  }
+
+  let nextPhaseName = "";
+  let nextTaskTitle = "";
+  if (mode === "advance" && resolvedPhaseIndex >= 0 && nextPhases[resolvedPhaseIndex + 1]) {
+    const nextPhase = nextPhases[resolvedPhaseIndex + 1];
+    nextPhase.status = "in_progress";
+    nextPhaseName = nextPhase.name || "";
+    const nextTask = nextTasks.find((task) => task.phase === nextPhaseName && task.status !== "done");
+    if (nextTask) {
+      nextTask.status = "in_progress";
+      nextTaskTitle = nextTask.title || "";
+    }
+  }
+
+  return {
+    phases: nextPhases,
+    tasks: nextTasks,
+    currentPhase: mode === "advance" ? (nextPhaseName || currentPhaseName || "") : currentPhaseName,
+    currentTask: mode === "advance" ? (nextTaskTitle || "Start next phase") : "Cycle finished"
+  };
+}
+
 function buildDialogueDraft(agentsMap) {
   const draft = {};
 
@@ -2941,9 +3466,9 @@ function capitalize(value) {
 
 function formatOutputTab(value) {
   const labels = {
-    architect: "PM",
-    supervisor: "QA",
-    junior: "DEV",
+    architect: "Supervisor",
+    supervisor: "Senior Dev",
+    junior: "Junior Dev",
     prd: "PRD",
     tasks: "Tasks",
     logs: "Logs",
@@ -2989,15 +3514,15 @@ function formatAgentName(value, agentNameMap = {}) {
   }
 
   if (value === "junior") {
-    return "DEV";
+    return "Junior Dev";
   }
 
   if (value === "supervisor") {
-    return "QA";
+    return "Senior Dev / QA";
   }
 
   if (value === "architect") {
-    return "PROJECT MANAGER";
+    return "Supervisor / PM";
   }
 
   return capitalize(String(value || "team"));
@@ -3074,6 +3599,42 @@ function formatTimestamp(value) {
   } catch {
     return String(value);
   }
+}
+
+function toLandingStatusKey(status, decisionStatus) {
+  const decision = String(decisionStatus || "").toLowerCase();
+  const value = String(status || "").toLowerCase();
+
+  if (decision === "applied" || decision === "accepted" || value === "completed") {
+    return "completed";
+  }
+
+  if (value === "waiting for decision" || decision === "pending") {
+    return "waiting";
+  }
+
+  if (value === "in progress" || decision === "denied" || decision === "manual_review_required") {
+    return "active";
+  }
+
+  return "not-started";
+}
+
+function toLandingStatusLabel(status, decisionStatus) {
+  const key = toLandingStatusKey(status, decisionStatus);
+  if (key === "active") {
+    return "In progress";
+  }
+
+  if (key === "waiting") {
+    return "Waiting for decision";
+  }
+
+  if (key === "completed") {
+    return "Completed";
+  }
+
+  return "Not started";
 }
 
 function mapTrackedStatusToStage(status, decisionStatus) {
