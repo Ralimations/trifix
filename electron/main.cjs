@@ -49,10 +49,14 @@ app.on("window-all-closed", () => {
 });
 
 async function loadBackend() {
-  const [constants, fileSystem, orchestrator] = await Promise.all([
+  const [constants, fileSystem, orchestrator, runState, artifactLedger, verifier, modelHealth] = await Promise.all([
     import("./constants.js"),
     import("./fileSystem.js"),
-    import("./agent/orchestrator.js")
+    import("./agent/orchestrator.js"),
+    import("./agent/runState.js"),
+    import("./agent/artifactLedger.js"),
+    import("./agent/verifier.js"),
+    import("./agent/modelHealth.js")
   ]);
 
   return {
@@ -60,6 +64,7 @@ async function loadBackend() {
     AI_ENDPOINT: constants.AI_ENDPOINT,
     DEV_ENDPOINT: constants.DEV_ENDPOINT,
     ARCHITECT_ENDPOINT: constants.ARCHITECT_ENDPOINT,
+    REQUEST_TIMEOUT_MS: constants.REQUEST_TIMEOUT_MS,
     DEFAULT_SANDBOX_PROJECT_NAME: constants.DEFAULT_SANDBOX_PROJECT_NAME,
     buildDefaultSandboxProject: fileSystem.buildDefaultSandboxProject,
     buildTaskSandboxProject: fileSystem.buildTaskSandboxProject,
@@ -70,7 +75,11 @@ async function loadBackend() {
     applyFileOperations: fileSystem.applyFileOperations,
     getLastResult: orchestrator.getLastResult,
     runPipeline: orchestrator.runPipeline,
-    runAgentTest: orchestrator.runAgentTest
+    runAgentTest: orchestrator.runAgentTest,
+    runState,
+    artifactLedger,
+    verifier,
+    getModelHealth: modelHealth.getModelHealth
   };
 }
 
@@ -226,6 +235,7 @@ function registerIpc() {
     },
     agents: await getMergedAgents()
   }));
+  ipcMain.handle("app:model-health", async () => backend.getModelHealth());
 
   ipcMain.handle("app:dialogue:save", async (_event, dialoguePatch) => {
     const current = await readSettings();
@@ -247,6 +257,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("pipeline:run", async (event, payload) => {
+    const sandboxParentPath = app.getPath("documents");
     const files = payload?.projectRoot
       ? await backend.readSelectedProjectFiles(payload.projectRoot, payload.selectedFiles || [])
       : [];
@@ -304,7 +315,10 @@ function registerIpc() {
       {
         ...payload,
         files,
-        graphContext
+        graphContext,
+        mode: "manual",
+        runPath: payload?.projectRoot || "",
+        sandboxParentPath
       },
       (progress) => {
         const progressRoot = payload?.projectRoot;
@@ -351,12 +365,42 @@ function registerIpc() {
     if (payload?.projectRoot) {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
       if (fileOperations.length > 0) {
+        await updateAutonomyRunState(payload.projectRoot, {
+          status: "running",
+          currentStage: "apply_files",
+          changedFiles: fileOperations.map((operation) => operation.path)
+        });
+        await appendAutonomyLog(payload.projectRoot, {
+          type: "stage-detail",
+          runId,
+          event: "files applied started",
+          fileOperations: fileOperations.map((operation) => operation.path)
+        });
         const existingPatchResult = await applyFileOperationsToExistingProject(
           payload.projectRoot,
           result,
           payload?.selectedFiles || [],
           fileOperations
         );
+        await backend.artifactLedger.trackPlannedFiles(payload.projectRoot, result?.project?.requiredFiles || []);
+        await backend.artifactLedger.trackProposedFiles(payload.projectRoot, fileOperations);
+        await backend.artifactLedger.trackAppliedOperations(payload.projectRoot, existingPatchResult.applied || []);
+        await backend.artifactLedger.trackFailedOperations(payload.projectRoot, existingPatchResult.failedOperations || []);
+        await updateAutonomyArtifacts(payload.projectRoot, {
+          changedFiles: (existingPatchResult.applied || []).map((item) => item.path)
+        });
+        await updateAutonomyRunState(payload.projectRoot, {
+          status: "running",
+          currentStage: "apply_files",
+          changedFiles: (existingPatchResult.applied || []).map((item) => item.path)
+        });
+        await appendAutonomyLog(payload.projectRoot, {
+          type: "stage-detail",
+          runId,
+          event: "files applied done",
+          applied: existingPatchResult.applied || [],
+          failedOperations: existingPatchResult.failedOperations || []
+        });
         result = attachExistingProjectPatchResult(result, existingPatchResult);
         activeTrackedEntry = await upsertProjectEntry(
           projectToTrackedEntry(existingPatchResult.project, {
@@ -388,11 +432,25 @@ function registerIpc() {
     } else {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
       if (fileOperations.length === 0) {
-        throw new Error("DEV proposed changes but no valid file operations were found.");
+        throw new Error("DEV produced no valid fileOperations.");
       }
 
+      const plannedRunPath = buildGeneratedTaskRoot(sandboxParentPath, result?.project?.projectSlug);
+      if (plannedRunPath) {
+        await updateAutonomyRunState(plannedRunPath, {
+          status: "running",
+          currentStage: "apply_files",
+          changedFiles: fileOperations.map((operation) => operation.path)
+        });
+        await appendAutonomyLog(plannedRunPath, {
+          type: "stage-detail",
+          runId,
+          event: "files applied started",
+          fileOperations: fileOperations.map((operation) => operation.path)
+        });
+      }
       const generatedProject = await backend.applyFileOperations(
-        app.getPath("documents"),
+        sandboxParentPath,
         result?.project?.architecture || result?.project || {},
         fileOperations
       );
@@ -400,9 +458,9 @@ function registerIpc() {
       await initializeAutonomyLedger(generatedProject.rootPath, {
         runId,
         mode: "manual",
-        status: "waiting_for_decision",
+        status: "running",
         startedAt,
-        currentStage: "file-executor",
+        currentStage: "apply_files",
         currentPhase: result?.workflow?.currentPhase || "Phase 1",
         currentTask: result?.workflow?.currentTask || "Review output",
         selectedFiles: generatedProject.applied.map((item) => item.path),
@@ -410,6 +468,14 @@ function registerIpc() {
         lastValidationStatus: "pending",
         nextAction: "user-decision"
       });
+      await backend.artifactLedger.trackPlannedFiles(generatedProject.rootPath, result?.project?.requiredFiles || []);
+      await backend.artifactLedger.trackProposedFiles(generatedProject.rootPath, fileOperations);
+      await backend.artifactLedger.trackAppliedOperations(generatedProject.rootPath, generatedProject.applied || []);
+      await backend.artifactLedger.trackFailedOperations(generatedProject.rootPath, generatedProject.failedOperations || []);
+      await backend.artifactLedger.trackCommandRequests(generatedProject.rootPath, [
+        ...(result?.dev?.commandRequests || []),
+        ...(result?.pm?.commandRequests || [])
+      ]);
       await appendAutonomyLog(generatedProject.rootPath, {
         type: "files-written",
         runId,
@@ -423,6 +489,13 @@ function registerIpc() {
         changedFiles: generatedProject.applied.map((item) => item.path),
         filesCreated: generatedProject.filesCreated || 0,
         filesModified: generatedProject.filesModified || 0,
+        failedOperations: generatedProject.failedOperations || []
+      });
+      await appendAutonomyLog(generatedProject.rootPath, {
+        type: "stage-detail",
+        runId,
+        event: "files applied done",
+        applied: generatedProject.applied || [],
         failedOperations: generatedProject.failedOperations || []
       });
       activeTrackedEntry = await upsertProjectEntry(
@@ -496,22 +569,23 @@ function registerIpc() {
     const resultRoot = result?.project?.rootPath || payload?.projectRoot;
     if (resultRoot) {
       const changedFiles = result?.decision?.affectedFiles || result?.executor?.applied?.map((item) => item.path) || [];
+      const validationStatus = getEffectiveValidationStatus(result) || "pending";
       await updateAutonomyRunState(resultRoot, {
         runId,
-        status: "waiting_for_decision",
+        status: "needs_review",
         finishedAt: new Date().toISOString(),
         currentStage: result?.workflow?.currentStage || "decision",
         currentPhase: result?.workflow?.currentPhase || "",
         currentTask: result?.workflow?.currentTask || "",
         changedFiles,
         selectedFiles: changedFiles,
-        lastValidationStatus: "pending",
+        lastValidationStatus: validationStatus,
         nextAction: "user-decision"
       });
       await appendAutonomyLog(resultRoot, {
         type: "run-complete",
         runId,
-        status: "waiting_for_decision",
+        status: "needs_review",
         changedFiles,
         summary: result?.decision?.summary || ""
       });
@@ -696,7 +770,10 @@ async function executeAutonomyTask(task) {
         {
           ...task.payload,
           files,
-          graphContext
+          graphContext,
+          mode: "autonomous",
+          runPath: task.payload?.projectRoot || "",
+          sandboxParentPath: app.getPath("documents")
         },
         (progress) => {
           task.progress.push({
@@ -727,7 +804,7 @@ async function executeAutonomyTask(task) {
     } else {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
       if (fileOperations.length === 0) {
-        throw new Error("DEV proposed changes but no valid file operations were found.");
+        throw new Error("DEV produced no valid fileOperations.");
       }
       const generatedProject = await backend.applyFileOperations(
         app.getPath("documents"),
@@ -776,9 +853,10 @@ async function executeAutonomyTask(task) {
     finalResult = repaired.result;
     activeTrackedEntry = repaired.activeTrackedEntry || activeTrackedEntry;
 
-    const finalStatus = getEffectiveValidationStatus(finalResult) === "failed"
-      ? "blocked"
-      : "waiting_for_decision";
+    const finalValidationStatus = getEffectiveValidationStatus(finalResult);
+    const finalStatus = finalValidationStatus === "passed" && !isQaUnavailable(finalResult)
+      ? "completed"
+      : "needs_review";
     task.status = finalStatus;
     const projectRoot = finalResult?.project?.rootPath || task.payload?.projectRoot || "";
     if (projectRoot) {
@@ -885,6 +963,9 @@ async function persistAutonomyQueueState(task, statePatch = {}) {
 async function writeAutonomyFinalReport(projectRoot, result, task) {
   const dir = await initializeAutonomyLedger(projectRoot);
   const reportPath = path.join(dir, "final-report.md");
+  const ledger = await backend.artifactLedger.loadArtifactLedger(projectRoot);
+  const runState = await backend.runState.loadRunState(projectRoot);
+  const verification = result?.autoRepair?.finalValidation?.verification || result?.validation?.verification || null;
   const lines = [
     "# TriFix Final Report",
     "",
@@ -892,24 +973,61 @@ async function writeAutonomyFinalReport(projectRoot, result, task) {
     `Status: ${task.status}`,
     `Finished: ${task.finishedAt || new Date().toISOString()}`,
     "",
-    "## Summary",
+    "## Task Summary",
     "",
-    result?.decision?.summary || result?.pm?.summary || "No summary returned.",
+    result?.decision?.summary || result?.pm?.summary || runState?.taskInput || "No summary returned.",
     "",
-    "## Changed Files",
+    "## Project",
     "",
-    ...(result?.decision?.affectedFiles?.length
-      ? result.decision.affectedFiles.map((filePath) => `- ${filePath}`)
+    `Project slug: ${result?.project?.projectSlug || ledger?.projectSlug || path.basename(projectRoot)}`,
+    `Workspace: ${projectRoot}`,
+    "",
+    "## Stages Completed",
+    "",
+    `Final stage: ${runState?.stage || "final"}`,
+    `Attempts: ${runState?.attempt ?? 0}/${runState?.maxAttempts ?? 3}`,
+    "",
+    "## Files Planned",
+    "",
+    ...((ledger?.filesPlanned || []).length
+      ? ledger.filesPlanned.map((filePath) => `- ${filePath}`)
       : ["- none"]),
     "",
-    "## Validation",
+    "## Files Written",
     "",
-    `Status: ${result?.autoRepair?.status || result?.validation?.status || "not_run"}`,
+    ...((ledger?.filesWritten || []).length
+      ? ledger.filesWritten.map((file) => `- ${file.path}`)
+      : ["- none"]),
+    "",
+    "## Failed Operations",
+    "",
+    ...((ledger?.failedOperations || []).length
+      ? ledger.failedOperations.map((operation) => `- ${operation.path || "(unknown)"}: ${operation.error || "failed"}`)
+      : ["- none"]),
+    "",
+    "## Verification Result",
+    "",
+    `Status: ${verification?.status || result?.autoRepair?.status || result?.validation?.status || "not_run"}`,
+    verification?.summary || "",
     result?.validation?.validation?.command ? `Command: ${result.validation.validation.command}` : "",
-    result?.autoRepair?.summary || "",
+    "",
+    "## QA Summary",
+    "",
+    ledger?.qaResult || result?.qa?.finalReview || result?.qa?.parallelReview || "No QA summary recorded.",
+    "",
+    "## Final PM Decision",
+    "",
+    result?.decision?.recommendation || result?.pm?.recommendation || "No final PM decision recorded.",
+    "",
+    "## Next Recommended Action",
+    "",
+    task.status === "completed"
+      ? "Review the written output and run any optional local commands listed in artifacts.json."
+      : "Open the generated workspace, inspect verification failures, and decide whether to apply a manual patch.",
     ""
   ].filter((line) => line !== "");
   await fs.writeFile(reportPath, `${lines.join("\n")}\n`, "utf8");
+  await backend.artifactLedger.trackFinalReportPath(projectRoot, path.join(AUTONOMY_DIR_NAME, "final-report.md"));
 }
 
 function summarizeAutonomyTask(task) {
@@ -1755,6 +1873,9 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     return { result, activeTrackedEntry };
   }
 
+  const runState = await backend.runState.loadRunState(root);
+  const maxRepairAttempts = Number(runState?.maxAttempts || 3);
+
   event.sender.send("pipeline:progress", {
     runId,
     agent: "supervisor",
@@ -1771,9 +1892,33 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
       }
     }
   });
+  await updateAutonomyRunState(root, {
+    status: "running",
+    currentStage: "verify",
+    changedFiles: appliedFiles
+  });
+  await appendAutonomyLog(root, {
+    type: "stage-detail",
+    runId,
+    event: "verification started"
+  });
 
   const initialValidation = await executeAutomaticProjectSteps(root, activeTrackedEntry?.id, result);
   result = attachValidationResult(result, initialValidation);
+  await updateAutonomyRunState(root, {
+    status: initialValidation.status === "passed" ? "running" : "failed",
+    currentStage: "verify",
+    changedFiles: appliedFiles,
+    lastValidationStatus: initialValidation.status,
+    lastError: initialValidation.status === "passed" ? "" : initialValidation.error || backend.verifier.buildVerificationReport(initialValidation.verification)
+  });
+  await appendAutonomyLog(root, {
+    type: "stage-detail",
+    runId,
+    event: "verification done",
+    verificationStatus: initialValidation.status,
+    summary: initialValidation.verification?.summary || initialValidation.error || ""
+  });
   event.sender.send("pipeline:progress", {
     runId,
     agent: "supervisor",
@@ -1787,9 +1932,16 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
   }
 
   let latestValidation = initialValidation;
-  const maxRepairAttempts = 2;
 
   for (let attempt = 1; attempt <= maxRepairAttempts; attempt += 1) {
+    await updateAutonomyRunState(root, {
+      attempt,
+      status: "running",
+      currentStage: "patch",
+      changedFiles: appliedFiles,
+      lastValidationStatus: latestValidation.status,
+      lastError: latestValidation.error || backend.verifier.buildVerificationReport(latestValidation.verification)
+    });
     await appendAutonomyLog(root, {
       type: "auto-repair-start",
       runId,
@@ -1827,6 +1979,7 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     }, repairFiles);
     const repairFeedback = [
       `AUTO_REPAIR_VALIDATION_FAILURE_ATTEMPT_${attempt}:`,
+      backend.verifier.buildVerificationReport(latestValidation.verification),
       `Command: ${latestValidation.validation?.command || "validation"}`,
       `Status: ${latestValidation.validation?.status || latestValidation.status}`,
       "Output:",
@@ -1846,7 +1999,10 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
         files: repairFiles,
         graphContext: repairGraphContext,
         feedback: [payload?.feedback, repairFeedback].filter(Boolean).join("\n\n"),
-        loopCount: Number(payload?.loopCount || 0) + attempt
+        loopCount: Number(payload?.loopCount || 0) + attempt,
+        mode: payload?.mode || "manual",
+        runPath: root,
+        sandboxParentPath: app.getPath("documents")
       },
       (progress) => {
         event.sender.send("pipeline:progress", {
@@ -1860,10 +2016,16 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     const repairOperations = Array.isArray(repairResult?.dev?.fileOperations) ? repairResult.dev.fileOperations : [];
     if (repairOperations.length === 0) {
       result = attachAutoRepairResult(result, {
-        status: "needs_patch",
-        summary: `Auto repair attempt ${attempt} did not produce valid file operations.`,
+        status: "needs_review",
+        summary: "DEV produced no valid fileOperations.",
         repairResult,
         validation: latestValidation
+      });
+      await updateAutonomyRunState(root, {
+        attempt,
+        status: "failed",
+        currentStage: "patch",
+        lastError: "DEV produced no valid fileOperations."
       });
       return { result, activeTrackedEntry };
     }
@@ -1882,6 +2044,17 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
       skipSetupCommands: true
     });
     result = mergeAutoRepairResult(result, repairResult, repairPatchResult, initialValidation, finalValidation);
+    await backend.artifactLedger.trackProposedFiles(root, repairOperations);
+    await backend.artifactLedger.trackAppliedOperations(root, repairPatchResult.applied || []);
+    await backend.artifactLedger.trackFailedOperations(root, repairPatchResult.failedOperations || []);
+    await updateAutonomyRunState(root, {
+      attempt,
+      status: finalValidation.status === "passed" ? "running" : "failed",
+      currentStage: "verify",
+      changedFiles: appliedFiles,
+      lastValidationStatus: finalValidation.status,
+      lastError: finalValidation.status === "passed" ? "" : finalValidation.error || backend.verifier.buildVerificationReport(finalValidation.verification)
+    });
 
     const repairedProject = {
       ...(result?.project || {}),
@@ -1919,6 +2092,12 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     });
 
     if (finalValidation.status === "passed") {
+      await appendAutonomyLog(root, {
+        type: "stage-detail",
+        runId,
+        event: "verification done",
+        verificationStatus: "passed"
+      });
       event.sender.send("pipeline:progress", {
         runId,
         agent: "supervisor",
@@ -1940,6 +2119,15 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     partialResult: result
   });
 
+  await updateAutonomyRunState(root, {
+    attempt: maxRepairAttempts,
+    status: "needs_review",
+    currentStage: "final",
+    changedFiles: appliedFiles,
+    lastValidationStatus: latestValidation.status,
+    lastError: latestValidation.error || backend.verifier.buildVerificationReport(latestValidation.verification)
+  });
+
   return { result, activeTrackedEntry };
 }
 
@@ -1948,6 +2136,26 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
   const commands = options.skipSetupCommands
     ? []
     : await collectAutomaticCommands(root, result);
+  const verification = await backend.verifier.verifyArtifacts({
+    rootPath: root,
+    expectedFiles: result?.project?.requiredFiles || [],
+    appliedOperations: result?.executor?.applied || result?.dev?.fileOperations || [],
+    commandRequests: [
+      ...(result?.pm?.commandRequests || []),
+      ...(result?.dev?.commandRequests || []),
+      ...(result?.dev?.commands || [])
+    ]
+  });
+
+  if (verification.status !== "passed") {
+    return {
+      status: "failed",
+      entries,
+      verification,
+      validation: null,
+      error: verification.summary
+    };
+  }
 
   try {
     for (const command of commands) {
@@ -1959,12 +2167,13 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
       });
       entries.push(entry);
       if (entry.status !== "passed") {
-        return {
-          status: "failed",
-          entries,
-          validation: entry,
-          error: `${entry.command} failed.`
-        };
+      return {
+        status: "failed",
+        entries,
+        verification,
+        validation: entry,
+        error: `${entry.command} failed.`
+      };
       }
     }
 
@@ -1977,6 +2186,7 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
     return {
       status: validation.status,
       entries,
+      verification,
       validation,
       error: validation.status === "passed" ? "" : `${validation.command} failed.`
     };
@@ -1984,6 +2194,7 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
     return {
       status: "failed",
       entries,
+      verification,
       validation: null,
       error: error?.message || "Automatic validation failed."
     };
@@ -2048,10 +2259,24 @@ async function applyFileOperationsToExistingProject(rootPath, result, selectedFi
   const project = await backend.buildProjectTree(rootPath, {
     ensureSandboxFolder: inferProjectType(rootPath) !== "sandbox-task"
   });
+  const verification = await backend.verifier.verifyArtifacts({
+    rootPath,
+    expectedFiles: [],
+    appliedOperations: patchResult.applied || []
+  });
+  const failedOperations = [
+    ...(verification.missingFiles || []).map((filePath) => ({
+      action: "write",
+      path: filePath,
+      error: "File was reported as written but was not found on disk."
+    }))
+  ];
   return {
     project,
     applied: patchResult.applied || [],
-    backupRoot: patchResult.backupRoot || ""
+    backupRoot: patchResult.backupRoot || "",
+    failedOperations,
+    verification
   };
 }
 
@@ -2073,7 +2298,7 @@ function attachExistingProjectPatchResult(result, patchResult) {
       backupRoot: patchResult.backupRoot || "",
       filesCreated: applied.filter((item) => item.created).length,
       filesModified: applied.filter((item) => !item.created).length,
-      failedOperations: []
+      failedOperations: patchResult.failedOperations || []
     },
     project: {
       ...(result?.project || {}),
@@ -2195,7 +2420,25 @@ function getEffectiveValidationStatus(result) {
     return autoRepairStatus;
   }
 
+  const verificationStatus = String(result?.validation?.verification?.status || "").trim().toLowerCase();
+  if (verificationStatus && verificationStatus !== "passed") {
+    return verificationStatus;
+  }
+
   return String(result?.validation?.status || "").trim().toLowerCase();
+}
+
+function isQaUnavailable(result) {
+  const qaNotes = [
+    result?.qa?.parallelReview,
+    result?.qa?.finalReview,
+    result?.qa?.qaResult
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join("\n");
+
+  return /qa request timed out|review unavailable|final review unavailable|unavailable/i.test(qaNotes);
 }
 
 function extractProjectPathsFromValidationOutput(output) {
@@ -2218,6 +2461,48 @@ function extractProjectPathsFromValidationOutput(output) {
 
 function uniqueStrings(values = []) {
   return [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function mapRunStage(stage) {
+  const normalized = String(stage || "").trim().toLowerCase();
+  if (["pm_plan", "supervisor-spec", "pipeline-start", "planning"].includes(normalized)) return "pm_plan";
+  if (["dev", "junior-initial", "coding"].includes(normalized)) return "dev";
+  if (["apply_files", "file-executor"].includes(normalized)) return "apply_files";
+  if (["verify", "auto-validation", "validation"].includes(normalized)) return "verify";
+  if (["qa", "senior-parallel-review", "senior-final-review"].includes(normalized)) return "qa";
+  if (["patch", "junior-patch", "auto-repair"].includes(normalized)) return "patch";
+  if (["final", "supervisor-final", "decision"].includes(normalized)) return "final";
+  return "pm_plan";
+}
+
+function mapRunStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (["completed", "done", "passed", "success"].includes(normalized)) return "completed";
+  if (["needs_review", "waiting_for_decision", "waiting for decision"].includes(normalized)) return "needs_review";
+  if (["failed", "error"].includes(normalized)) return "failed";
+  if (["running", "thinking", "coding", "testing", "speaking", "pending", "queued", "idle"].includes(normalized)) return "running";
+  return "pending";
+}
+
+function buildGeneratedTaskRoot(parentPath, projectSlug) {
+  const normalizedParent = String(parentPath || "").trim();
+  const normalizedSlug = sanitizeGeneratedSlug(projectSlug);
+  if (!normalizedParent || !normalizedSlug) {
+    return "";
+  }
+  return path.join(normalizedParent, backend.DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks", normalizedSlug);
+}
+
+function sanitizeGeneratedSlug(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
 }
 
 async function discardGeneratedOutput(payload = {}) {
@@ -2517,40 +2802,44 @@ async function initializeAutonomyLedger(rootPath, statePatch = {}) {
   await ensureFile(path.join(dir, DECISIONS_FILE), "# TriFix Decisions\n\n");
   await ensureJsonFile(path.join(graphDir, GRAPH_STATUS_FILE), createDefaultGraphStatus(root));
   await ensureJsonFile(path.join(processDir, PROCESS_REGISTRY_FILE), []);
-  await ensureJsonFile(path.join(dir, ARTIFACTS_FILE), {
-    projectName: "",
-    projectSlug: "",
+  await backend.runState.createRunState({
+    runId: statePatch.runId || "",
+    taskInput: statePatch.taskInput || "",
+    projectRoot: root,
+    mode: statePatch.mode || "manual"
+  });
+  const existingState = await backend.runState.loadRunState(root);
+  await backend.runState.saveRunState(root, {
+    ...existingState,
+    runId: statePatch.runId ?? existingState?.runId ?? "",
+    mode: statePatch.mode ?? existingState?.mode ?? "manual",
+    status: mapRunStatus(statePatch.status ?? existingState?.status ?? "pending"),
+    stage: mapRunStage(statePatch.currentStage ?? statePatch.stage ?? existingState?.stage ?? "pm_plan"),
+    attempt: Number(statePatch.attempt ?? existingState?.attempt ?? 0),
+    maxAttempts: Number(statePatch.maxAttempts ?? existingState?.maxAttempts ?? 3),
+    taskInput: statePatch.taskInput ?? existingState?.taskInput ?? "",
+    projectSlug: statePatch.projectSlug ?? existingState?.projectSlug ?? path.basename(root),
+    workspacePath: root,
+    changedFiles: uniqueStrings(statePatch.changedFiles ?? existingState?.changedFiles ?? []),
+    lastError: statePatch.lastError ?? existingState?.lastError ?? "",
+    lastValidationStatus: statePatch.lastValidationStatus ?? existingState?.lastValidationStatus ?? ""
+  });
+  await backend.artifactLedger.createArtifactLedger({
+    runPath: root,
+    projectSlug: statePatch.projectSlug || path.basename(root),
+    workspacePath: root
+  });
+  await backend.artifactLedger.saveArtifactLedger(root, {
+    projectName: statePatch.projectName || "",
+    projectSlug: statePatch.projectSlug || path.basename(root),
     rootPath: root,
-    changedFiles: [],
+    changedFiles: uniqueStrings(statePatch.changedFiles || []),
     processes: [],
     graph: {
       status: "not_checked",
       reportPath: path.join(AUTONOMY_DIR_NAME, GRAPH_DIR_NAME, "GRAPH_REPORT.md"),
       graphPath: path.join(AUTONOMY_DIR_NAME, GRAPH_DIR_NAME, "graph.json")
     }
-  });
-
-  const existingState = await readJsonFile(path.join(dir, RUN_STATE_FILE), {});
-  await writeJsonFile(path.join(dir, RUN_STATE_FILE), {
-    schemaVersion: 1,
-    projectRoot: root,
-    mode: "manual",
-    status: "idle",
-    createdAt: existingState.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    currentStage: "",
-    currentPhase: "",
-    currentTask: "",
-    selectedFiles: [],
-    changedFiles: [],
-    lastCommand: "",
-    lastCommandStatus: "",
-    lastValidationStatus: "",
-    nextAction: "",
-    ...existingState,
-    ...stripUndefined(statePatch),
-    projectRoot: root,
-    updatedAt: new Date().toISOString()
   });
 
   return dir;
@@ -3085,13 +3374,16 @@ function runQuickProcess(command, args, cwd, timeoutMs) {
 }
 
 async function updateAutonomyRunState(rootPath, statePatch = {}) {
-  const dir = await initializeAutonomyLedger(rootPath);
-  const statePath = path.join(dir, RUN_STATE_FILE);
-  const current = await readJsonFile(statePath, {});
-  await writeJsonFile(statePath, {
+  await initializeAutonomyLedger(rootPath);
+  const current = await backend.runState.loadRunState(rootPath);
+  await backend.runState.saveRunState(rootPath, {
     ...current,
     ...stripUndefined(statePatch),
-    updatedAt: new Date().toISOString()
+    status: mapRunStatus(statePatch.status ?? current?.status ?? "running"),
+    stage: mapRunStage(statePatch.currentStage ?? statePatch.stage ?? current?.stage ?? "pm_plan"),
+    changedFiles: uniqueStrings(statePatch.changedFiles ?? current?.changedFiles ?? []),
+    lastValidationStatus: statePatch.lastValidationStatus ?? current?.lastValidationStatus ?? "",
+    lastError: statePatch.lastError ?? current?.lastError ?? ""
   });
 }
 
@@ -3120,14 +3412,8 @@ async function appendAutonomyDecision(rootPath, entry = {}) {
 }
 
 async function updateAutonomyArtifacts(rootPath, patch = {}) {
-  const dir = await initializeAutonomyLedger(rootPath);
-  const artifactsPath = path.join(dir, ARTIFACTS_FILE);
-  const current = await readJsonFile(artifactsPath, {});
-  await writeJsonFile(artifactsPath, {
-    ...current,
-    ...stripUndefined(patch),
-    updatedAt: new Date().toISOString()
-  });
+  await initializeAutonomyLedger(rootPath);
+  await backend.artifactLedger.saveArtifactLedger(rootPath, patch);
 }
 
 async function normalizeExistingProjectRoot(rootPath) {
@@ -3380,7 +3666,7 @@ async function readAutonomyStateForProject(rootPath) {
       runId: state.runId || "",
       mode: state.mode,
       status: state.status || "",
-      currentStage: state.currentStage || "",
+      currentStage: state.stage || state.currentStage || "",
       currentTask: state.currentTask || "",
       queuedAt: state.queuedAt || "",
       startedAt: state.startedAt || "",

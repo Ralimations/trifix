@@ -4,9 +4,12 @@ const normalizeLocalEndpoint = (endpoint) =>
   String(endpoint || "").replace("http://localhost:3010/", "http://127.0.0.1:3010/");
 
 export const AI_ENDPOINT =
-  process.env.TRIFIX_AI_ENDPOINT || AGENT_CONFIGS.supervisor.endpoint;
+  process.env.TRIFIX_QA_ENDPOINT ||
+  process.env.TRIFIX_AI_ENDPOINT ||
+  AGENT_CONFIGS.supervisor.endpoint;
 
 export const ARCHITECT_ENDPOINT = normalizeLocalEndpoint(
+  process.env.TRIFIX_PM_ENDPOINT ||
   process.env.TRIFIX_ARCHITECT_ENDPOINT ||
   AGENT_CONFIGS.architect.endpoint
 );
@@ -18,27 +21,36 @@ export const DEV_ENDPOINT = normalizeLocalEndpoint(
 );
 
 export const ARCHITECT_MODEL =
-  process.env.TRIFIX_ARCHITECT_MODEL || AGENT_CONFIGS.architect.model;
+  process.env.TRIFIX_PM_MODEL ||
+  process.env.TRIFIX_ARCHITECT_MODEL ||
+  AGENT_CONFIGS.architect.model;
 export const DEV_MODEL =
   process.env.TRIFIX_DEV_MODEL ||
   process.env.TRIFIX_JUNIOR_MODEL ||
   AGENT_CONFIGS.junior.model;
+export const QA_MODEL =
+  process.env.TRIFIX_QA_MODEL || AGENT_CONFIGS.supervisor.model;
+export const REQUEST_TIMEOUT_MS = Number(process.env.TRIFIX_REQUEST_TIMEOUT_MS || AGENT_CONFIGS.junior.timeoutMs || 1800000);
 
 export const AGENTS = {
   ...AGENT_CONFIGS,
   junior: {
     ...AGENT_CONFIGS.junior,
     model: DEV_MODEL,
-    endpoint: DEV_ENDPOINT
+    endpoint: DEV_ENDPOINT,
+    timeoutMs: REQUEST_TIMEOUT_MS
   },
   supervisor: {
     ...AGENT_CONFIGS.supervisor,
-    endpoint: process.env.TRIFIX_SUPERVISOR_ENDPOINT || AI_ENDPOINT
+    model: QA_MODEL,
+    endpoint: process.env.TRIFIX_SUPERVISOR_ENDPOINT || AI_ENDPOINT,
+    timeoutMs: REQUEST_TIMEOUT_MS
   },
   architect: {
     ...AGENT_CONFIGS.architect,
     model: ARCHITECT_MODEL,
-    endpoint: ARCHITECT_ENDPOINT
+    endpoint: ARCHITECT_ENDPOINT,
+    timeoutMs: REQUEST_TIMEOUT_MS
   }
 };
 

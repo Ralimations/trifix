@@ -253,7 +253,7 @@ export async function applyFileOperations(parentPath, projectSpec = {}, operatio
 
   const fileOperations = Array.isArray(operations) ? operations : [];
   if (fileOperations.length === 0) {
-    throw new Error("DEV proposed changes but no valid file operations were found.");
+    throw new Error("DEV produced no valid fileOperations.");
   }
 
   const tasksRoot = path.join(parentPath, DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks");
@@ -307,7 +307,16 @@ export async function applyFileOperations(parentPath, projectSpec = {}, operatio
       await fs.rm(root, { recursive: true, force: true });
     }
 
-    throw new Error("DEV proposed changes but no valid file operations were found.");
+    throw new Error("DEV produced no valid fileOperations.");
+  }
+
+  const verification = await verifyWrittenOperations(root, applied);
+  for (const missingPath of verification.missingFiles) {
+    failedOperations.push({
+      action: "write",
+      path: missingPath,
+      error: "File was reported as written but was not found on disk."
+    });
   }
 
   const project = await buildProjectTree(root, { ensureSandboxFolder: false });
@@ -325,7 +334,8 @@ export async function applyFileOperations(parentPath, projectSpec = {}, operatio
     filesCreated,
     filesModified,
     failedOperations,
-    applied
+    applied,
+    verification
   };
 }
 
@@ -529,6 +539,31 @@ async function fileExists(absolutePath) {
 
     throw error;
   }
+}
+
+async function verifyWrittenOperations(root, operations = []) {
+  const missingFiles = [];
+
+  for (const operation of operations) {
+    const relativePath = toProjectPath(operation?.path || "");
+    if (!relativePath) {
+      continue;
+    }
+
+    try {
+      const stat = await fs.stat(path.join(root, relativePath));
+      if (!stat.isFile()) {
+        missingFiles.push(relativePath);
+      }
+    } catch {
+      missingFiles.push(relativePath);
+    }
+  }
+
+  return {
+    status: missingFiles.length === 0 ? "passed" : "failed",
+    missingFiles
+  };
 }
 
 async function directoryExists(absolutePath) {

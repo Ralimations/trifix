@@ -1,3 +1,12 @@
+const DEFAULT_REQUEST_TIMEOUT_MS = 1800000;
+
+const envNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const REQUEST_TIMEOUT_MS = envNumber(process.env.TRIFIX_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS);
+
 export const AGENT_CONFIGS = {
   junior: {
     id: "junior",
@@ -6,9 +15,9 @@ export const AGENT_CONFIGS = {
     title: "Junior Dev",
     roleLabel: "junior dev / local patch applier",
     summary: "uses Qwen 3.5 9B to implement scoped code changes and apply patches",
-    endpoint: "http://127.0.0.1:3010/api/v1/chat",
-    model: "qwen/qwen3.5-9b",
-    timeoutMs: 1800000,
+    endpoint: process.env.TRIFIX_DEV_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
+    model: process.env.TRIFIX_DEV_MODEL || "qwen/qwen3.5-9b",
+    timeoutMs: REQUEST_TIMEOUT_MS,
     color: "blue",
     prompts: {
       system:
@@ -48,9 +57,9 @@ export const AGENT_CONFIGS = {
     title: "Senior Dev / QA",
     roleLabel: "senior dev / parallel review + testing",
     summary: "reviews in parallel, predicts bugs, suggests fixes, and verifies checklist alignment",
-    endpoint: "http://10.8.0.3:3011/api/v1/chat",
-    model: "gemma-4-e4b-uncensored-hauhaucs-aggressive",
-    timeoutMs: 1800000,
+    endpoint: process.env.TRIFIX_QA_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat",
+    model: process.env.TRIFIX_QA_MODEL || "gemma-4-e4b-uncensored-hauhaucs-aggressive",
+    timeoutMs: REQUEST_TIMEOUT_MS,
     color: "red",
     prompts: {
       system:
@@ -90,9 +99,9 @@ export const AGENT_CONFIGS = {
     title: "Supervisor / PM",
     roleLabel: "supervisor / planning + task routing",
     summary: "routes work, creates concise specs, owns FSD/PRD alignment, and makes final decisions",
-    endpoint: "http://127.0.0.1:3010/api/v1/chat",
-    model: "google/gemma-4-e4b",
-    timeoutMs: 1800000,
+    endpoint: process.env.TRIFIX_PM_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
+    model: process.env.TRIFIX_PM_MODEL || "google/gemma-4-e4b",
+    timeoutMs: REQUEST_TIMEOUT_MS,
     color: "green",
     prompts: {
       system:

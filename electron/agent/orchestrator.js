@@ -1,13 +1,28 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
+import path from "node:path";
 import {
   AGENTS,
   AI_ENDPOINT,
+  DEFAULT_SANDBOX_PROJECT_NAME,
   MAX_CONTEXT_CHARS_PER_FILE,
   MAX_CONTEXT_CHARS_TOTAL,
   SANDBOX_FOLDER_NAME
 } from "../constants.js";
+import {
+  appendRunLog,
+  createRunState,
+  markStage,
+  saveRunState
+} from "./runState.js";
+import {
+  trackCommandRequests,
+  trackPlannedFiles,
+  trackProposedFiles,
+  trackQaResult
+} from "./artifactLedger.js";
 
 const REQUEST_TIMEOUT_MS = 1800000;
 const SPEAKING_DELAY_MS = 800;
@@ -60,9 +75,28 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const feedback = String(payload?.feedback || "").trim();
   const loopCount = Number(payload?.loopCount || 0);
   const runId = payload?.runId || randomUUID();
+  const runMode = payload?.mode === "autonomous" || payload?.autonomy ? "autonomous" : "manual";
+  let pipelineRunPath = String(payload?.runPath || payload?.projectRoot || "").trim();
 
   if (!input && files.length === 0 && contextDocuments.length === 0) {
     throw new Error("Add an instruction, upload context, or select at least one project file.");
+  }
+
+  if (pipelineRunPath) {
+    await initializePipelineRunState({
+      runPath: pipelineRunPath,
+      runId,
+      taskInput: input,
+      mode: runMode
+    });
+    await markPipelineStage(pipelineRunPath, "pm_plan", "running", {
+      status: "running",
+      attempt: loopCount,
+      maxAttempts: 3
+    }, {
+      type: "stage-detail",
+      event: "supervisor-spec started"
+    });
   }
 
   const filesAnalyzed = files.map((file) => ({
@@ -120,6 +154,17 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   addParallelLog("Supervisor spec created");
 
   const pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, null, pmPlan);
+  if (!pipelineRunPath) {
+    pipelineRunPath = buildPlannedRunPath(payload?.sandboxParentPath, pmArchitecture?.projectSlug);
+    if (pipelineRunPath) {
+      await initializePipelineRunState({
+        runPath: pipelineRunPath,
+        runId,
+        taskInput: input,
+        mode: runMode
+      });
+    }
+  }
   const prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
   const projectPlan = buildProjectPlan(prd);
   const qaStructureReview = isExistingProjectRequest
@@ -149,6 +194,16 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     }
   });
   await delay(SPEAKING_DELAY_MS);
+  if (pipelineRunPath) {
+    await trackPlannedFiles(pipelineRunPath, pmArchitecture?.requiredFiles || pmArchitecture?.fileArchitecture || []);
+    await markPipelineStage(pipelineRunPath, "pm_plan", "running", {
+      changedFiles: uniqueStrings(pmArchitecture?.requiredFiles || []),
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "supervisor-spec done"
+    });
+  }
   emitStage({
     agent: "architect",
     stage: "supervisor-spec",
@@ -187,6 +242,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   });
 
   addParallelLog("Junior Dev started");
+  if (pipelineRunPath) {
+    await markPipelineStage(pipelineRunPath, "dev", "running", {
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "junior-initial started"
+    });
+  }
   emitStage({ agent: "junior", stage: "junior-initial", status: "coding", projectPlan });
   const juniorInitialTask = trackAgentCall(callAgent({
     agent: AGENTS.junior,
@@ -227,6 +290,23 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const juniorInitialOutput = juniorInitialSettled.value;
   const juniorInitialLeadResult = parseLeadOutput(juniorInitialOutput, filesAnalyzed, pmArchitecture);
   const juniorInitialResult = buildJuniorResult(juniorInitialOutput);
+  if (pipelineRunPath) {
+    await trackProposedFiles(pipelineRunPath, juniorInitialLeadResult.fileOperations || []);
+    await trackCommandRequests(pipelineRunPath, juniorInitialLeadResult.commandRequests || []);
+    await appendRunLog(pipelineRunPath, {
+      type: "stage-detail",
+      event: "fileOperations parsed",
+      fileOperations: (juniorInitialLeadResult.fileOperations || []).map((operation) => operation.path),
+      commandRequests: juniorInitialLeadResult.commandRequests || []
+    });
+    await markPipelineStage(pipelineRunPath, "dev", "running", {
+      changedFiles: juniorInitialLeadResult.affectedFiles || [],
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "junior-initial done"
+    });
+  }
   emitStage({
     agent: "junior",
     stage: "junior-initial",
@@ -288,6 +368,15 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
 
   const seniorParallelResult = buildSupervisorResult(seniorParallelReview);
+  if (pipelineRunPath) {
+    await markPipelineStage(pipelineRunPath, "qa", "running", {
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "senior review started"
+    });
+    await trackQaResult(pipelineRunPath, seniorParallelReview.trim());
+  }
   emitStage({
     agent: "supervisor",
     stage: "senior-parallel-review",
@@ -304,6 +393,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     }
   });
   await delay(SPEAKING_DELAY_MS);
+  if (pipelineRunPath) {
+    await markPipelineStage(pipelineRunPath, "qa", "running", {
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "senior review done"
+    });
+  }
   emitStage({
     agent: "supervisor",
     stage: "senior-parallel-review",
@@ -324,6 +421,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   let finalLeadResult = juniorInitialLeadResult;
   if (seniorParallelAvailable) {
     addParallelLog("Patch pass started");
+    if (pipelineRunPath) {
+      await markPipelineStage(pipelineRunPath, "patch", "running", {
+        status: "running"
+      }, {
+        type: "stage-detail",
+        event: "patch pass started"
+      });
+    }
     emitStage({ agent: "junior", stage: "junior-patch", status: "coding", projectPlan });
     try {
       juniorPatchOutput = await callAgent({
@@ -356,6 +461,17 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
 
   const finalDevOutput = [juniorInitialOutput, juniorPatchOutput].filter(Boolean).join("\n\nPATCH PASS:\n");
+  if (pipelineRunPath) {
+    await trackProposedFiles(pipelineRunPath, finalLeadResult.fileOperations || []);
+    await trackCommandRequests(pipelineRunPath, finalLeadResult.commandRequests || []);
+    await markPipelineStage(pipelineRunPath, "patch", "running", {
+      changedFiles: finalLeadResult.affectedFiles || [],
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "patch pass done"
+    });
+  }
   emitStage({
     agent: "junior",
     stage: "junior-patch",
@@ -412,6 +528,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   });
 
   addParallelLog("Final status started");
+  if (pipelineRunPath) {
+    await markPipelineStage(pipelineRunPath, "final", "running", {
+      status: "running"
+    }, {
+      type: "stage-detail",
+      event: "final decision started"
+    });
+  }
   emitStage({ agent: "architect", stage: "supervisor-final", status: "thinking", projectPlan });
   let pmDecision = "";
   try {
@@ -496,9 +620,67 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   await delay(SPEAKING_DELAY_MS);
   emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "done", partialResult: pipelineResult });
 
+  if (pipelineRunPath) {
+    await markPipelineStage(pipelineRunPath, "final", runMode === "autonomous" ? "running" : "needs_review", {
+      changedFiles: finalLeadResult.affectedFiles || [],
+      status: runMode === "autonomous" ? "running" : "needs_review"
+    }, {
+      type: "stage-detail",
+      event: "final decision done"
+    });
+  }
+
   lastResult = pipelineResult;
 
   return lastResult;
+}
+
+async function initializePipelineRunState({ runPath, runId, taskInput, mode }) {
+  try {
+    await fs.mkdir(runPath, { recursive: true });
+    await createRunState({
+      runId,
+      taskInput,
+      projectRoot: runPath,
+      mode
+    });
+    await saveRunState(runPath, {
+      runId,
+      taskInput,
+      mode,
+      status: "running"
+    });
+  } catch {}
+}
+
+async function markPipelineStage(runPath, stage, status, statePatch = {}, logEvent = null) {
+  try {
+    await markStage(runPath, stage, status, statePatch);
+    if (logEvent) {
+      await appendRunLog(runPath, logEvent);
+    }
+  } catch {}
+}
+
+function buildPlannedRunPath(parentPath, projectSlug) {
+  const baseParent = String(parentPath || "").trim();
+  const slug = sanitizePipelineProjectSlug(projectSlug);
+  if (!baseParent || !slug) {
+    return "";
+  }
+  return path.join(baseParent, DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks", slug);
+}
+
+function sanitizePipelineProjectSlug(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
 }
 
 function emitAgentRequestProgress({ emitProgress, runId, agentId, stage, status, requestStatus, loopCount, projectPlan }) {
