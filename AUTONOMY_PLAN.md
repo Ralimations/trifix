@@ -113,7 +113,7 @@ Add a project-local folder:
 Suggested internal commands:
 
 ```text
-graphify .
+graphify update .
 graphify watch .
 graphify query "what files implement routing?"
 ```
@@ -360,6 +360,13 @@ Avoid showing raw command requirements as user decisions. Commands should appear
 - refresh tree after every file write
 - keep changed files selected for the next phase
 
+Status:
+
+- Started in TriFix backend.
+- `.trifix/run-state.json`, `.trifix/run-log.jsonl`, `.trifix/memory.md`, `.trifix/decisions.md`, and `.trifix/artifacts.json` are created per project/sandbox.
+- Agent progress, file writes, command results, validation results, and accept decisions are logged.
+- `.trifix` is hidden from the normal project file tree so agents do not reread run metadata as source context.
+
 ### Phase 2: Auto Repair
 
 - run validation after writes
@@ -367,6 +374,14 @@ Avoid showing raw command requirements as user decisions. Commands should appear
 - ask Junior Dev for patch
 - retry with max attempts
 - stop with blocker report
+
+Status:
+
+- Started in the main process.
+- After DEV fileOperations are written, TriFix now runs safe setup commands and validation automatically inside the project sandbox.
+- Existing-project DEV fileOperations are applied to disk before validation instead of staying as proposals only.
+- On validation failure, TriFix runs one targeted auto-repair pass and applies Junior Dev repair fileOperations.
+- Final validation result is stored on the pipeline result and `.trifix/run-state.json`.
 
 ### Phase 3: Graph Context
 
@@ -376,12 +391,34 @@ Avoid showing raw command requirements as user decisions. Commands should appear
 - add graph summary to PM/QA/DEV context
 - query graph for related files before each task
 
+Status:
+
+- Started.
+- TriFix now creates `.trifix/graph/index-status.json` per project.
+- Backend can detect `graphify` or `graphifyy` on PATH and records availability in graph status/artifacts.
+- Project panel shows graph context status with Check and Build actions.
+- Build action runs Graphify from the project root, writes `.graphifyignore`, and copies `graph.json`, `GRAPH_REPORT.md`, and `graph.html` into `.trifix/graph`.
+- Backend graph query IPC is available for asking Graphify about related files.
+- Pipeline runs an optional graph query before PM/QA/DEV calls and injects a compact `GRAPH_CONTEXT` block into the shared prompt.
+- If Graphify is missing, unindexed, or fails, the run falls back to selected files and uploaded context.
+
 ### Phase 4: Process Manager
 
 - track long-running dev servers
 - store stdout/stderr logs
 - detect ports and health URLs
 - show app URL in output card
+
+Status:
+
+- Started.
+- `npm run dev` / `npm run start` launched through Run Project now create tracked process records under `.trifix/processes`.
+- stdout and stderr are written to per-process log files and summarized in command history.
+- TriFix detects local app URLs from server output and exposes Open URL / Stop Process actions in the Logs tab.
+- Stop Process terminates the tracked process tree and updates persisted process state.
+- Project refresh/reopen now reloads persisted process records from `.trifix/processes/processes.json`.
+- Workspace shows a dedicated project process card with Open URL, Logs, Restart, and Stop controls.
+- Logs can be viewed from the process card or command history without leaving TriFix.
 
 ### Phase 5: Overnight Mode
 
@@ -390,6 +427,18 @@ Avoid showing raw command requirements as user decisions. Commands should appear
 - run task queue in backend
 - write final report
 - pause only for blocked/unsafe actions
+
+Status:
+
+- Started in the main process.
+- Added backend autonomy queue IPC: start, status, and stop.
+- Autonomy queue runs the existing PM/Senior Dev/Junior Dev pipeline outside the renderer run button path.
+- Queue tasks write files, run validation, invoke the auto-repair pass, and persist state to `.trifix/run-state.json`.
+- Completed autonomy runs write `.trifix/final-report.md`.
+- Office UI now has an Autonomous Run control, Stop Auto control, and a compact autonomy status card.
+- Autonomy runs now have an 8-hour default runtime budget, a 12-hour hard maximum, and persisted deadline/runtime metadata.
+- Landing recents and reopened projects now surface the last persisted autonomy state from `.trifix/run-state.json`.
+- Persisted queue resume after app restart and multi-task decomposition are still pending.
 
 ## First Concrete Build
 

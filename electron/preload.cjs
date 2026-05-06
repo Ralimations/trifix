@@ -6,9 +6,21 @@ contextBridge.exposeInMainWorld("trifix", {
   openTrackedProject: (entry) => ipcRenderer.invoke("project:open-tracked", entry),
   openFolderPath: (folderPath) => ipcRenderer.invoke("project:open-folder", folderPath),
   refreshProject: (rootPath) => ipcRenderer.invoke("project:refresh", rootPath),
+  getGraphStatus: (payload) => ipcRenderer.invoke("project:graph-status", payload),
+  buildGraphIndex: (payload) => ipcRenderer.invoke("project:graph-build", payload),
+  queryGraphIndex: (payload) => ipcRenderer.invoke("project:graph-query", payload),
+  openGraphView: (payload) => ipcRenderer.invoke("project:graph-open", payload),
   uploadProjectContext: (payload) => ipcRenderer.invoke("project:context-upload", payload),
   runProjectCommand: (payload) => ipcRenderer.invoke("project:command", payload),
+  stopProjectProcess: (payload) => ipcRenderer.invoke("project:process-stop", payload),
+  restartProjectProcess: (payload) => ipcRenderer.invoke("project:process-restart", payload),
+  listProjectProcesses: (payload) => ipcRenderer.invoke("project:process-list", payload),
+  readProjectProcessLog: (payload) => ipcRenderer.invoke("project:process-log", payload),
+  openExternalUrl: (url) => ipcRenderer.invoke("project:open-url", url),
   runPipeline: (payload) => ipcRenderer.invoke("pipeline:run", payload),
+  startAutonomyRun: (payload) => ipcRenderer.invoke("autonomy:start", payload),
+  getAutonomyStatus: (runId) => ipcRenderer.invoke("autonomy:status", runId),
+  stopAutonomyRun: (runId) => ipcRenderer.invoke("autonomy:stop", runId),
   testAgent: (payload) => ipcRenderer.invoke("pipeline:test-agent", payload),
   getLastResult: () => ipcRenderer.invoke("pipeline:last"),
   getSettings: () => ipcRenderer.invoke("app:settings"),
@@ -24,5 +36,10 @@ contextBridge.exposeInMainWorld("trifix", {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("pipeline:progress", listener);
     return () => ipcRenderer.removeListener("pipeline:progress", listener);
+  },
+  onAutonomyProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("autonomy:progress", listener);
+    return () => ipcRenderer.removeListener("autonomy:progress", listener);
   }
 });

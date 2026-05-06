@@ -53,6 +53,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const language = String(payload?.language || "auto");
   const files = Array.isArray(payload?.files) ? payload.files : [];
   const contextDocuments = Array.isArray(payload?.contextDocuments) ? payload.contextDocuments : [];
+  const graphContext = payload?.graphContext || null;
   const projectFsd = payload?.fsd || null;
   const projectRoot = String(payload?.projectRoot || "").trim();
   const isExistingProjectRequest = Boolean(projectRoot);
@@ -75,6 +76,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     language,
     feedback,
     contextDocuments,
+    graphContext,
     projectFsd,
     mode: isExistingProjectRequest ? "existing-project" : "new-project"
   });
@@ -378,6 +380,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   addParallelLog("Final review started");
   emitStage({ agent: "supervisor", stage: "senior-final-review", status: "testing", projectPlan });
   let seniorFinalReview = "";
+  let seniorFinalReviewAvailable = false;
   if (seniorParallelAvailable) {
     try {
       seniorFinalReview = await callAgent({
@@ -387,13 +390,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         onRequestStatus: (requestStatus) =>
           emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-final-review", status: "testing", requestStatus, loopCount, projectPlan })
       });
+      seniorFinalReviewAvailable = true;
       addParallelLog("Senior Dev final review finished");
     } catch (error) {
-      seniorFinalReview = `FINAL REVIEW:\nNEEDS PATCH\n\nISSUES:\n- Senior Dev final review failed: ${formatAgentFailure(error)}\n\nREQUIRED FIXES:\n- Supervisor must decide from Junior output.`;
+      seniorFinalReview = `FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- Senior Dev final review failed: ${formatAgentFailure(error)}\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.`;
       addParallelLog("Senior Dev final review failed");
     }
   } else {
-    seniorFinalReview = "FINAL REVIEW:\nNEEDS PATCH\n\nISSUES:\n- Senior Dev review unavailable.\n\nREQUIRED FIXES:\n- Supervisor must decide from Junior output.";
+    seniorFinalReview = "FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- Senior Dev review unavailable.\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.";
   }
 
   emitStage({
@@ -421,6 +425,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         qaInstructions: qaDevHandoff,
         devOutput: finalDevOutput,
         qaReview: seniorFinalReview,
+        qaReviewAvailable: seniorFinalReviewAvailable,
         devLeadResult: finalLeadResult,
         language,
         feedback,
@@ -670,7 +675,7 @@ function postJson({ endpoint, headers, body, timeoutMs }) {
   });
 }
 
-function buildCompactContext({ input, files, language, feedback, contextDocuments = [], projectFsd = null, mode = "new-project" }) {
+function buildCompactContext({ input, files, language, feedback, contextDocuments = [], graphContext = null, projectFsd = null, mode = "new-project" }) {
   const isExistingProject = mode === "existing-project";
   const maxInputChars = isExistingProject ? 4000 : 9000;
   const maxDocumentSummaryChars = isExistingProject ? 3000 : 7000;
@@ -712,6 +717,11 @@ function buildCompactContext({ input, files, language, feedback, contextDocument
   });
   if (documentSummary) {
     chunks.push(`PROJECT_CONTEXT_SUMMARY:\n${documentSummary}`);
+  }
+
+  const graphSummary = formatGraphContextForPrompt(graphContext);
+  if (graphSummary) {
+    chunks.push(`GRAPH_CONTEXT:\n${graphSummary}`);
   }
 
   let remaining = maxContextCharsTotal - chunks.join("\n\n").length;
@@ -760,6 +770,25 @@ function buildDocumentContextSummary(contextDocuments = [], projectFsd = null) {
   return trimForPrompt(chunks.join("\n\n"), maxSummaryChars);
 }
 
+function formatGraphContextForPrompt(graphContext) {
+  if (!graphContext || typeof graphContext !== "object") {
+    return "";
+  }
+
+  const chunks = [
+    `Status: ${graphContext.status || "unknown"}`,
+    graphContext.message ? `Message: ${trimForPrompt(graphContext.message, 300)}` : "",
+    graphContext.reportSummary ? `Report summary:\n${trimForPrompt(graphContext.reportSummary, 2200)}` : "",
+    Array.isArray(graphContext.relatedFiles) && graphContext.relatedFiles.length
+      ? `Related files:\n${graphContext.relatedFiles.map((filePath) => `- ${filePath}`).join("\n")}`
+      : "",
+    graphContext.query ? `Query: ${trimForPrompt(graphContext.query, 260)}` : "",
+    graphContext.queryOutput ? `Query output:\n${trimForPrompt(graphContext.queryOutput, 1800)}` : ""
+  ].filter(Boolean);
+
+  return trimForPrompt(chunks.join("\n\n"), 4500);
+}
+
 function summarizeFile(file) {
   const lines = String(file.content || "").split(/\r?\n/);
   const imports = [];
@@ -801,15 +830,22 @@ function summarizeFile(file) {
 function parseChatResponse(responseText) {
   try {
     const json = JSON.parse(responseText);
+    const structuredPayload = readStructuredPayload(json);
     const text = readChatText(json);
-    if (!text) {
-      const structuredPayload = readStructuredPayload(json);
-      if (structuredPayload) {
-        return structuredPayload;
-      }
-      return responseText;
+
+    if (structuredPayload && shouldPreferStructuredPayload(structuredPayload, text)) {
+      return structuredPayload;
     }
-    return text;
+
+    if (text) {
+      return text;
+    }
+
+    if (structuredPayload) {
+      return structuredPayload;
+    }
+
+    return responseText;
   } catch (error) {
     if (!(error instanceof SyntaxError)) {
       throw error;
@@ -925,7 +961,13 @@ function findStructuredPayload(value, visited = new Set()) {
   }
 
   if (isReasoningItem(value)) {
-    return null;
+    const found = findStructuredPayload(value.content, visited);
+    if (found) {
+      return found;
+    }
+
+    const contentText = typeof value.content === "string" ? value.content.trim() : "";
+    return contentText || null;
   }
 
   if (looksLikeAgentPayload(value)) {
@@ -947,6 +989,30 @@ function findStructuredPayload(value, visited = new Set()) {
   }
 
   return null;
+}
+
+function shouldPreferStructuredPayload(structuredPayload, text) {
+  const structured = String(structuredPayload || "").trim();
+  const plainText = String(text || "").trim();
+  if (!structured) {
+    return false;
+  }
+
+  if (!plainText) {
+    return true;
+  }
+
+  const structuredSignals = [
+    "\"fileOperations\"",
+    "\"commandRequests\"",
+    "\"fileArchitecture\"",
+    "\"implementationPlan\"",
+    "FILE:",
+    "AFFECTED_FILES",
+    "COMMAND_REQUESTS"
+  ];
+
+  return structuredSignals.some((signal) => structured.includes(signal)) && !structuredSignals.some((signal) => plainText.includes(signal));
 }
 
 function isReasoningItem(value) {
@@ -1025,6 +1091,7 @@ function parseServerError(body) {
 
 function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null) {
   const parsedJson = extractJsonObject(output);
+  const nestedJson = findNestedOperationContainer(parsedJson);
   const summary = extractSection(output, "SUMMARY");
   const rationale = extractSection(output, "RATIONALE");
   const proposedChanges = extractListSection(output, "PROPOSED_CHANGES");
@@ -1034,7 +1101,8 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
   const expectedPaths = normalizeExpectedFilePaths(filesAnalyzed, expectedArchitecture);
   const patches = [
     ...extractPatches(output),
-    ...extractPathLabeledCodeBlocks(output)
+    ...extractPathLabeledCodeBlocks(output),
+    ...extractInlineFileBlocks(output)
   ];
   const fallbackCodeFence = output.match(/```[\w+-]*\n([\s\S]*?)```/);
   const jsonFileOperations = mergeByPath(
@@ -1042,11 +1110,21 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
     normalizeFileOperations(parsedJson?.operations),
     normalizeFileOperations(parsedJson?.patches),
     normalizeFileOperations(parsedJson?.files),
+    normalizeFileOperations(nestedJson?.fileOperations),
+    normalizeFileOperations(nestedJson?.operations),
+    normalizeFileOperations(nestedJson?.patches),
+    normalizeFileOperations(nestedJson?.files),
     fileOperationsFromObjectMap(parsedJson?.files),
     fileOperationsFromObjectMap(parsedJson?.changedFiles),
-    fileOperationsFromObjectMap(parsedJson?.filesChanged)
+    fileOperationsFromObjectMap(parsedJson?.filesChanged),
+    fileOperationsFromObjectMap(nestedJson?.files),
+    fileOperationsFromObjectMap(nestedJson?.changedFiles),
+    fileOperationsFromObjectMap(nestedJson?.filesChanged)
   );
-  const jsonCommands = normalizeStringArray(parsedJson?.commands);
+  const jsonCommands = uniqueStrings([
+    ...normalizeStringArray(parsedJson?.commands),
+    ...normalizeStringArray(nestedJson?.commands)
+  ]);
 
   let normalizedPatches = patches;
   if (normalizedPatches.length === 0 && expectedPaths.length === 1 && fallbackCodeFence?.[1]) {
@@ -1091,6 +1169,41 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
   };
 }
 
+function findNestedOperationContainer(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const candidates = [
+    value?.result,
+    value?.dev,
+    value?.output,
+    value?.response,
+    value?.data,
+    value?.payload,
+    value?.changes
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") {
+      continue;
+    }
+
+    if (
+      Array.isArray(candidate?.fileOperations) ||
+      Array.isArray(candidate?.operations) ||
+      Array.isArray(candidate?.patches) ||
+      Array.isArray(candidate?.files) ||
+      (candidate?.files && typeof candidate.files === "object") ||
+      (candidate?.changedFiles && typeof candidate.changedFiles === "object")
+    ) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function extractJsonObject(output) {
   const text = String(output || "").trim();
   if (!text) {
@@ -1121,6 +1234,7 @@ function extractJsonObject(output) {
 }
 
 function normalizePmArchitecture(parsed, input, previous = null, rawOutput = "") {
+  const intent = analyzeProjectIntent(input);
   const fallbackName = deriveProjectName(input);
   const taskName = extractSection(rawOutput, "TASK").split(/\r?\n/)[0];
   const projectName = normalizeTitle(parsed?.projectName || previous?.projectName || taskName || fallbackName);
@@ -1129,7 +1243,13 @@ function normalizePmArchitecture(parsed, input, previous = null, rawOutput = "")
   const fileArchitecture = normalizeFileArchitecture(
     parsed?.fileArchitecture || (sectionFiles.length > 0 ? sectionFiles : null),
     parsed?.requiredFiles
+    ,
+    intent
   );
+  const sectionCommandRequests = uniqueStrings([
+    ...extractListSection(rawOutput, "COMMAND_REQUESTS"),
+    ...extractListSection(rawOutput, "SETUP_COMMANDS")
+  ]);
   const sectionPlan = [
     ...extractListSection(rawOutput, "ACCEPTANCE"),
     ...extractListSection(rawOutput, "NOTES")
@@ -1140,6 +1260,11 @@ function normalizePmArchitecture(parsed, input, previous = null, rawOutput = "")
   const requiredFiles = normalizeStringArray(parsed?.requiredFiles).length > 0
     ? normalizeStringArray(parsed?.requiredFiles)
     : fileArchitecture.map((file) => file.path);
+  const setupCommands = uniqueStrings([
+    ...normalizeStringArray(parsed?.setupCommands),
+    ...sectionCommandRequests,
+    ...defaultSetupCommandsForIntent(intent, fileArchitecture)
+  ]);
 
   return {
     projectName,
@@ -1147,10 +1272,11 @@ function normalizePmArchitecture(parsed, input, previous = null, rawOutput = "")
     fileArchitecture,
     implementationPlan: implementationPlan.length > 0
       ? implementationPlan
-      : fileArchitecture.map((file) => `Create ${file.path}`),
+      : defaultImplementationPlanForIntent(intent, fileArchitecture),
     requiredFiles,
+    setupCommands,
     qaInstruction:
-      String(parsed?.qaInstruction || previous?.qaInstruction || "Verify required files and FSD alignment.").trim()
+      String(parsed?.qaInstruction || previous?.qaInstruction || defaultQaInstructionForIntent(intent)).trim()
   };
 }
 
@@ -1238,7 +1364,7 @@ function formatQaStructureReview(review) {
   );
 }
 
-function normalizeFileArchitecture(fileArchitecture, requiredFiles) {
+function normalizeFileArchitecture(fileArchitecture, requiredFiles, intent = null) {
   const fromArchitecture = Array.isArray(fileArchitecture)
     ? fileArchitecture.map((item) => ({
         path: toProjectPath(item?.path || item),
@@ -1264,7 +1390,84 @@ function normalizeFileArchitecture(fileArchitecture, requiredFiles) {
 
   return unique.length > 0
     ? unique
-    : [{ path: "index.html", purpose: "Single-file app entry point" }];
+    : defaultFileArchitectureForIntent(intent);
+}
+
+function analyzeProjectIntent(input) {
+  const text = String(input || "").toLowerCase();
+  return {
+    wantsVite: /\bvite\b/.test(text),
+    wantsReact: /\breact\b/.test(text),
+    wantsShadcn: /\bshadcn\b|\bshadcn\/ui\b/.test(text),
+    wantsTailwind: /\btailwind\b/.test(text),
+    wantsDashboard: /\bdashboard\b/.test(text),
+    wantsCrud: /\bcrud\b/.test(text),
+    wantsTodo: /\bto-?do\b/.test(text)
+  };
+}
+
+function isModernReactAppIntent(intent) {
+  return Boolean(intent?.wantsVite || intent?.wantsReact || intent?.wantsShadcn);
+}
+
+function defaultFileArchitectureForIntent(intent) {
+  if (isModernReactAppIntent(intent)) {
+    return [
+      { path: "package.json", purpose: "Vite React app dependencies and scripts" },
+      { path: "index.html", purpose: "Vite HTML shell" },
+      { path: "vite.config.js", purpose: "Vite config" },
+      { path: "jsconfig.json", purpose: "Path alias support for src imports" },
+      { path: "src/main.jsx", purpose: "React entry point" },
+      { path: "src/App.jsx", purpose: "Dashboard shell and CRUD flow" },
+      { path: "src/index.css", purpose: "Global styles and tokens" },
+      { path: "src/lib/utils.js", purpose: "shadcn utility helpers" },
+      { path: "components.json", purpose: "shadcn/ui component registry config" },
+      { path: "src/components/ui/button.jsx", purpose: "shadcn button component" },
+      { path: "src/components/ui/card.jsx", purpose: "shadcn card component" },
+      { path: "src/components/ui/input.jsx", purpose: "shadcn input component" },
+      { path: "src/components/ui/dialog.jsx", purpose: "shadcn dialog component for CRUD editing" }
+    ];
+  }
+
+  return [{ path: "index.html", purpose: "Single-file app entry point" }];
+}
+
+function defaultImplementationPlanForIntent(intent, fileArchitecture) {
+  if (isModernReactAppIntent(intent)) {
+    const plan = [
+      "Create a real Vite + React project structure with package.json and src entry files.",
+      intent?.wantsShadcn
+        ? "Implement reusable shadcn/ui-style components and utilities instead of raw HTML controls."
+        : "Implement reusable React UI components for the requested feature set.",
+      intent?.wantsCrud || intent?.wantsTodo
+        ? "Build client-side CRUD flows for todo items with create, update, delete, and status changes."
+        : "Build the requested interactive application flows.",
+      intent?.wantsDashboard
+        ? "Compose the UI as a dashboard layout with data panels and action surfaces."
+        : "Compose the UI as a structured app layout.",
+      "Run install and build checks so the output is runnable."
+    ];
+    return uniqueStrings(plan);
+  }
+
+  return fileArchitecture.map((file) => `Create ${file.path}`);
+}
+
+function defaultSetupCommandsForIntent(intent, fileArchitecture) {
+  const filePaths = new Set((fileArchitecture || []).map((file) => file?.path).filter(Boolean));
+  if (isModernReactAppIntent(intent) || filePaths.has("package.json")) {
+    return ["npm install", "npm run build"];
+  }
+
+  return [];
+}
+
+function defaultQaInstructionForIntent(intent) {
+  if (isModernReactAppIntent(intent)) {
+    return "Verify the Vite React app installs, builds, and uses reusable component structure instead of a single-file fallback.";
+  }
+
+  return "Verify required files and FSD alignment.";
 }
 
 function normalizeFileOperations(fileOperations) {
@@ -1276,6 +1479,8 @@ function normalizeFileOperations(fileOperations) {
     .map((operation) => {
       const content =
         operation?.content ??
+        operation?.fullContent ??
+        operation?.fileContent ??
         operation?.code ??
         operation?.source ??
         operation?.text ??
@@ -1283,12 +1488,30 @@ function normalizeFileOperations(fileOperations) {
         "";
 
       return {
-        action: String(operation?.action || "write").toLowerCase(),
-        path: toProjectPath(operation?.path || operation?.file || operation?.filename || operation?.name || ""),
+        action: normalizeFileOperationAction(operation?.action),
+        path: toProjectPath(
+          operation?.path ||
+          operation?.file ||
+          operation?.filePath ||
+          operation?.filepath ||
+          operation?.filename ||
+          operation?.target ||
+          operation?.name ||
+          ""
+        ),
         content: typeof content === "string" ? content : String(content || "")
       };
     })
     .filter((operation) => operation.action === "write" && operation.path);
+}
+
+function normalizeFileOperationAction(value) {
+  const action = String(value || "write").trim().toLowerCase();
+  if (!action || ["write", "create", "update", "modify", "edit", "replace", "overwrite", "upsert"].includes(action)) {
+    return "write";
+  }
+
+  return action;
 }
 
 function fileOperationsFromPatches(patches) {
@@ -1310,7 +1533,9 @@ function fileOperationsFromObjectMap(value) {
     .map(([filePath, content]) => ({
       action: "write",
       path: toProjectPath(filePath),
-      content: typeof content === "string" ? content : String(content?.content || content?.code || content?.source || "")
+      content: typeof content === "string"
+        ? content
+        : String(content?.content || content?.fullContent || content?.fileContent || content?.code || content?.source || "")
     }))
     .filter((operation) => operation.path);
 }
@@ -1443,8 +1668,9 @@ function buildProjectPlan(prd) {
 }
 
 function buildPmResult(output, fallbackSummary) {
+  const finalStatus = extractSection(output, "FINAL_STATUS") || extractSection(output, "FINAL STATUS");
   return {
-    summary: extractSection(output, "SUMMARY") || extractSection(output, "FINAL_STATUS") || extractSection(output, "FINAL STATUS") || extractSection(output, "QA_INSTRUCTION") || fallbackSummary,
+    summary: extractSection(output, "SUMMARY") || finalStatus || extractSection(output, "QA_INSTRUCTION") || fallbackSummary,
     rationale: extractSection(output, "RATIONALE") || extractSection(output, "REASON") || toPublicRationale(output),
     affectedFiles: extractListSection(output, "AFFECTED_FILES"),
     proposedChanges: extractListSection(output, "PROPOSED_CHANGES"),
@@ -1454,8 +1680,26 @@ function buildPmResult(output, fallbackSummary) {
     ]),
     patches: [],
     recommendation: extractSection(output, "RECOMMENDATION") || output.trim(),
-    fixedCode: ""
+    fixedCode: "",
+    decisionStatus: inferPmDecisionStatus(finalStatus || output)
   };
+}
+
+function inferPmDecisionStatus(output) {
+  const text = String(output || "").trim();
+  if (!text) {
+    return "pending";
+  }
+
+  if (/needs\s+patch/i.test(text) || /fail/i.test(text)) {
+    return "needs_patch";
+  }
+
+  if (/\bpass\b/i.test(text) || /approved"\s*:\s*true/i.test(text)) {
+    return "pending";
+  }
+
+  return "pending";
 }
 
 function buildFsdState(projectFsd, contextDocuments) {
@@ -1496,6 +1740,15 @@ function buildSupervisorResult(critique) {
 }
 
 function buildPipelineResult({ explanation, critique, files, filesAnalyzed, leadResult, loopCount, project, qaInstructions, qaStructureReview, pmPlan, pmDecision }) {
+  const pmPlanResult = buildPmResult(pmPlan, "");
+  const pmDecisionResult = buildPmResult(pmDecision, "");
+  const pmCommandRequests = uniqueStrings([
+    ...(project?.architecture?.setupCommands || []),
+    ...(pmPlanResult.commandRequests || []),
+    ...(leadResult.commandRequests || [])
+  ]);
+  const decisionStatus = pmDecisionResult.decisionStatus || "pending";
+  const decisionSummary = pmDecisionResult.rationale || leadResult.summary;
   return {
     junior: buildJuniorResult(explanation),
     supervisor: buildSupervisorResult(critique),
@@ -1509,29 +1762,30 @@ function buildPipelineResult({ explanation, critique, files, filesAnalyzed, lead
       fixedCode: leadResult.fixedCode
     },
     decision: {
-      summary: leadResult.summary,
+      summary: decisionSummary,
       affectedFiles: leadResult.affectedFiles,
       proposedChanges: leadResult.proposedChanges,
       canApply: leadResult.patches.length > 0,
-      decisionStatus: "pending"
+      decisionStatus: decisionStatus,
+      verdict: pmDecisionResult.summary || ""
     },
     workflow: {
       folderLoaded: true,
       contextReady: files.length > 0 || Boolean(project?.fsd),
       currentStage: "decision",
       loopCount,
-      decisionStatus: "pending",
+      decisionStatus: decisionStatus,
       currentPhase: project?.phases?.[0]?.name || "Phase 1",
       currentTask: project?.tasks?.find((task) => task.status !== "done")?.title || "Review decision",
       iterationCount: loopCount,
-      projectStatus: "Waiting for decision",
+      projectStatus: decisionStatus === "needs_patch" ? "Patch required" : "Waiting for decision",
       commandStatus: "idle"
     },
     project,
     pm: {
       plan: pmPlan,
       decision: pmDecision,
-      commandRequests: leadResult.commandRequests || []
+      commandRequests: pmCommandRequests
     },
     qa: {
       instructions: qaInstructions,
@@ -1573,7 +1827,7 @@ function buildSupervisorSpecSystemPrompt() {
     "Create a concise implementation spec for the dev pipeline.",
     "Do not write code. Do not over-explain.",
     "Name expected files and folders. Define acceptance tests.",
-    "If project setup commands are required, include only safe setup commands such as npm install or npm run build.",
+    "If project setup commands are required, include only safe local commands such as npm install or npm run build.",
     "Keep output under 300 tokens.",
     "Output format:",
     "TASK:",
@@ -1649,6 +1903,7 @@ function buildSupervisorFinalSystemPrompt() {
   return [
     "You are the Supervisor/PM.",
     "Check if the result satisfies acceptance.",
+    "If Senior Dev final review is unavailable, decide from the Junior output, changed files, and checklist. Do not fail only because the review is unavailable.",
     "Do not write code. Keep the decision short.",
     "Return only:",
     "FINAL STATUS:",
@@ -1780,6 +2035,7 @@ async function createRevisionBrief({ compactContext, feedback, loopCount }) {
 }
 
 function buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
+  const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 7000 : 12000),
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 900)}` : "",
@@ -1788,6 +2044,12 @@ function buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, l
       isExistingProjectRequest
         ? "This is a follow-up request for an existing project. Do not create a new project folder."
         : "This is a project creation or FSD task. Choose a short contextual project name and expected files.",
+      isModernReactAppIntent(intent)
+        ? "This request implies a modern React app. Do not collapse it into a single-file index.html solution."
+        : "Use the smallest coherent file set for the request.",
+      intent.wantsShadcn
+        ? "For shadcn/ui requests, plan reusable component files, utility helpers, and package.json dependencies needed to build."
+        : "Plan reusable files only when the request needs them.",
       "Name only the smallest expected files/folders.",
       "Keep constraints strict so Junior Dev does not redesign or create random folders.",
       "Add COMMAND_REQUESTS only for necessary project setup steps, such as installing dependencies or running a build check.",
@@ -1810,6 +2072,7 @@ function buildJuniorInitialContext({
   loopCount,
   isExistingProjectRequest = false
 }) {
+  const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 3200 : 5200),
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1200)}`,
@@ -1829,6 +2092,12 @@ function buildJuniorInitialContext({
       "Only Junior Dev may create/edit files.",
       "Use project-relative paths only, such as index.html or src/main.js.",
       "Do not include sandbox/tasks or absolute paths.",
+      isModernReactAppIntent(intent)
+        ? "For Vite/React requests, create a real package.json + src/ React app structure. Do not fall back to a static single-file page."
+        : "Use the simplest valid project structure for the request.",
+      intent.wantsShadcn
+        ? "For shadcn/ui requests, implement reusable shadcn-style component files, utility helpers, and the dependency manifest needed for them."
+        : "Create reusable components only if they materially help the request.",
       "Return JSON only:",
       "{",
       '  "summary": "short summary",',
@@ -1912,6 +2181,7 @@ function buildSupervisorFinalContext({
   qaInstructions,
   devOutput,
   qaReview,
+  qaReviewAvailable,
   devLeadResult,
   language,
   feedback,
@@ -1925,6 +2195,7 @@ function buildSupervisorFinalContext({
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `DEV_CHECKLIST:\n${trimForPrompt(qaInstructions, 800)}`,
     `JUNIOR_DEV_OUTPUT:\n${trimForPrompt(devOutput, 1800)}`,
+    `SENIOR_FINAL_REVIEW_AVAILABLE: ${qaReviewAvailable ? "yes" : "no"}`,
     `SENIOR_FINAL_REVIEW:\n${trimForPrompt(qaReview, 1400)}`,
     `CHANGED_FILES:\n${(devLeadResult.affectedFiles || []).join("\n")}`,
     `Preferred language: ${language}`,
@@ -1934,6 +2205,7 @@ function buildSupervisorFinalContext({
 }
 
 function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopCount, qaFeedback = [], isExistingProjectRequest = false }) {
+  const intent = analyzeProjectIntent(compactContext);
   if (isExistingProjectRequest) {
     return [
       trimForPrompt(compactContext, 7000),
@@ -1972,13 +2244,20 @@ function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopC
       "Extract a short projectName from the FSD title/project name when present.",
       "projectSlug must be lowercase kebab-case, remove special characters, max 40 chars.",
       "If there is no usable title, use a slug like task-YYYYMMDD-HHMMSS.",
+      isModernReactAppIntent(intent)
+        ? "If the request implies Vite/React, return a multi-file app architecture with package.json, src entry files, and any component/util files needed."
+        : "Use the smallest architecture that can satisfy the request.",
+      intent.wantsShadcn
+        ? "If the request mentions shadcn/ui, include component files, utility helpers, and setupCommands for installing and building."
+        : "Only include setupCommands when project install/build steps are genuinely required.",
       "Return JSON only with this shape:",
       "{",
       '  "projectName": "Simple Admin Dashboard",',
       '  "projectSlug": "simple-admin-dashboard",',
-      '  "fileArchitecture": [{ "path": "index.html", "purpose": "Single-file dashboard app" }],',
-      '  "implementationPlan": ["Create index.html", "Embed CSS", "Embed vanilla JS interactions"],',
-      '  "requiredFiles": ["index.html"],',
+      '  "fileArchitecture": [{ "path": "package.json", "purpose": "Vite React app dependencies and scripts" }, { "path": "src/App.jsx", "purpose": "Main dashboard UI" }],',
+      '  "implementationPlan": ["Create the Vite React project structure", "Build the dashboard UI and CRUD flows"],',
+      '  "requiredFiles": ["package.json", "src/main.jsx", "src/App.jsx"],',
+      '  "setupCommands": ["npm install", "npm run build"],',
       '  "qaInstruction": "Verify required files and FSD alignment."',
       "}"
     ].join("\n")
@@ -1986,6 +2265,7 @@ function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopC
 }
 
 function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }) {
+  const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, 7000),
     `PM_PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
@@ -1996,6 +2276,9 @@ function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture
     [
       "Verify the PM file structure before DEV starts.",
       "Check required files match the FSD, no unnecessary folders, valid projectSlug, and realistic scope.",
+      isModernReactAppIntent(intent)
+        ? "If this is a Vite/React request, reject single-file fallback structures and require installable/buildable app files."
+        : "Allow a small file set when the request is simple.",
       "Do not write implementation code.",
       "Return JSON only with this shape:",
       "{",
@@ -2012,6 +2295,7 @@ function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture
 }
 
 function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions, qaStructureReview, language, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
+  const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 2800 : 4500),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
@@ -2030,15 +2314,21 @@ function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitec
       "Implement only the current task scope.",
       "Create/edit actual files by returning machine-readable fileOperations.",
       "Use project-relative paths only, such as index.html or src/main.js. Do not include sandbox/tasks or absolute paths.",
+      isModernReactAppIntent(intent)
+        ? "For Vite/React requests, return a real multi-file app with package.json, src/main.jsx, src/App.jsx, and supporting files."
+        : "A single-file app is acceptable only if the request is truly simple.",
+      intent.wantsShadcn
+        ? "For shadcn/ui requests, create reusable component files under src/components/ui and supporting utils/dependencies required to build them."
+        : "Use a component structure only when it helps the request.",
       "Keep output concise. Do not include hidden reasoning.",
       "Return JSON only with this shape:",
       "{",
-      '  "summary": "Created single-file dashboard.",',
+      '  "summary": "Created the requested app.",',
       '  "fileOperations": [',
-      '    { "action": "write", "path": "index.html", "content": "<!DOCTYPE html>..." }',
+      '    { "action": "write", "path": "src/App.jsx", "content": "export default function App() { return null; }" }',
       "  ],",
-      '  "commands": [],',
-      '  "recommendation": "Open index.html in browser."',
+      '  "commands": ["npm install", "npm run build"],',
+      '  "recommendation": "Run install and build checks."',
       "}"
     ].join("\n")
   ].filter(Boolean).join("\n\n");
@@ -2329,6 +2619,37 @@ function extractPatches(output) {
     path: match[1].trim(),
     content: cleanCode(match[2])
   }));
+}
+
+function extractInlineFileBlocks(output) {
+  const text = String(output || "");
+  const matches = [...text.matchAll(/(?:^|\n)FILE:\s*([^\n]+)\n([\s\S]*?)(?=\nFILE:\s*[^\n]+\n|$)/gi)];
+  const blocks = [];
+
+  for (const match of matches) {
+    const filePath = toProjectPath(match[1]);
+    const rawContent = String(match[2] || "").trim();
+    if (!filePath || !rawContent) {
+      continue;
+    }
+
+    const content = rawContent.startsWith("```")
+      ? cleanCode(rawContent)
+      : rawContent
+          .replace(/^(SUMMARY|RATIONALE|RECOMMENDATION|COMMAND_REQUESTS|AFFECTED_FILES|PROPOSED_CHANGES):[\s\S]*$/i, "")
+          .trim();
+
+    if (!content || blocks.some((block) => block.path.toLowerCase() === filePath.toLowerCase())) {
+      continue;
+    }
+
+    blocks.push({
+      path: filePath,
+      content
+    });
+  }
+
+  return blocks;
 }
 
 function extractPathLabeledCodeBlocks(output) {

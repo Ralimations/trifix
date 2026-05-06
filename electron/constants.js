@@ -45,6 +45,7 @@ export const AGENTS = {
 export const BLOCKED_NAMES = new Set([
   "node_modules",
   ".git",
+  ".trifix",
   ".trifix-backups",
   "dist",
   "build"

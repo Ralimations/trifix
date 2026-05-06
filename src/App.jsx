@@ -13,6 +13,7 @@ import {
   FilePlus2,
   FolderClosed,
   FolderOpen,
+  Eye,
   History,
   Loader2,
   MessageSquare,
@@ -159,6 +160,8 @@ export function App() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [isRunning, setIsRunning] = useState(false);
+  const [autonomyRun, setAutonomyRun] = useState(null);
+  const [isAutonomyRunning, setIsAutonomyRunning] = useState(false);
   const [settings, setSettings] = useState(null);
   const [trackedProjects, setTrackedProjects] = useState([]);
   const [workflow, setWorkflow] = useState({
@@ -174,7 +177,10 @@ export function App() {
     commandStatus: "idle"
   });
   const [commandLog, setCommandLog] = useState([]);
+  const [projectProcesses, setProjectProcesses] = useState([]);
+  const [processLogView, setProcessLogView] = useState(null);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
+  const [isGraphRunning, setIsGraphRunning] = useState(false);
   const [testerResult, setTesterResult] = useState(null);
   const [isTesterRunning, setIsTesterRunning] = useState(false);
   const [draftProjectName, setDraftProjectName] = useState("");
@@ -190,6 +196,7 @@ export function App() {
   const [decisionPreview, setDecisionPreview] = useState([]);
   const [decisionMessage, setDecisionMessage] = useState("");
   const [isDecisionBusy, setIsDecisionBusy] = useState(false);
+  const [notifications, setNotifications] = useState([]);
   const currentRunRef = useRef(null);
   const stageMessageKeysRef = useRef(new Set());
   const messageSequenceRef = useRef(0);
@@ -200,6 +207,7 @@ export function App() {
   const chatterTimeoutRef = useRef(null);
   const chatterReplyTimeoutRef = useRef(null);
   const chatterHardTimeoutRef = useRef(null);
+  const notificationTimersRef = useRef(new Map());
   const chatScrollRef = useRef(null);
   const autoRequiredStepsKeyRef = useRef("");
   const selectedFileSet = useMemo(() => new Set(selectedFiles), [selectedFiles]);
@@ -234,7 +242,7 @@ export function App() {
       .then((items) => setTrackedProjects(items || []))
       .catch(() => { });
 
-    return window.trifix.onPipelineProgress((progress) => {
+    const unsubscribePipeline = window.trifix.onPipelineProgress((progress) => {
       if (progress.runId !== currentRunRef.current) {
         return;
       }
@@ -263,6 +271,80 @@ export function App() {
         )
       );
     });
+    const unsubscribeAutonomy = window.trifix.onAutonomyProgress((progress) => {
+      if (progress.runId !== currentRunRef.current) {
+        return;
+      }
+
+      setAutonomyRun((current) => ({
+        ...(current || {}),
+        runId: progress.runId,
+        status: progress.queueStatus || progress.status || current?.status || "running",
+        deadlineAt: progress.deadlineAt || current?.deadlineAt || "",
+        maxRuntimeMs: progress.maxRuntimeMs || current?.maxRuntimeMs || 0,
+        lastStage: progress.stage || current?.lastStage || "",
+        lastStatus: progress.status || current?.lastStatus || "",
+        message: progress.message || progress.requestStatus?.displayText || current?.message || "",
+        updatedAt: new Date().toISOString()
+      }));
+
+      if (progress.requestStatus?.displayText || progress.message) {
+        setDecisionMessage(progress.requestStatus?.displayText || progress.message);
+      }
+
+      if (progress.partialResult) {
+        setResult((current) => mergePipelineResult(current, progress.partialResult));
+        queueStageMessages(progress);
+      }
+
+      setWorkflow((current) => ({
+        ...current,
+        ...(progress.partialResult?.workflow || {}),
+        currentStage: progress.stage || progress.agent || current.currentStage,
+        contextReady: true
+      }));
+
+      if (progress.agent) {
+        setAgents((currentAgents) =>
+          currentAgents.map((agent) =>
+            agent.id === progress.agent
+              ? { ...agent, status: mapProgressStatus(progress.agent, progress.status) }
+              : agent
+          )
+        );
+      }
+
+      if (["autonomy-complete", "autonomy-error"].includes(progress.stage)) {
+        setIsRunning(false);
+        setIsAutonomyRunning(false);
+        const outputFiles = getResultOutputFiles(progress.partialResult);
+        if (progress.partialResult) {
+          const generatedProject = normalizeGeneratedProject(progress.partialResult, project);
+          if (generatedProject?.rootPath) {
+            setProject(generatedProject);
+            setResultProject(generatedProject);
+            setSelectedFiles(outputFiles.length > 0 ? outputFiles : (generatedProject.defaultSelectedFiles || []));
+            setCommandLog(generatedProject.commandHistory || []);
+            setProjectProcesses(generatedProject.processes || []);
+          }
+          setActiveTab("decision");
+          setActiveView("office");
+        }
+        pushNotification({
+          type: progress.stage === "autonomy-error" ? "error" : "success",
+          title: progress.stage === "autonomy-error" ? "Autonomy stopped" : "Task finished",
+          message: progress.stage === "autonomy-error"
+            ? (progress.message || "The autonomous run needs review.")
+            : `${outputFiles.length} file(s) changed. Output is ready for review.`
+        });
+        void refreshTrackedProjects();
+      }
+    });
+
+    return () => {
+      unsubscribePipeline();
+      unsubscribeAutonomy();
+    };
   }, []);
 
   useEffect(() => {
@@ -287,6 +369,8 @@ export function App() {
     const shouldRun =
       shouldShowCycleReview({ result, workflow, isRunning }) &&
       !isCommandRunning &&
+      !result?.validation &&
+      !result?.autoRepair &&
       Boolean(targetProject?.rootPath);
 
     if (!shouldRun || workflow.commandStatus === "running") {
@@ -312,6 +396,24 @@ export function App() {
     autoRequiredStepsKeyRef.current = runKey;
     void runRequiredSteps();
   }, [result, resultProject, project, workflow, isRunning, isCommandRunning]);
+
+  useEffect(() => {
+    const targetRoot = (resultProject || project)?.rootPath;
+    const hasActiveProcess = projectProcesses.some((process) => ["running", "starting"].includes(process.status));
+    if (!targetRoot || !hasActiveProcess) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      void syncProjectProcesses(targetRoot);
+    }, 5000);
+
+    return () => clearInterval(timer);
+  }, [
+    project?.rootPath,
+    resultProject?.rootPath,
+    projectProcesses.map((process) => `${process.id}:${process.status}`).join("|")
+  ]);
 
   useEffect(() => {
     if (isTyping || activeMessage || messageQueue.length === 0) {
@@ -351,6 +453,8 @@ export function App() {
       if (typewriterDoneResolverRef.current) {
         typewriterDoneResolverRef.current();
       }
+      notificationTimersRef.current.forEach((timer) => clearTimeout(timer));
+      notificationTimersRef.current.clear();
     },
     []
   );
@@ -626,6 +730,8 @@ export function App() {
     setSelectedFiles(defaults);
     setContextDocuments(openedProject.fsd?.documents || []);
     setCommandLog(openedProject.commandHistory || []);
+    setProjectProcesses(openedProject.processes || []);
+    setProcessLogView(null);
     setDecisionPreview([]);
     setDecisionMessage("");
     setWorkflow((current) => ({
@@ -650,6 +756,7 @@ export function App() {
     setProject(refreshed);
     setContextDocuments(refreshed.fsd?.documents || contextDocuments);
     setCommandLog(refreshed.commandHistory || commandLog);
+    setProjectProcesses(refreshed.processes || []);
     setSelectedFiles((paths) => {
       const next = paths.filter((path) => hasPath(refreshed.tree, path));
       return next.length > 0 ? next : defaults;
@@ -664,6 +771,23 @@ export function App() {
           : "context-ready"
     }));
     await refreshTrackedProjects();
+  }
+
+  async function syncProjectProcesses(rootPath = (resultProject || project)?.rootPath) {
+    if (!rootPath) {
+      setProjectProcesses([]);
+      return [];
+    }
+
+    try {
+      const processes = await window.trifix.listProjectProcesses({ projectRoot: rootPath });
+      setProjectProcesses(processes || []);
+      setProject((current) => current?.rootPath === rootPath ? { ...current, processes: processes || [] } : current);
+      setResultProject((current) => current?.rootPath === rootPath ? { ...current, processes: processes || [] } : current);
+      return processes || [];
+    } catch {
+      return projectProcesses;
+    }
   }
 
   function toggleFile(path, checked) {
@@ -744,9 +868,23 @@ export function App() {
       setWorkflow((current) => ({
         ...current,
         commandStatus: entry.status,
-        projectStatus: entry.status === "passed" ? "Command passed" : "Command failed"
+        projectStatus: entry.status === "running"
+          ? "Process running"
+          : entry.status === "passed"
+            ? "Command passed"
+            : "Command failed"
       }));
-      setDecisionMessage(`${entry.command} ${entry.status}.`);
+      setDecisionMessage(entry.healthUrl ? `${entry.command} running at ${entry.healthUrl}.` : `${entry.command} ${entry.status}.`);
+      if (entry.healthUrl) {
+        pushNotification({
+          type: "success",
+          title: "Project running",
+          message: entry.healthUrl
+        });
+      }
+      if (entry.processId) {
+        await syncProjectProcesses(targetProject.rootPath);
+      }
       if (mode === "debug" && entry.status !== "passed") {
         setCodeInput((current) =>
           [
@@ -767,6 +905,119 @@ export function App() {
       }));
     } finally {
       setIsCommandRunning(false);
+    }
+  }
+
+  async function openProcessUrl(url) {
+    try {
+      await window.trifix.openExternalUrl(url);
+    } catch (openError) {
+      setDecisionMessage(openError?.message || "Could not open project URL.");
+    }
+  }
+
+  async function stopProjectProcess(processId) {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath || !processId) {
+      setDecisionMessage("No running project process is selected.");
+      return;
+    }
+
+    try {
+      const stopped = await window.trifix.stopProjectProcess({
+        projectRoot: targetProject.rootPath,
+        processId
+      });
+      setCommandLog((current) =>
+        current.map((entry) =>
+          entry.processId === processId
+            ? {
+                ...entry,
+                status: stopped.status || "stopped",
+                finishedAt: stopped.finishedAt || new Date().toISOString(),
+                output: `${entry.output || ""}\nProcess stopped.`
+              }
+            : entry
+        )
+      );
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: "stopped",
+        projectStatus: "Process stopped"
+      }));
+      setDecisionMessage(`${stopped.command || "Process"} stopped.`);
+      await syncProjectProcesses(targetProject.rootPath);
+      pushNotification({
+        type: "info",
+        title: "Process stopped",
+        message: stopped.command || processId
+      });
+      await refreshTrackedProjects();
+    } catch (stopError) {
+      setDecisionMessage(stopError?.message || "Could not stop project process.");
+    }
+  }
+
+  async function restartProjectProcess(processId) {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath || !processId) {
+      setDecisionMessage("No project process is selected.");
+      return;
+    }
+
+    setIsCommandRunning(true);
+    try {
+      const restarted = await window.trifix.restartProjectProcess({
+        projectRoot: targetProject.rootPath,
+        projectId: targetProject.projectId,
+        processId
+      });
+      if (restarted?.entry) {
+        setCommandLog((current) => [...current, restarted.entry].slice(-30));
+      }
+      setProjectProcesses(restarted?.processes || []);
+      setProject((current) => current?.rootPath === targetProject.rootPath ? { ...current, processes: restarted?.processes || [] } : current);
+      setResultProject((current) => current?.rootPath === targetProject.rootPath ? { ...current, processes: restarted?.processes || [] } : current);
+      setWorkflow((current) => ({
+        ...current,
+        commandStatus: restarted?.process?.status || "running",
+        projectStatus: restarted?.process?.healthUrl ? "Process running" : "Process restarted"
+      }));
+      setDecisionMessage(
+        restarted?.process?.healthUrl
+          ? `${restarted.process.command} running at ${restarted.process.healthUrl}.`
+          : `${restarted?.process?.command || "Process"} restarted.`
+      );
+      pushNotification({
+        type: "success",
+        title: "Process restarted",
+        message: restarted?.process?.healthUrl || restarted?.process?.command || processId
+      });
+      await refreshTrackedProjects();
+    } catch (restartError) {
+      setDecisionMessage(restartError?.message || "Could not restart project process.");
+    } finally {
+      setIsCommandRunning(false);
+    }
+  }
+
+  async function viewProjectProcessLog(processId) {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath || !processId) {
+      setDecisionMessage("No project process is selected.");
+      return;
+    }
+
+    try {
+      const log = await window.trifix.readProjectProcessLog({
+        projectRoot: targetProject.rootPath,
+        processId,
+        stream: "all",
+        maxChars: 20000
+      });
+      setProcessLogView(log);
+    } catch (logError) {
+      setDecisionMessage(logError?.message || "Could not read process logs.");
     }
   }
 
@@ -975,6 +1226,8 @@ export function App() {
     setSelectedFiles([]);
     setContextDocuments([]);
     setCommandLog([]);
+    setProjectProcesses([]);
+    setProcessLogView(null);
     setTaskTitle(draftProjectName.trim());
     setCodeInput("");
     setActiveView("office");
@@ -1119,9 +1372,11 @@ export function App() {
         setSelectedFiles(outputFiles.length > 0 ? outputFiles : (generatedProject.defaultSelectedFiles || []));
         setContextDocuments((current) => current.length > 0 ? current : generatedProject.fsd?.documents || []);
         setCommandLog(generatedProject.commandHistory || []);
+        setProjectProcesses(generatedProject.processes || []);
         setTaskTitle(generatedProject.projectName || taskTitle);
       } else {
         setResultProject(runProject?.rootPath ? runProject : null);
+        setProjectProcesses(runProject?.processes || []);
       }
       setResult(nextResult);
       setWorkflow({
@@ -1131,10 +1386,20 @@ export function App() {
       });
       setActiveTab("decision");
       setActiveView("office");
+      pushNotification({
+        type: "success",
+        title: "Task finished",
+        message: `${getResultOutputFiles(nextResult).length} file(s) changed. Output is ready for review.`
+      });
       await refreshTrackedProjects();
     } catch (runError) {
       setError(runError?.message || "Pipeline failed.");
       setDecisionMessage(runError?.message || "Pipeline failed.");
+      pushNotification({
+        type: "error",
+        title: "Task failed",
+        message: runError?.message || "Pipeline failed."
+      });
       setWorkflow((current) => ({
         ...current,
         currentStage: "error"
@@ -1148,6 +1413,128 @@ export function App() {
       );
     } finally {
       setIsRunning(false);
+    }
+  }
+
+  async function startAutonomousRun() {
+    if (!canRun) {
+      return;
+    }
+
+    setError("");
+    setIsRunning(true);
+    setIsAutonomyRunning(true);
+    stageMessageKeysRef.current = new Set();
+    reactionCursorRef.current = 0;
+    resetSpeechRuntime();
+
+    const runProject = project;
+    const runSelectedFiles = runProject?.rootPath ? selectedFiles : [];
+    const runId =
+      typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `auto-${Date.now()}`;
+    currentRunRef.current = runId;
+    const effectiveInput = !runProject?.rootPath && taskTitle.trim()
+      ? [`PROJECT_TITLE: ${taskTitle.trim()}`, codeInput].filter(Boolean).join("\n\n")
+      : codeInput;
+    const runStartMessage = runProject?.rootPath
+      ? "Autonomous run queued. The backend runner will work inside this sandbox."
+      : "Autonomous run queued. The backend runner will create output files inside a new sandbox.";
+
+    setAutonomyRun({
+      runId,
+      status: "queued",
+      maxRuntimeMs: 8 * 60 * 60 * 1000,
+      lastStage: "queued",
+      message: runStartMessage,
+      updatedAt: new Date().toISOString()
+    });
+    setDecisionMessage(runStartMessage);
+    setDecisionPreview([]);
+    setActiveTab("architect");
+    setResult(null);
+    setChatMessages([]);
+    setMessageQueue([]);
+    setActiveMessage(null);
+    setVisibleBubble(null);
+    setIsTyping(false);
+    setAgents(agentCatalog.map((agent) => ({ ...agent, status: "idle" })));
+    setWorkflow((current) => ({
+      ...current,
+      contextReady: true,
+      currentStage: "autonomy-queued",
+      decisionStatus: "pending",
+      currentPhase: "Planning",
+      currentTask: "Backend autonomy queue",
+      projectStatus: "Queued",
+      commandStatus: "idle"
+    }));
+    enqueueAgentMessage({
+      from: "architect",
+      to: "team",
+      text: runStartMessage,
+      message: runStartMessage,
+      type: "status",
+      priority: "high",
+      restoreState: "thinking"
+    });
+
+    try {
+      const queuedRun = await window.trifix.startAutonomyRun({
+        runId,
+        input: effectiveInput,
+        language,
+        projectRoot: runProject?.rootPath,
+        projectId: runProject?.projectId,
+        projectName: runProject?.name || taskTitle.trim() || runProject?.rootPath?.split(/[\\/]/).pop(),
+        projectType: runProject?.projectType,
+        selectedFiles: runSelectedFiles,
+        contextDocuments,
+        fsd: {
+          documents: contextDocuments,
+          summary: contextDocuments.map((doc) => `${doc.name}: ${doc.summary}`).join("\n")
+        },
+        loopCount: workflow.loopCount || 0,
+        maxRuntimeMinutes: 480
+      });
+      setAutonomyRun((current) => ({
+        ...(current || {}),
+        ...(queuedRun || {}),
+        message: runStartMessage
+      }));
+    } catch (runError) {
+      setIsRunning(false);
+      setIsAutonomyRunning(false);
+      setAutonomyRun((current) => ({
+        ...(current || {}),
+        status: "failed",
+        error: runError?.message || "Autonomous run failed to start."
+      }));
+      setError(runError?.message || "Autonomous run failed to start.");
+      setDecisionMessage(runError?.message || "Autonomous run failed to start.");
+    }
+  }
+
+  async function stopAutonomousRun() {
+    const runId = autonomyRun?.runId || currentRunRef.current;
+    if (!runId) {
+      return;
+    }
+
+    try {
+      const stopped = await window.trifix.stopAutonomyRun(runId);
+      setAutonomyRun((current) => ({
+        ...(current || {}),
+        ...(stopped || {}),
+        status: stopped?.status || "stopping",
+        message: "Stop requested for autonomous run."
+      }));
+      setDecisionMessage("Stop requested for autonomous run.");
+      if (stopped?.status === "stopped") {
+        setIsRunning(false);
+        setIsAutonomyRunning(false);
+      }
+    } catch (stopError) {
+      setDecisionMessage(stopError?.message || "Could not stop autonomous run.");
     }
   }
 
@@ -1172,6 +1559,7 @@ export function App() {
       await window.trifix.acceptDecision({
         ...result.decision,
         projectId: resultProject?.projectId || project?.projectId,
+        projectRoot: resultProject?.rootPath || project?.rootPath || result?.project?.rootPath,
         affectedFiles: result?.decision?.affectedFiles || []
       });
       await window.trifix.updateProject({
@@ -1201,6 +1589,7 @@ export function App() {
         setResultProject(nextProject);
         setSelectedFiles(nextSelectedFiles.length > 0 ? nextSelectedFiles : (refreshed.defaultSelectedFiles || []));
         setCommandLog(refreshed.commandHistory || activeProject.commandHistory || []);
+        setProjectProcesses(refreshed.processes || activeProject.processes || []);
       }
       setWorkflow((current) => ({
         ...current,
@@ -1247,6 +1636,13 @@ export function App() {
               ? "Cycle finished. Junior Dev file operations were already applied."
               : "Cycle finished. No files were changed.")
       );
+      pushNotification({
+        type: "success",
+        title: advancePhase ? "Phase ready" : "Cycle finished",
+        message: advancePhase
+          ? `Ready for ${planState.currentPhase || "the next phase"}.`
+          : `${getResultOutputFiles(result).length} file(s) are finalized.`
+      });
       await wait(1100);
       setScene(null);
       await refreshTrackedProjects();
@@ -1408,6 +1804,8 @@ export function App() {
       setResultProject(null);
       setSelectedFiles([]);
       setCommandLog([]);
+      setProjectProcesses([]);
+      setProcessLogView(null);
       setDecisionPreview([]);
       setWorkflow((current) => ({
         ...current,
@@ -1433,6 +1831,8 @@ export function App() {
     setResultProject(null);
     setContextDocuments([]);
     setCommandLog([]);
+    setProjectProcesses([]);
+    setProcessLogView(null);
     setTaskTitle("");
     setWorkflow((current) => ({
       ...current,
@@ -1452,6 +1852,18 @@ export function App() {
       setSelectedFiles(reopened.defaultSelectedFiles || []);
       setContextDocuments(reopened.fsd?.documents || []);
       setCommandLog(reopened.commandHistory || []);
+      setProjectProcesses(reopened.processes || []);
+      setProcessLogView(null);
+      const persistedAutonomy = reopened.autonomyState || entry.autonomyState || null;
+      setAutonomyRun(persistedAutonomy ? {
+        runId: persistedAutonomy.runId,
+        status: persistedAutonomy.status,
+        deadlineAt: persistedAutonomy.deadlineAt,
+        maxRuntimeMs: persistedAutonomy.maxRuntimeMs,
+        lastStage: persistedAutonomy.currentStage,
+        message: persistedAutonomy.currentTask || persistedAutonomy.nextAction || "Persisted autonomy state loaded.",
+        updatedAt: persistedAutonomy.finishedAt || persistedAutonomy.startedAt || persistedAutonomy.queuedAt
+      } : null);
       setWorkflow((current) => ({
         ...current,
         folderLoaded: true,
@@ -1471,6 +1883,67 @@ export function App() {
   async function removeTrackedProject(id) {
     await window.trifix.removeProject(id);
     await refreshTrackedProjects();
+  }
+
+  async function checkGraphifyStatus() {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath) {
+      setDecisionMessage("Open a project before checking graph context.");
+      return;
+    }
+
+    setDecisionMessage("Checking Graphify availability...");
+    try {
+      const graphStatus = await window.trifix.getGraphStatus({
+        projectRoot: targetProject.rootPath,
+        detect: true
+      });
+      setProject((current) => current?.rootPath === targetProject.rootPath ? { ...current, graphStatus } : current);
+      setResultProject((current) => current?.rootPath === targetProject.rootPath ? { ...current, graphStatus } : current);
+      setDecisionMessage(graphStatus.message || "Graph status updated.");
+    } catch (graphError) {
+      setDecisionMessage(graphError?.message || "Could not check graph context.");
+    }
+  }
+
+  async function buildGraphifyIndex() {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath) {
+      setDecisionMessage("Open a project before building graph context.");
+      return;
+    }
+
+    setIsGraphRunning(true);
+    setDecisionMessage("Building Graphify index. This may take a while on larger projects.");
+    try {
+      const graphStatus = await window.trifix.buildGraphIndex({
+        projectRoot: targetProject.rootPath
+      });
+      setProject((current) => current?.rootPath === targetProject.rootPath ? { ...current, graphStatus } : current);
+      setResultProject((current) => current?.rootPath === targetProject.rootPath ? { ...current, graphStatus } : current);
+      setDecisionMessage(graphStatus.message || "Graph index updated.");
+    } catch (graphError) {
+      setDecisionMessage(graphError?.message || "Could not build graph context.");
+    } finally {
+      setIsGraphRunning(false);
+    }
+  }
+
+  async function openGraphifyView() {
+    const targetProject = resultProject || project;
+    if (!targetProject?.rootPath) {
+      setDecisionMessage("Open a project before viewing graph context.");
+      return;
+    }
+
+    try {
+      await window.trifix.openGraphView({
+        projectRoot: targetProject.rootPath
+      });
+      setDecisionMessage("Opened current Graphify view.");
+    } catch (graphError) {
+      setDecisionMessage(graphError?.message || "Could not open Graphify view.");
+    }
   }
 
   async function proceedToNextPhase() {
@@ -1595,6 +2068,31 @@ export function App() {
     setIsTyping(false);
   }
 
+  function pushNotification(notification) {
+    const id =
+      typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `notice-${Date.now()}`;
+    const nextNotification = {
+      id,
+      type: notification?.type || "info",
+      title: notification?.title || "TriFix",
+      message: notification?.message || "",
+      createdAt: new Date().toISOString()
+    };
+
+    setNotifications((current) => [nextNotification, ...current].slice(0, 4));
+    const timer = setTimeout(() => removeNotification(id), 6500);
+    notificationTimersRef.current.set(id, timer);
+  }
+
+  function removeNotification(id) {
+    const timer = notificationTimersRef.current.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      notificationTimersRef.current.delete(id);
+    }
+    setNotifications((current) => current.filter((notification) => notification.id !== id));
+  }
+
   return (
     <div className={`app-shell ${activeView === "landing" ? "landing-shell" : ""}`}>
       {activeView === "landing" ? null : (
@@ -1667,6 +2165,8 @@ export function App() {
             taskTitle={taskTitle}
             contextDocuments={contextDocuments}
             commandLog={commandLog}
+            processes={projectProcesses}
+            processLogView={processLogView}
             selectedFiles={selectedFiles}
             selectedFileSet={selectedFileSet}
             codeInput={codeInput}
@@ -1674,6 +2174,8 @@ export function App() {
             result={result}
             error={error}
             isRunning={isRunning}
+            isAutonomyRunning={isAutonomyRunning}
+            autonomyRun={autonomyRun}
             canRun={canRun}
             workflow={workflow}
             chatMessages={chatMessages}
@@ -1688,12 +2190,23 @@ export function App() {
             messageByAgent={messageByAgent}
             onOpenProject={openProject}
             onRefreshProject={refreshProject}
+            onCheckGraphify={checkGraphifyStatus}
+            onBuildGraphify={buildGraphifyIndex}
+            onOpenGraphify={openGraphifyView}
+            isGraphRunning={isGraphRunning}
             onUploadContext={uploadContextDocuments}
             onToggleFile={toggleFile}
             onCodeInput={setCodeInput}
             onLanguage={setLanguage}
             onRun={() => runOffice(workflow.loopCount, "")}
+            onAutonomousRun={startAutonomousRun}
+            onStopAutonomy={stopAutonomousRun}
             onRunProject={() => runProjectControl("run")}
+            onOpenProcessUrl={openProcessUrl}
+            onStopProcess={stopProjectProcess}
+            onRestartProcess={restartProjectProcess}
+            onViewProcessLog={viewProjectProcessLog}
+            onCloseProcessLog={() => setProcessLogView(null)}
             isCommandRunning={isCommandRunning}
             isChatOpen={isChatOpen}
             onToggleChat={() => setIsChatOpen((current) => !current)}
@@ -1735,6 +2248,34 @@ export function App() {
         ) : null}
         {scene ? <SceneOverlay scene={scene} /> : null}
       </main>
+      <NotificationStack notifications={notifications} onDismiss={removeNotification} />
+    </div>
+  );
+}
+
+function NotificationStack({ notifications = [], onDismiss }) {
+  if (!notifications.length) {
+    return null;
+  }
+
+  return (
+    <div className="notification-stack" aria-live="polite" aria-label="Notifications">
+      {notifications.map((notification) => (
+        <div className={`notification-card ${notification.type || "info"}`} key={notification.id}>
+          <div>
+            <strong>{notification.title}</strong>
+            {notification.message ? <span>{notification.message}</span> : null}
+          </div>
+          <button
+            className="notification-dismiss"
+            type="button"
+            onClick={() => onDismiss(notification.id)}
+            aria-label="Dismiss notification"
+          >
+            <XCircle size={16} />
+          </button>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1746,6 +2287,8 @@ function OfficeView({
   taskTitle,
   contextDocuments,
   commandLog = [],
+  processes = [],
+  processLogView,
   selectedFiles,
   selectedFileSet,
   codeInput,
@@ -1753,6 +2296,8 @@ function OfficeView({
   result,
   error,
   isRunning,
+  isAutonomyRunning,
+  autonomyRun,
   canRun,
   workflow,
   chatMessages,
@@ -1767,12 +2312,23 @@ function OfficeView({
   messageByAgent,
   onOpenProject,
   onRefreshProject,
+  onCheckGraphify,
+  onBuildGraphify,
+  onOpenGraphify,
+  isGraphRunning,
   onUploadContext,
   onToggleFile,
   onCodeInput,
   onLanguage,
   onRun,
+  onAutonomousRun,
+  onStopAutonomy,
   onRunProject,
+  onOpenProcessUrl,
+  onStopProcess,
+  onRestartProcess,
+  onViewProcessLog,
+  onCloseProcessLog,
   isCommandRunning,
   isChatOpen,
   onToggleChat,
@@ -1794,6 +2350,8 @@ function OfficeView({
   const [isCycleReviewOpen, setIsCycleReviewOpen] = useState(false);
   const lastOpenedReviewKey = useRef("");
   const reviewKey = `${workflow?.loopCount || 0}:${workflow?.decisionStatus || ""}:${result?.decision?.summary || ""}`;
+  const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
+  const needsPatch = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase() === "needs_patch";
 
   useEffect(() => {
     if (!showCycleReview) {
@@ -1803,9 +2361,23 @@ function OfficeView({
 
     if (lastOpenedReviewKey.current !== reviewKey) {
       lastOpenedReviewKey.current = reviewKey;
-      setIsCycleReviewOpen(true);
+      setIsCycleReviewOpen(false);
     }
   }, [reviewKey, showCycleReview]);
+
+  function runCycleAction(action) {
+    setIsCycleReviewOpen(false);
+    action?.();
+  }
+
+  function openChangesReview() {
+    if (showCycleReview) {
+      setIsCycleReviewOpen(true);
+      return;
+    }
+
+    onTabChange?.("decision");
+  }
 
   return (
     <>
@@ -1826,12 +2398,12 @@ function OfficeView({
               result={result}
               workflow={workflow}
               isBusy={isDecisionBusy}
-              onAdvanceCycle={onAdvanceCycle}
-              onFinishCycle={onAccept}
-              onNeedsPatch={onNeedsPatch}
-              onDiscardOutput={onDiscardOutput}
-            onClose={() => setIsCycleReviewOpen(false)}
-          />
+              onAdvanceCycle={() => runCycleAction(onAdvanceCycle)}
+              onFinishCycle={() => runCycleAction(onAccept)}
+              onNeedsPatch={() => runCycleAction(onNeedsPatch)}
+              onDiscardOutput={() => runCycleAction(onDiscardOutput)}
+              onClose={() => setIsCycleReviewOpen(false)}
+            />
           </div>
         </div>
       ) : null}
@@ -1851,12 +2423,45 @@ function OfficeView({
             {isCommandRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
             Run Project
           </button>
+          {isAutonomyRunning ? (
+            <button className="secondary-button danger" type="button" onClick={onStopAutonomy}>
+              <XCircle size={18} />
+              Stop Auto
+            </button>
+          ) : (
+            <button className="secondary-button" type="button" onClick={onAutonomousRun} disabled={!canRun}>
+              <Sparkles size={18} />
+              Autonomous Run
+            </button>
+          )}
           <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
             {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
             Run Team
           </button>
         </div>
       </header>
+
+      {autonomyRun?.runId ? (
+        <AutonomyStatusCard
+          autonomyRun={autonomyRun}
+          isRunning={isAutonomyRunning}
+          workflow={workflow}
+          result={result}
+          isDecisionBusy={isDecisionBusy}
+          canContinue={Boolean(nextPhase) && !needsPatch}
+          onOpenChanges={openChangesReview}
+          onContinue={onAdvanceCycle}
+          onDeny={onNeedsPatch}
+          onEnd={onAccept}
+        />
+      ) : null}
+      <ProcessManagerCard
+        processes={processes}
+        onOpenProcessUrl={onOpenProcessUrl}
+        onStopProcess={onStopProcess}
+        onRestartProcess={onRestartProcess}
+        onViewProcessLog={onViewProcessLog}
+      />
 
       <section className="office-stage" aria-label="Developer agents">
         <div className="stage-backdrop" />
@@ -1967,6 +2572,13 @@ function OfficeView({
               <div className="selected-count">
                 {selectedFiles.length} / {project.limits?.maxSelectedFiles || 10} files queued
               </div>
+              <GraphStatusCard
+                graphStatus={project.graphStatus}
+                isGraphRunning={isGraphRunning}
+                onCheckGraphify={onCheckGraphify}
+                onBuildGraphify={onBuildGraphify}
+                onOpenGraphify={onOpenGraphify}
+              />
               <div className="file-tree">
                 <FileTree nodes={project.tree} selectedFileSet={selectedFileSet} onToggleFile={onToggleFile} />
               </div>
@@ -1996,7 +2608,14 @@ function OfficeView({
         onAdvanceCycle={onAdvanceCycle}
         onNeedsPatch={onNeedsPatch}
         onDiscardOutput={onDiscardOutput}
+        onOpenProcessUrl={onOpenProcessUrl}
+        onStopProcess={onStopProcess}
+        onRestartProcess={onRestartProcess}
+        onViewProcessLog={onViewProcessLog}
       />
+      {processLogView ? (
+        <ProcessLogModal processLog={processLogView} onClose={onCloseProcessLog} />
+      ) : null}
     </>
   );
 }
@@ -2228,7 +2847,11 @@ function OutputBin({
   onAcceptAndApply,
   onAdvanceCycle,
   onNeedsPatch,
-  onDiscardOutput
+  onDiscardOutput,
+  onOpenProcessUrl,
+  onStopProcess,
+  onRestartProcess,
+  onViewProcessLog
 }) {
   return (
     <section className="output-section" aria-label="Output Bin">
@@ -2302,7 +2925,14 @@ function OutputBin({
           <TasksPanel phases={result?.project?.phases} tasks={result?.project?.tasks} />
         ) : null}
         {activeTab === "logs" ? (
-          <CommandLogPanel commandLog={commandLog} result={result} />
+          <CommandLogPanel
+            commandLog={commandLog}
+            result={result}
+            onOpenProcessUrl={onOpenProcessUrl}
+            onStopProcess={onStopProcess}
+            onRestartProcess={onRestartProcess}
+            onViewProcessLog={onViewProcessLog}
+          />
         ) : null}
         {activeTab === "decision" ? (
           <DecisionPanel
@@ -2340,6 +2970,7 @@ function DecisionPanel({
   onDiscardOutput
 }) {
   const decision = result?.decision;
+  const needsPatch = String(workflow?.decisionStatus || decision?.decisionStatus || "").toLowerCase() === "needs_patch";
 
   return (
     <div className="output-panel output-decision tone-green">
@@ -2351,6 +2982,12 @@ function DecisionPanel({
       <div className="decision-summary">
         <h3>Summary</h3>
         <p>{decision?.summary || "No decision summary yet."}</p>
+        {decision?.verdict ? (
+          <>
+            <h3>PM verdict</h3>
+            <p>{decision.verdict}</p>
+          </>
+        ) : null}
         {result?.project?.rootPath ? (
           <p className="project-path" title={result.project.rootPath}>
             {result.project.projectName || result.project.name || "Project"}: {result.project.rootPath}
@@ -2434,6 +3071,12 @@ function DecisionPanel({
       ) : null}
 
       {decisionMessage ? <div className="context-banner">{decisionMessage}</div> : null}
+      {needsPatch ? (
+        <div className="error-banner" role="alert">
+          <TriangleAlert size={18} />
+          <span>Supervisor / PM requested another patch before this cycle can be accepted.</span>
+        </div>
+      ) : null}
       {workflow.decisionStatus === "manual_review_required" ? (
         <div className="error-banner" role="alert">
           <TriangleAlert size={18} />
@@ -2447,11 +3090,12 @@ function DecisionPanel({
 function CycleReviewLauncher({ result, workflow, onOpen }) {
   const affectedFiles = result?.decision?.affectedFiles || [];
   const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
+  const needsPatch = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase() === "needs_patch";
 
   return (
     <button className="cycle-review-launcher" type="button" onClick={onOpen} aria-label="Open cycle review">
       <span>
-        <strong>Cycle ready</strong>
+        <strong>{needsPatch ? "Patch required" : "Cycle ready"}</strong>
         <small>{affectedFiles.length} file(s) affected{nextPhase ? ` - Next: ${nextPhase}` : ""}</small>
       </span>
       <CheckCircle2 size={18} />
@@ -2462,6 +3106,7 @@ function CycleReviewLauncher({ result, workflow, onOpen }) {
 function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCycle, onNeedsPatch, onDiscardOutput, onClose }) {
   const affectedFiles = result?.decision?.affectedFiles || [];
   const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
+  const needsPatch = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase() === "needs_patch";
 
   return (
     <section className="cycle-review-card" aria-label="Cycle review">
@@ -2506,11 +3151,11 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
           <span>{nextPhase ? `Next: ${nextPhase}` : "No next phase planned"}</span>
         </div>
         <div className="decision-actions">
-          <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isBusy || !nextPhase}>
+          <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isBusy || !nextPhase || needsPatch}>
             <Play size={16} />
             Proceed to Next Phase
           </button>
-          <button className="secondary-button" type="button" onClick={onFinishCycle} disabled={isBusy}>
+          <button className="secondary-button" type="button" onClick={onFinishCycle} disabled={isBusy || needsPatch}>
             <CheckCircle2 size={16} />
             Finish Cycle
           </button>
@@ -2562,7 +3207,7 @@ function TasksPanel({ phases = [], tasks = [] }) {
   );
 }
 
-function CommandLogPanel({ commandLog = [], result }) {
+function CommandLogPanel({ commandLog = [], result, onOpenProcessUrl, onStopProcess, onRestartProcess, onViewProcessLog }) {
   const logs = commandLog.length > 0 ? commandLog : result?.project?.commandHistory || [];
   const pipelineLogs = Array.isArray(result?.parallel?.logs) ? result.parallel.logs : [];
   return (
@@ -2586,7 +3231,35 @@ function CommandLogPanel({ commandLog = [], result }) {
           {logs.map((entry) => (
             <div className="command-log-card" key={entry.id || `${entry.command}-${entry.startedAt}`}>
               <strong>{entry.command}</strong>
-              <span>{entry.status} {typeof entry.exitCode !== "undefined" ? `(exit ${entry.exitCode})` : ""}</span>
+              <span>{entry.status} {Number.isInteger(entry.exitCode) ? `(exit ${entry.exitCode})` : ""}</span>
+              {entry.healthUrl || entry.processId ? (
+                <div className="command-log-actions">
+                  {entry.healthUrl ? (
+                    <button className="secondary-button" type="button" onClick={() => onOpenProcessUrl?.(entry.healthUrl)}>
+                      <Eye size={15} />
+                      Open URL
+                    </button>
+                  ) : null}
+                  {entry.processId && entry.status === "running" ? (
+                    <button className="secondary-button danger" type="button" onClick={() => onStopProcess?.(entry.processId)}>
+                      <XCircle size={15} />
+                      Stop Process
+                    </button>
+                  ) : null}
+                  {entry.processId ? (
+                    <>
+                      <button className="secondary-button" type="button" onClick={() => onRestartProcess?.(entry.processId)}>
+                        <RefreshCw size={15} />
+                        Restart
+                      </button>
+                      <button className="secondary-button" type="button" onClick={() => onViewProcessLog?.(entry.processId)}>
+                        <FileCode2 size={15} />
+                        View Logs
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
               <pre>{entry.output || "No output captured."}</pre>
             </div>
           ))}
@@ -2629,6 +3302,172 @@ function OutputPanel({ title, content, code = false, codeContent = "", tone = "b
           <code>{codeContent}</code>
         </pre>
       ) : null}
+    </div>
+  );
+}
+
+function ProcessManagerCard({ processes = [], onOpenProcessUrl, onStopProcess, onRestartProcess, onViewProcessLog }) {
+  if (!processes.length) {
+    return null;
+  }
+
+  const activeProcess = processes.find((process) => ["running", "starting"].includes(process.status)) || processes[0];
+
+  return (
+    <section className={`process-manager-card ${activeProcess.status || "idle"}`} aria-label="Project process">
+      <div className="process-manager-main">
+        <span className={`process-status-dot ${activeProcess.status || "idle"}`} />
+        <div>
+          <span className="process-label">Project Process</span>
+          <strong>{activeProcess.command || "Process"}</strong>
+          <p>
+            {activeProcess.healthUrl || activeProcess.stdoutLog || "No app URL detected yet."}
+          </p>
+        </div>
+      </div>
+      <div className="process-manager-actions">
+        {activeProcess.healthUrl ? (
+          <button className="secondary-button" type="button" onClick={() => onOpenProcessUrl?.(activeProcess.healthUrl)}>
+            <Eye size={16} />
+            Open URL
+          </button>
+        ) : null}
+        <button className="secondary-button" type="button" onClick={() => onViewProcessLog?.(activeProcess.id)}>
+          <FileCode2 size={16} />
+          Logs
+        </button>
+        <button className="secondary-button" type="button" onClick={() => onRestartProcess?.(activeProcess.id)}>
+          <RefreshCw size={16} />
+          Restart
+        </button>
+        {["running", "starting"].includes(activeProcess.status) ? (
+          <button className="secondary-button danger" type="button" onClick={() => onStopProcess?.(activeProcess.id)}>
+            <XCircle size={16} />
+            Stop
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function ProcessLogModal({ processLog, onClose }) {
+  const process = processLog?.process || {};
+  return (
+    <div className="process-log-overlay" role="presentation" onMouseDown={onClose}>
+      <section className="process-log-modal" role="dialog" aria-modal="true" aria-label="Process logs" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="process-log-header">
+          <div>
+            <p className="eyebrow">Process Logs</p>
+            <h2>{process.command || "Project process"}</h2>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close process logs">
+            <XCircle size={18} />
+          </button>
+        </div>
+        <div className="process-log-meta">
+          <span>{process.status || "unknown"}</span>
+          {process.healthUrl ? <span>{process.healthUrl}</span> : null}
+          {process.pid ? <span>PID {process.pid}</span> : null}
+        </div>
+        <pre className="process-log-output">{processLog?.output || "No log output captured yet."}</pre>
+      </section>
+    </div>
+  );
+}
+
+function AutonomyStatusCard({
+  autonomyRun,
+  isRunning,
+  workflow,
+  result,
+  isDecisionBusy,
+  canContinue,
+  onOpenChanges,
+  onContinue,
+  onDeny,
+  onEnd
+}) {
+  const status = autonomyRun?.status || "idle";
+  const detail = autonomyRun?.message || autonomyRun?.error || autonomyRun?.lastStage || "Backend autonomy runner is idle.";
+  const deadline = autonomyRun?.deadlineAt ? `Deadline: ${formatTimestamp(autonomyRun.deadlineAt)}` : "";
+  const runtime = autonomyRun?.maxRuntimeMs ? `Limit: ${Math.round(autonomyRun.maxRuntimeMs / 60000)} min` : "";
+  const decisionState = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase();
+  const showDecisionActions = !isRunning && ["waiting_for_decision", "blocked"].includes(status);
+
+  return (
+    <section className={`autonomy-status-card ${isRunning ? "running" : ""}`} aria-label="Autonomy status">
+      <div>
+        <span className="output-tab">Autonomy</span>
+        <strong>{formatAutonomyStatus(status)}</strong>
+        <p>{detail}</p>
+        {showDecisionActions ? (
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={onOpenChanges} disabled={isDecisionBusy}>
+              <Eye size={16} />
+              Open Changes
+            </button>
+            <button className="primary-button" type="button" onClick={onContinue} disabled={isDecisionBusy || !canContinue}>
+              <Play size={16} />
+              Continue
+            </button>
+            <button className="secondary-button" type="button" onClick={onDeny} disabled={isDecisionBusy}>
+              <XCircle size={16} />
+              Deny
+            </button>
+            <button className="secondary-button danger" type="button" onClick={onEnd} disabled={isDecisionBusy || decisionState === "needs_patch"}>
+              <CheckCircle2 size={16} />
+              End
+            </button>
+          </div>
+        ) : null}
+        {deadline || runtime ? <p>{[runtime, deadline].filter(Boolean).join(" · ")}</p> : null}
+      </div>
+      <div className="autonomy-status-meta">
+        {isRunning ? <Loader2 size={16} className="spin" /> : <CheckCircle2 size={16} />}
+        <span>{autonomyRun?.lastStage || autonomyRun?.runId}</span>
+      </div>
+    </section>
+  );
+}
+
+function GraphStatusCard({ graphStatus, isGraphRunning, onCheckGraphify, onBuildGraphify, onOpenGraphify }) {
+  const status = graphStatus?.status || "not_checked";
+  const available = Boolean(graphStatus?.toolAvailable);
+  const canView = status === "indexed" || Boolean(graphStatus?.htmlPath || graphStatus?.reportPath);
+  const label = available
+    ? status === "indexed"
+      ? "Graph context indexed"
+      : `${graphStatus.toolName || "Graphify"} available`
+    : status === "tool_missing"
+      ? "Graphify missing"
+      : "Graph context not checked";
+
+  return (
+    <div className={`graph-status-card ${available ? "available" : ""}`}>
+      <div>
+        <strong>{label}</strong>
+        <span>{graphStatus?.message || "Use Graphify to index project structure for smaller agent context."}</span>
+      </div>
+      <div className="graph-status-actions">
+        <button
+          className="icon-button graph-view-button"
+          type="button"
+          onClick={onOpenGraphify}
+          disabled={isGraphRunning || !canView}
+          title="View Graphify graph"
+          aria-label="View Graphify graph"
+        >
+          <Eye size={15} />
+        </button>
+        <button className="secondary-button" type="button" onClick={onCheckGraphify} disabled={isGraphRunning}>
+          Check
+        </button>
+        <button className="secondary-button" type="button" onClick={onBuildGraphify} disabled={isGraphRunning}>
+          {isGraphRunning ? <Loader2 size={14} className="spin" /> : null}
+          Build
+        </button>
+      </div>
     </div>
   );
 }
@@ -2904,6 +3743,7 @@ function LandingView({
             <div className="landing-recents">
               {recentEntries.map((entry) => {
                 const statusKey = toLandingStatusKey(entry?.status, entry?.decisionStatus);
+                const autonomyState = entry?.autonomyState;
                 return (
                   <article key={entry.id} className="landing-recent-card">
                     <div className="landing-recent-main">
@@ -2918,6 +3758,12 @@ function LandingView({
                             <Clock3 size={14} />
                             Updated: {formatTimestamp(entry.lastUpdated)}
                           </span>
+                          {autonomyState?.status ? (
+                            <span className="landing-meta-item autonomy-meta">
+                              <Sparkles size={14} />
+                              Auto: {formatAutonomyStatus(autonomyState.status)}
+                            </span>
+                          ) : null}
                         </div>
                       </div>
                     </div>
@@ -3562,6 +4408,7 @@ function normalizeGeneratedProject(result, fallbackProject) {
     projectStatus: resultProject.status || result?.workflow?.projectStatus || "Files written",
     defaultSelectedFiles: resultProject.defaultSelectedFiles || [],
     commandHistory: resultProject.commandHistory || fallbackProject?.commandHistory || [],
+    processes: resultProject.processes || fallbackProject?.processes || [],
     fsd: resultProject.fsd || fallbackProject?.fsd || null
   };
 }
@@ -3579,7 +4426,7 @@ function shouldShowCycleReview({ result, workflow, isRunning }) {
     return false;
   }
 
-  return ["pending", "applied", "accepted"].includes(String(workflow?.decisionStatus || "pending"));
+  return String(workflow?.decisionStatus || "pending").toLowerCase() === "pending";
 }
 
 function canDiscardGeneratedOutput(project, result) {
@@ -3797,7 +4644,25 @@ function mapProgressStatus(agentId, status) {
     return "thinking";
   }
 
-  return status;
+  if (AGENT_STATUS_KEYS.includes(status)) {
+    return status;
+  }
+
+  if (["waiting_for_decision", "blocked"].includes(status)) {
+    return "waiting";
+  }
+
+  if (["failed", "stopped"].includes(status)) {
+    return "error";
+  }
+
+  return "thinking";
+}
+
+function formatAutonomyStatus(status) {
+  return String(status || "idle")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function wait(ms) {
@@ -3842,7 +4707,11 @@ function toLandingStatusKey(status, decisionStatus) {
     return "waiting";
   }
 
-  if (value === "in progress" || decision === "denied" || decision === "manual_review_required") {
+  if (value === "in progress" || value === "validation failed" || value === "blocked" || value === "timed_out" || decision === "denied" || decision === "manual_review_required") {
+    return "active";
+  }
+
+  if (decision === "needs_patch") {
     return "active";
   }
 
@@ -3877,6 +4746,10 @@ function mapTrackedStatusToStage(status, decisionStatus) {
 
   if (decisionStatus === "manual_review_required") {
     return "manual-review";
+  }
+
+  if (decisionStatus === "needs_patch") {
+    return "correction-loop";
   }
 
   if (decisionStatus === "denied") {

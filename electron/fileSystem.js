@@ -11,7 +11,7 @@ import {
 } from "./constants.js";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
-const SANDBOX_BLOCKED_NAMES = new Set(["node_modules", ".git", ".trifix-backups"]);
+const SANDBOX_BLOCKED_NAMES = new Set(["node_modules", ".git", ".trifix", ".trifix-backups"]);
 const BINARY_CONTEXT_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 
 export async function buildDefaultSandboxProject(parentPath) {
@@ -183,9 +183,9 @@ export async function previewFilePatches(rootPath, patches, allowedPaths = []) {
       continue;
     }
 
-    const { targetPath, absolutePath, sandboxTarget, redirected } =
+    const { targetPath, absolutePath, allowCreate, redirected } =
       await resolvePatchWriteTarget(root, requestedPath, allowedSet);
-    const previous = await readExistingPatchTarget(absolutePath, targetPath, sandboxTarget);
+    const previous = await readExistingPatchTarget(absolutePath, targetPath, allowCreate);
     const nextContent = String(patch.content || "");
 
     previews.push({
@@ -215,9 +215,9 @@ export async function applyFilePatches(rootPath, patches, allowedPaths = []) {
       continue;
     }
 
-    const { targetPath, absolutePath, sandboxTarget, redirected } =
+    const { targetPath, absolutePath, allowCreate, redirected } =
       await resolvePatchWriteTarget(root, requestedPath, allowedSet);
-    const previous = await readExistingPatchTarget(absolutePath, targetPath, sandboxTarget);
+    const previous = await readExistingPatchTarget(absolutePath, targetPath, allowCreate);
     const backupPath = path.join(backupRoot, targetPath);
 
     if (!previous.created) {
@@ -225,7 +225,7 @@ export async function applyFilePatches(rootPath, patches, allowedPaths = []) {
       await fs.writeFile(backupPath, previous.content, "utf8");
     }
 
-    if (sandboxTarget) {
+    if (previous.created) {
       await fs.mkdir(path.dirname(absolutePath), { recursive: true });
     }
 
@@ -266,7 +266,7 @@ export async function applyFileOperations(parentPath, projectSpec = {}, operatio
   let rootCreated = false;
 
   for (const operation of fileOperations) {
-    const action = String(operation?.action || "write").toLowerCase();
+    const action = normalizeFileOperationAction(operation?.action);
     const requestedPath = normalizeFileOperationPath(operation?.path || "", projectSlug, requestedSlug);
 
     if (action !== "write") {
@@ -487,12 +487,14 @@ async function resolvePatchWriteTarget(root, requestedPath, allowedSet) {
 
   const requestedAbsolutePath = await resolveInsideRoot(root, requestedPath);
   const requestedSandboxTarget = isSandboxPath(requestedPath);
+  const requestedExists = await fileExists(requestedAbsolutePath);
+  const allowExplicitCreate = allowedSet.has(requestedPath);
 
-  if (requestedSandboxTarget || (await fileExists(requestedAbsolutePath))) {
+  if (requestedSandboxTarget || requestedExists || allowExplicitCreate) {
     return {
       targetPath: requestedPath,
       absolutePath: requestedAbsolutePath,
-      sandboxTarget: requestedSandboxTarget,
+      allowCreate: requestedSandboxTarget || allowExplicitCreate,
       redirected: false
     };
   }
@@ -502,9 +504,18 @@ async function resolvePatchWriteTarget(root, requestedPath, allowedSet) {
   return {
     targetPath: sandboxPath,
     absolutePath: await resolveInsideRoot(root, sandboxPath),
-    sandboxTarget: true,
+    allowCreate: true,
     redirected: true
   };
+}
+
+function normalizeFileOperationAction(value) {
+  const action = String(value || "write").trim().toLowerCase();
+  if (!action || ["write", "create", "update", "modify", "edit", "replace", "overwrite", "upsert"].includes(action)) {
+    return "write";
+  }
+
+  return action;
 }
 
 async function fileExists(absolutePath) {
