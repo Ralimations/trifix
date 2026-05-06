@@ -33,13 +33,26 @@ app.whenReady().then(async () => {
   settingsFilePath = path.join(app.getPath("userData"), "trifix-settings.json");
   projectsFilePath = path.join(app.getPath("userData"), "trifix-projects.json");
   registerIpc();
-  createWindow();
+  await createWindow();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      void createWindow();
     }
   });
+}).catch((error) => {
+  logStartupError("app.whenReady", error);
+  try {
+    dialog.showErrorBox("TriFix failed to start", formatStartupError(error));
+  } catch {}
+});
+
+process.on("uncaughtException", (error) => {
+  logStartupError("uncaughtException", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logStartupError("unhandledRejection", reason);
 });
 
 app.on("window-all-closed", () => {
@@ -83,7 +96,7 @@ async function loadBackend() {
   };
 }
 
-function createWindow() {
+async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 860,
@@ -91,6 +104,7 @@ function createWindow() {
     minHeight: 720,
     backgroundColor: "#10131a",
     title: "TriFix AI: Tiny Office Mode",
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -99,11 +113,92 @@ function createWindow() {
     }
   });
 
-  if (isDev) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else {
-    mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+  mainWindow.once("ready-to-show", () => {
+    if (!mainWindow?.isDestroyed()) {
+      mainWindow.show();
+    }
+  });
+
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) {
+      return;
+    }
+    logStartupError("did-fail-load", new Error(`${errorCode}: ${errorDescription} (${validatedURL})`));
+    void showWindowFallback(`Could not load ${validatedURL || "the TriFix UI"}.\n${errorDescription || "Unknown load failure."}`);
+  });
+
+  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    logStartupError("renderer-console", `level=${level} ${sourceId || "renderer"}:${line || 0} ${message}`);
+  });
+
+  mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
+    logStartupError("preload-error", new Error(`${preloadPath}: ${formatStartupError(error)}`));
+    void showWindowFallback(`The TriFix preload script failed.\n${formatStartupError(error)}`);
+  });
+
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    logStartupError("render-process-gone", new Error(`${details.reason || "unknown"} (exitCode=${details.exitCode ?? "n/a"})`));
+    void showWindowFallback(`The TriFix renderer exited unexpectedly.\nReason: ${details.reason || "unknown"}`);
+  });
+
+  try {
+    if (isDev) {
+      await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+    } else {
+      await mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+    }
+    const renderProbe = await mainWindow.webContents.executeJavaScript(`(() => {
+      const root = document.getElementById('root');
+      return {
+        hasBridge: typeof window.trifix !== 'undefined',
+        rootChildren: root ? root.children.length : -1,
+        rootHtmlLength: root ? root.innerHTML.length : -1,
+        bodyTextLength: document.body ? document.body.innerText.length : -1,
+        title: document.title || ''
+      };
+    })()`);
+    logStartupError("render-probe", JSON.stringify(renderProbe));
+  } catch (error) {
+    logStartupError("createWindow.load", error);
+    await showWindowFallback(formatStartupError(error));
   }
+}
+
+async function showWindowFallback(message) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  const safeMessage = escapeHtml(String(message || "TriFix could not load the UI."));
+  await mainWindow.loadURL(`data:text/html,<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif;background:#10131a;color:#f5f7fb;padding:24px"><h2>TriFix UI failed to load</h2><pre style="white-space:pre-wrap">${safeMessage}</pre></body></html>`);
+  if (!mainWindow.isVisible()) {
+    mainWindow.show();
+  }
+}
+
+function logStartupError(scope, error) {
+  const line = `[${new Date().toISOString()}] ${scope}: ${formatStartupError(error)}\n`;
+  try {
+    console.error(line.trim());
+  } catch {}
+  try {
+    const logPath = path.join(process.cwd(), "dev.current.stderr.log");
+    void fs.appendFile(logPath, line, "utf8");
+  } catch {}
+}
+
+function formatStartupError(error) {
+  if (!error) {
+    return "Unknown startup error.";
+  }
+  return error?.stack || error?.message || String(error);
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
 function registerIpc() {

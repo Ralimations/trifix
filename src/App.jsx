@@ -222,7 +222,13 @@ export function App() {
   }, [agents]);
 
   useEffect(() => {
-    window.trifix
+    const bridge = window.trifix;
+    if (!bridge) {
+      setError("TriFix desktop bridge is unavailable. Restart the Electron app.");
+      return () => { };
+    }
+
+    bridge
       .getSettings()
       .then((nextSettings) => {
         setSettings(nextSettings);
@@ -232,17 +238,17 @@ export function App() {
       })
       .catch(() => { });
 
-    window.trifix
+    bridge
       .getLastResult()
       .then((cached) => cached && setResult(cached))
       .catch(() => { });
 
-    window.trifix
+    bridge
       .listProjects()
       .then((items) => setTrackedProjects(items || []))
       .catch(() => { });
 
-    const unsubscribePipeline = window.trifix.onPipelineProgress((progress) => {
+    const unsubscribePipeline = bridge.onPipelineProgress((progress) => {
       if (progress.runId !== currentRunRef.current) {
         return;
       }
@@ -271,7 +277,7 @@ export function App() {
         )
       );
     });
-    const unsubscribeAutonomy = window.trifix.onAutonomyProgress((progress) => {
+    const unsubscribeAutonomy = bridge.onAutonomyProgress((progress) => {
       if (progress.runId !== currentRunRef.current) {
         return;
       }
