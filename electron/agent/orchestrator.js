@@ -23,6 +23,7 @@ import {
   trackProposedFiles,
   trackQaResult
 } from "./artifactLedger.js";
+import { getModelHealth } from "./modelHealth.js";
 
 const REQUEST_TIMEOUT_MS = 1800000;
 const SPEAKING_DELAY_MS = 800;
@@ -77,6 +78,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const runId = payload?.runId || randomUUID();
   const runMode = payload?.mode === "autonomous" || payload?.autonomy ? "autonomous" : "manual";
   let pipelineRunPath = String(payload?.runPath || payload?.projectRoot || "").trim();
+  debugPipeline("runPipeline start", { runId, runMode, hasProjectRoot: Boolean(projectRoot) });
 
   if (!input && files.length === 0 && contextDocuments.length === 0) {
     throw new Error("Add an instruction, upload context, or select at least one project file.");
@@ -144,6 +146,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     });
 
   emitStage({ agent: "architect", stage: "supervisor-spec", status: "thinking" });
+  debugPipeline("pm call start", { runId });
   const pmPlan = await callAgent({
     agent: AGENTS.architect,
     systemPrompt: buildSupervisorSpecSystemPrompt(),
@@ -151,9 +154,17 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     onRequestStatus: (requestStatus) =>
       emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount })
   });
+  debugPipeline("pm call end", { runId });
   addParallelLog("Supervisor spec created");
 
   const pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, null, pmPlan);
+  const singleFileHtmlMode = isSingleFileHtmlSmokeRequest(input, pmArchitecture);
+  if (singleFileHtmlMode) {
+    pmArchitecture.fileArchitecture = [{ path: "index.html", purpose: "Single-file HTML app" }];
+    pmArchitecture.requiredFiles = ["index.html"];
+    pmArchitecture.setupCommands = [];
+    pmArchitecture.implementationPlan = ["Create a single-file HTML admin dashboard in index.html."];
+  }
   if (!pipelineRunPath) {
     pipelineRunPath = buildPlannedRunPath(payload?.sandboxParentPath, pmArchitecture?.projectSlug);
     if (pipelineRunPath) {
@@ -226,6 +237,13 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   });
 
   const qaInstructionResult = buildSupervisorResult(qaDevHandoff);
+  debugPipeline("qa health check start", { runId });
+  const qaHealth = await getQaHealthSnapshot();
+  debugPipeline("qa health check end", { runId, qaOnline: qaHealth.online, qaError: qaHealth.error || "" });
+  const qaEndpointOnline = qaHealth.online;
+  const qaUnavailableReason = qaEndpointOnline
+    ? ""
+    : `Senior Dev parallel review unavailable: ${qaHealth.error || "QA endpoint is offline."}`;
   emitStage({
     agent: "supervisor",
     stage: "senior-parallel-review",
@@ -251,40 +269,70 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     });
   }
   emitStage({ agent: "junior", stage: "junior-initial", status: "coding", projectPlan });
+  debugPipeline("junior call start", { runId });
+  const juniorSystemPrompt = buildJuniorInitialSystemPrompt();
+  const juniorInput = buildJuniorInitialContext({
+    compactContext,
+    prd,
+    pmPlan,
+    pmArchitecture,
+    qaInstructions: qaDevHandoff,
+    qaStructureReview,
+    language,
+    feedback,
+    revisionBrief,
+    loopCount,
+    isExistingProjectRequest,
+    singleFileHtmlMode
+  });
+  
+  debugPipeline("junior payload details", {
+    runId,
+    endpoint: AGENTS.junior.endpoint,
+    model: AGENTS.junior.model,
+    systemPromptLength: juniorSystemPrompt.length,
+    inputLength: juniorInput.length,
+    totalPayloadSize: juniorSystemPrompt.length + juniorInput.length
+  });
+
   const juniorInitialTask = trackAgentCall(callAgent({
     agent: AGENTS.junior,
-    systemPrompt: buildJuniorInitialSystemPrompt(),
-    input: buildJuniorInitialContext({
-      compactContext,
-      prd,
-      pmPlan,
-      pmArchitecture,
-      qaInstructions: qaDevHandoff,
-      qaStructureReview,
-      language,
-      feedback,
-      revisionBrief,
-      loopCount,
-      isExistingProjectRequest
-    }),
+    systemPrompt: juniorSystemPrompt,
+    input: juniorInput,
+    allowPartialResponse: singleFileHtmlMode,
     onRequestStatus: (requestStatus) =>
       emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-initial", status: "coding", requestStatus, loopCount, projectPlan })
   }));
 
-  addParallelLog("Senior Dev started");
+  let seniorParallelTask = null;
+  if (qaEndpointOnline) {
+    addParallelLog("Senior Dev started");
+    debugPipeline("qa task create", { runId, skipped: false });
+  } else {
+    addParallelLog("Senior Dev skipped because QA endpoint is offline");
+    debugPipeline("qa skip branch", { runId, reason: qaUnavailableReason });
+  }
   emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "testing", projectPlan });
-  const seniorParallelTask = trackAgentCall(callAgent({
-    agent: AGENTS.supervisor,
-    systemPrompt: buildSeniorParallelSystemPrompt(),
-    input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }),
-    onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
-  }));
+  if (qaEndpointOnline) {
+    seniorParallelTask = trackAgentCall(callAgent({
+      agent: AGENTS.supervisor,
+      systemPrompt: buildSeniorParallelSystemPrompt(),
+      input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }),
+      onRequestStatus: (requestStatus) =>
+        emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
+    }));
+  }
 
   const juniorInitialSettled = await juniorInitialTask.promise;
+  debugPipeline("junior call end", { runId, status: juniorInitialSettled.status });
   addParallelLog("Junior Dev finished");
   if (juniorInitialSettled.status === "rejected") {
-    throw new Error(`Junior Dev failed before producing file changes: ${formatAgentFailure(juniorInitialSettled.reason)}`);
+    const errorMsg = formatAgentFailure(juniorInitialSettled.reason);
+    emitStage({ agent: "junior", stage: "junior-initial", status: "error", projectPlan, partialResult: { error: errorMsg } });
+    if (seniorParallelTask) {
+      emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "error", projectPlan, partialResult: { error: "Aborted due to Junior failure." } });
+    }
+    throw new Error(`Junior Dev failed before producing file changes: ${errorMsg}`);
   }
 
   const juniorInitialOutput = juniorInitialSettled.value;
@@ -349,9 +397,15 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     }
   });
 
-  let seniorParallelSettled = await waitForTrackedAgent(seniorParallelTask, 15000);
+  let seniorParallelSettled = qaEndpointOnline
+    ? await waitForTrackedAgent(seniorParallelTask, 15000)
+    : null;
   if (!seniorParallelSettled) {
-    addParallelLog("Senior Dev still running; continuing without blocking patch pass");
+    addParallelLog(
+      qaEndpointOnline
+        ? "Senior Dev still running; continuing without blocking patch pass"
+        : "Senior Dev review skipped; continuing without QA"
+    );
   }
 
   let seniorParallelReview = "";
@@ -363,6 +417,8 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   } else if (seniorParallelSettled?.status === "rejected") {
     seniorParallelReview = `Senior Dev parallel review unavailable: ${formatAgentFailure(seniorParallelSettled.reason)}`;
     addParallelLog("Senior Dev failed; continuing with Junior Dev output");
+  } else if (!qaEndpointOnline) {
+    seniorParallelReview = qaUnavailableReason;
   } else {
     seniorParallelReview = "Senior Dev parallel review was not ready before the patch pass.";
   }
@@ -512,6 +568,9 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       seniorFinalReview = `FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- Senior Dev final review failed: ${formatAgentFailure(error)}\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.`;
       addParallelLog("Senior Dev final review failed");
     }
+  } else if (!qaEndpointOnline) {
+    seniorFinalReview = `FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- ${qaHealth.error || "QA endpoint is offline."}\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.`;
+    addParallelLog("Senior Dev final review skipped because QA endpoint is offline");
   } else {
     seniorFinalReview = "FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- Senior Dev review unavailable.\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.";
   }
@@ -538,32 +597,41 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
   emitStage({ agent: "architect", stage: "supervisor-final", status: "thinking", projectPlan });
   let pmDecision = "";
-  try {
-    pmDecision = await callAgent({
-      agent: AGENTS.architect,
-      systemPrompt: buildSupervisorFinalSystemPrompt(),
-      input: buildSupervisorFinalContext({
-        compactContext,
-        prd,
-        pmPlan,
-        qaInstructions: qaDevHandoff,
-        devOutput: finalDevOutput,
-        qaReview: seniorFinalReview,
-        qaReviewAvailable: seniorFinalReviewAvailable,
-        devLeadResult: finalLeadResult,
-        language,
-        feedback,
-        revisionBrief,
-        loopCount,
-        isExistingProjectRequest
-      }),
-      onRequestStatus: (requestStatus) =>
-        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
-    });
-    addParallelLog("Final status finished");
-  } catch (error) {
-    pmDecision = `FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSupervisor final status failed: ${formatAgentFailure(error)}`;
-    addParallelLog("Final status failed");
+  if (!qaEndpointOnline) {
+    pmDecision = "FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSenior Dev / QA was unavailable. Use deterministic verification results and manual review before completion.";
+    debugPipeline("final pm call skipped", { runId, reason: qaHealth.error || "QA endpoint is offline." });
+    addParallelLog("Final status resolved locally because QA is unavailable");
+  } else {
+    try {
+      debugPipeline("final pm call start", { runId });
+      pmDecision = await callAgent({
+        agent: AGENTS.architect,
+        systemPrompt: buildSupervisorFinalSystemPrompt(),
+        input: buildSupervisorFinalContext({
+          compactContext,
+          prd,
+          pmPlan,
+          qaInstructions: qaDevHandoff,
+          devOutput: finalDevOutput,
+          qaReview: seniorFinalReview,
+          qaReviewAvailable: seniorFinalReviewAvailable,
+          devLeadResult: finalLeadResult,
+          language,
+          feedback,
+          revisionBrief,
+          loopCount,
+          isExistingProjectRequest
+        }),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
+      });
+      debugPipeline("final pm call end", { runId });
+      addParallelLog("Final status finished");
+    } catch (error) {
+      debugPipeline("final pm call error", { runId, error: formatAgentFailure(error) });
+      pmDecision = `FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSupervisor final status failed: ${formatAgentFailure(error)}`;
+      addParallelLog("Final status failed");
+    }
   }
 
   const pmDecisionResult = buildPmResult(pmDecision, finalLeadResult.summary);
@@ -631,6 +699,11 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
 
   lastResult = pipelineResult;
+  debugPipeline("runPipeline return", {
+    runId,
+    changedFiles: finalLeadResult.affectedFiles || [],
+    qaAvailable: seniorFinalReviewAvailable
+  });
 
   return lastResult;
 }
@@ -711,7 +784,7 @@ function emitAgentRequestProgress({ emitProgress, runId, agentId, stage, status,
   });
 }
 
-async function callAgent({ agent, systemPrompt, input, onRequestStatus }) {
+async function callAgent({ agent, systemPrompt, input, onRequestStatus, allowPartialResponse = false }) {
   const requestTimeoutMs = agent.timeoutMs || REQUEST_TIMEOUT_MS;
   const endpoint = agent.endpoint || AI_ENDPOINT;
   const startedAt = Date.now();
@@ -785,6 +858,13 @@ async function callAgent({ agent, systemPrompt, input, onRequestStatus }) {
     }
 
     if (networkCode === "ETIMEDOUT") {
+      if (allowPartialResponse && String(error?.partialText || "").trim()) {
+        const partial = parseChatResponse(error.partialText);
+        if (String(partial || "").trim()) {
+          emitRequestStatus("completed", "Completed from partial response");
+          return partial;
+        }
+      }
       throw new Error(
         `${agent.name} request timed out after ${formatDuration(requestTimeoutMs)}. The model may still be generating. Try shorter context or increase timeout.`
       );
@@ -821,37 +901,50 @@ function postJson({ endpoint, headers, body, timeoutMs }) {
     const url = new URL(endpoint);
     const client = url.protocol === "https:" ? https : http;
     const payload = JSON.stringify(body);
+    const chunks = [];
+    let settled = false;
     const request = client.request(
       url,
       {
         method: "POST",
         headers: {
           ...headers,
+          Connection: "close",
           "Content-Length": Buffer.byteLength(payload)
         },
+        agent: false,
         timeout: timeoutMs
       },
       (response) => {
-        const chunks = [];
-
         response.setEncoding("utf8");
         response.on("data", (chunk) => chunks.push(chunk));
-        response.on("end", () =>
+        response.on("end", () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
           resolve({
             ok: response.statusCode >= 200 && response.statusCode < 300,
             status: response.statusCode || 0,
             text: () => Promise.resolve(chunks.join(""))
-          })
-        );
+          });
+        });
       }
     );
 
     request.on("timeout", () => {
       const error = new Error(`Request timed out after ${formatDuration(timeoutMs)}.`);
       error.code = "ETIMEDOUT";
+      error.partialText = chunks.join("");
       request.destroy(error);
     });
-    request.on("error", reject);
+    request.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    });
     request.write(payload);
     request.end();
   });
@@ -925,6 +1018,21 @@ function buildCompactContext({ input, files, language, feedback, contextDocument
   }
 
   return chunks.join("\n\n");
+}
+
+function isSingleFileHtmlSmokeRequest(input, architecture = null) {
+  const prompt = String(input || "").toLowerCase();
+  const explicitSingleFile = /single[- ]file|index\.html only|one file|single html/i.test(prompt);
+  if (!explicitSingleFile || isModernReactAppIntent(prompt)) {
+    return false;
+  }
+
+  const files = normalizeExpectedFilePaths([], architecture);
+  if (files.length === 0) {
+    return true;
+  }
+
+  return files.length === 1 && /\.html?$/i.test(files[0]);
 }
 
 function buildDocumentContextSummary(contextDocuments = [], projectFsd = null) {
@@ -1287,6 +1395,7 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
     ...extractInlineFileBlocks(output)
   ];
   const fallbackCodeFence = output.match(/```[\w+-]*\n([\s\S]*?)```/);
+  const htmlFallbackOperation = buildSingleFileHtmlFallback(output, expectedPaths);
   const jsonFileOperations = mergeByPath(
     normalizeFileOperations(parsedJson?.fileOperations),
     normalizeFileOperations(parsedJson?.operations),
@@ -1304,6 +1413,8 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
     fileOperationsFromObjectMap(nestedJson?.filesChanged)
   );
   const jsonCommands = uniqueStrings([
+    ...normalizeStringArray(parsedJson?.commandRequests),
+    ...normalizeStringArray(nestedJson?.commandRequests),
     ...normalizeStringArray(parsedJson?.commands),
     ...normalizeStringArray(nestedJson?.commands)
   ]);
@@ -1320,7 +1431,9 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
 
   const fileOperations = jsonFileOperations.length > 0
     ? jsonFileOperations
-    : fileOperationsFromPatches(normalizedPatches);
+    : htmlFallbackOperation
+      ? [htmlFallbackOperation]
+      : fileOperationsFromPatches(normalizedPatches);
   const normalizedPatchesForApply = normalizedPatches.length > 0
     ? normalizedPatches
     : fileOperations.map((operation) => ({
@@ -1348,6 +1461,34 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
     fileOperations,
     fixedCode: fileOperations[0]?.content || normalizedPatchesForApply[0]?.content || cleanCode(fallbackCodeFence?.[1] || output),
     recommendation: parsedJson?.recommendation || recommendation || output.trim()
+  };
+}
+
+function buildSingleFileHtmlFallback(output, expectedPaths = []) {
+  if (!Array.isArray(expectedPaths) || expectedPaths.length !== 1) {
+    return null;
+  }
+
+  const expectedPath = toProjectPath(expectedPaths[0]);
+  if (!expectedPath || !/\.html?$/i.test(expectedPath)) {
+    return null;
+  }
+
+  const text = String(output || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const fencedHtml = text.match(/```(?:html)?\s*([\s\S]*?)```/i);
+  const candidate = cleanCode(fencedHtml?.[1] || text);
+  if (!candidate || !/<!doctype html>|<html[\s>]/i.test(candidate)) {
+    return null;
+  }
+
+  return {
+    action: "write",
+    path: expectedPath,
+    content: candidate
   };
 }
 
@@ -2028,9 +2169,11 @@ function buildJuniorInitialSystemPrompt() {
     "Edit only listed/relevant files.",
     "Do not create extra folders. Do not rename files unless required.",
     "Do not redesign the app.",
-    "No long explanations.",
+    "Return ONLY parseable JSON.",
+    "Do not include Thinking Process, reasoning, markdown, code fences, comments, or explanations outside JSON.",
+    "Do not return partial JSON.",
     "Return machine-readable fileOperations when creating or editing files.",
-    "Max output: 800 tokens."
+    "For new-project or FSD-only tasks, output the full file content needed for each write operation."
   ].join("\n");
 }
 
@@ -2136,6 +2279,31 @@ async function waitForTrackedAgent(task, timeoutMs) {
 
 function formatAgentFailure(error) {
   return String(error?.message || error || "Unknown agent failure").trim();
+}
+
+async function getQaHealthSnapshot() {
+  try {
+    const health = await getModelHealth();
+    const supervisor = health?.supervisor || {};
+    return {
+      online: Boolean(supervisor.online),
+      error: String(supervisor.error || "").trim()
+    };
+  } catch (error) {
+    return {
+      online: false,
+      error: `QA health check failed: ${formatAgentFailure(error)}`
+    };
+  }
+}
+
+function debugPipeline(message, details = {}) {
+  try {
+    const formattedDetails = Object.keys(details).length > 0 ? ` ${JSON.stringify(details)}` : "";
+    console.error(`[trifix-runPipeline] ${message}${formattedDetails}`);
+  } catch {
+    console.error(`[trifix-runPipeline] ${message}`);
+  }
 }
 
 function mergeLeadResults(initialResult, patchResult) {
@@ -2252,9 +2420,22 @@ function buildJuniorInitialContext({
   feedback,
   revisionBrief,
   loopCount,
-  isExistingProjectRequest = false
+  isExistingProjectRequest = false,
+  singleFileHtmlMode = false
 }) {
   const intent = analyzeProjectIntent(compactContext);
+  if (singleFileHtmlMode) {
+    return [
+      trimForPrompt(compactContext, 800),
+      `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 500)}`,
+      [
+        "Create exactly one file: index.html.",
+        "Output ONLY the raw HTML code inside a ```html code fence.",
+        "Do not output JSON.",
+        "Do not include Thinking Process or hidden reasoning."
+      ].join("\n")
+    ].filter(Boolean).join("\n\n");
+  }
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 3200 : 5200),
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1200)}`,
@@ -2280,12 +2461,19 @@ function buildJuniorInitialContext({
       intent.wantsShadcn
         ? "For shadcn/ui requests, implement reusable shadcn-style component files, utility helpers, and the dependency manifest needed for them."
         : "Create reusable components only if they materially help the request.",
-      "Return JSON only:",
+      "Return ONLY valid parseable JSON.",
+      "Do not include Thinking Process.",
+      "Do not include markdown explanation.",
+      "Do not include code fences.",
+      "Do not include hidden reasoning.",
+      "Do not include partial JSON.",
+      "Use the exact top-level keys summary, fileOperations, and commandRequests.",
+      "For a single-file HTML task, write the full HTML document into index.html.",
+      "Return this exact shape:",
       "{",
-      '  "summary": "short summary",',
-      '  "fileOperations": [{ "action": "write", "path": "index.html", "content": "<!DOCTYPE html>..." }],',
-      '  "commands": [],',
-      '  "recommendation": "short recommendation"',
+      '  "summary": "Created the requested files.",',
+      '  "fileOperations": [{ "action": "write", "path": "index.html", "content": "<!doctype html>..." }],',
+      '  "commandRequests": []',
       "}"
     ].join("\n")
   ].filter(Boolean).join("\n\n");

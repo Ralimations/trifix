@@ -1,0 +1,17 @@
+{"at":"2026-05-06T08:56:58.629Z","type":"stage","stage":"pm_plan","status":"running","metadata":{"changedFiles":["dashboard/index.html"],"status":"running"}}
+{"at":"2026-05-06T08:56:58.631Z","type":"stage-detail","event":"supervisor-spec done"}
+{"at":"2026-05-06T08:57:03.656Z","type":"stage","stage":"dev","status":"running","metadata":{"status":"running"}}
+{"at":"2026-05-06T08:57:03.658Z","type":"stage-detail","event":"junior-initial started"}
+{"at":"2026-05-06T09:05:40.196Z","type":"stage-detail","event":"fileOperations parsed","fileOperations":["dashboard/index.html"],"commandRequests":[]}
+{"at":"2026-05-06T09:05:40.208Z","type":"stage","stage":"dev","status":"running","metadata":{"changedFiles":["dashboard/index.html"],"status":"running"}}
+{"at":"2026-05-06T09:05:40.212Z","type":"stage-detail","event":"junior-initial done"}
+{"at":"2026-05-06T09:05:41.036Z","type":"stage","stage":"qa","status":"running","metadata":{"status":"running"}}
+{"at":"2026-05-06T09:05:41.039Z","type":"stage-detail","event":"senior review started"}
+{"at":"2026-05-06T09:05:41.864Z","type":"stage","stage":"qa","status":"running","metadata":{"status":"running"}}
+{"at":"2026-05-06T09:05:41.867Z","type":"stage-detail","event":"senior review done"}
+{"at":"2026-05-06T09:05:41.887Z","type":"stage","stage":"patch","status":"running","metadata":{"changedFiles":["dashboard/index.html"],"status":"running"}}
+{"at":"2026-05-06T09:05:41.890Z","type":"stage-detail","event":"patch pass done"}
+{"at":"2026-05-06T09:05:41.898Z","type":"stage","stage":"final","status":"running","metadata":{"status":"running"}}
+{"at":"2026-05-06T09:05:41.901Z","type":"stage-detail","event":"final decision started"}
+{"at":"2026-05-06T09:07:59.822Z","type":"stage","stage":"final","status":"running","metadata":{"changedFiles":["dashboard/index.html"],"status":"running"}}
+{"at":"2026-05-06T09:07:59.825Z","type":"stage-detail","event":"final decision done"}

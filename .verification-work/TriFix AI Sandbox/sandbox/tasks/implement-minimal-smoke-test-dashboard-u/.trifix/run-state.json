@@ -1,0 +1,18 @@
+{
+  "runId": "2cc7d748-54d5-41c4-bdac-a063710ab84f",
+  "mode": "autonomous",
+  "status": "running",
+  "stage": "final",
+  "attempt": 0,
+  "maxAttempts": 3,
+  "taskInput": "FSD-only SmokeTest Admin Dashboard. Create a minimal single-file admin dashboard as index.html only. Use plain HTML, CSS, and JS inline. No markdown. No extra files unless required.",
+  "projectSlug": "implement-minimal-smoke-test-dashboard-u",
+  "workspacePath": "D:\\ralskunk\\trifix\\.verification-work\\TriFix AI Sandbox\\sandbox\\tasks\\implement-minimal-smoke-test-dashboard-u",
+  "changedFiles": [
+    "index.html"
+  ],
+  "lastError": "",
+  "lastValidationStatus": "",
+  "createdAt": "2026-05-07T00:23:35.885Z",
+  "updatedAt": "2026-05-07T00:28:52.431Z"
+}

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "records": [
+    {
+      "at": "2026-05-06T08:40:36.482Z",
+      "type": "planned-files",
+      "count": 1,
+      "files": [
+        "index.html"
+      ]
+    },
+    {
+      "at": "2026-05-06T08:46:18.992Z",
+      "type": "proposed-files",
+      "count": 1,
+      "files": [
+        "index.html"
+      ]
+    },
+    {
+      "at": "2026-05-06T08:46:19.003Z",
+      "type": "command-requests",
+      "count": 0
+    },
+    {
+      "at": "2026-05-06T08:46:19.852Z",
+      "type": "qa-result",
+      "qaResult": "Senior Dev parallel review unavailable: Timed out after 5000ms."
+    },
+    {
+      "at": "2026-05-06T08:46:20.676Z",
+      "type": "proposed-files",
+      "count": 1,
+      "files": [
+        "index.html"
+      ]
+    },
+    {
+      "at": "2026-05-06T08:46:20.684Z",
+      "type": "command-requests",
+      "count": 0
+    }
+  ],
+  "filesPlanned": [
+    "index.html"
+  ],
+  "updatedAt": "2026-05-06T08:46:20.684Z",
+  "filesProposed": [
+    "index.html"
+  ],
+  "commandRequests": [],
+  "qaResult": "Senior Dev parallel review unavailable: Timed out after 5000ms."
+}

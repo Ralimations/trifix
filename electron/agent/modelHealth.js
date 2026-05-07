@@ -2,7 +2,10 @@ import http from "node:http";
 import https from "node:https";
 import { AGENTS } from "../constants.js";
 
-const DEFAULT_TIMEOUT_MS = Number(process.env.TRIFIX_REQUEST_TIMEOUT_MS || 5000);
+const DEFAULT_TIMEOUT_MS = Math.min(
+  Math.max(Number(process.env.TRIFIX_HEALTH_TIMEOUT_MS || 5000) || 5000, 1000),
+  10000
+);
 
 export async function getModelHealth() {
   const entries = await Promise.all(

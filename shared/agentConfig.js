@@ -6,8 +6,9 @@ const envNumber = (value, fallback) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
-const REQUEST_TIMEOUT_MS = envNumber(ENV.TRIFIX_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS);
-
+const PM_TIMEOUT_MS = envNumber(ENV.TRIFIX_PM_TIMEOUT_MS, 180000);
+const DEV_TIMEOUT_MS = envNumber(ENV.TRIFIX_DEV_TIMEOUT_MS, 600000);
+const QA_TIMEOUT_MS = envNumber(ENV.TRIFIX_QA_TIMEOUT_MS, 180000);
 export const AGENT_CONFIGS = {
   junior: {
     id: "junior",
@@ -18,7 +19,7 @@ export const AGENT_CONFIGS = {
     summary: "uses Qwen 3.5 9B to implement scoped code changes and apply patches",
     endpoint: ENV.TRIFIX_DEV_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
     model: ENV.TRIFIX_DEV_MODEL || "qwen/qwen3.5-9b",
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    timeoutMs: DEV_TIMEOUT_MS,
     color: "blue",
     prompts: {
       system:
@@ -60,7 +61,7 @@ export const AGENT_CONFIGS = {
     summary: "reviews in parallel, predicts bugs, suggests fixes, and verifies checklist alignment",
     endpoint: ENV.TRIFIX_QA_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat",
     model: ENV.TRIFIX_QA_MODEL || "gemma-4-e4b-uncensored-hauhaucs-aggressive",
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    timeoutMs: QA_TIMEOUT_MS,
     color: "red",
     prompts: {
       system:
@@ -102,7 +103,7 @@ export const AGENT_CONFIGS = {
     summary: "routes work, creates concise specs, owns FSD/PRD alignment, and makes final decisions",
     endpoint: ENV.TRIFIX_PM_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
     model: ENV.TRIFIX_PM_MODEL || "google/gemma-4-e4b",
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    timeoutMs: PM_TIMEOUT_MS,
     color: "green",
     prompts: {
       system:
