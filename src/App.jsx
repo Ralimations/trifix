@@ -111,6 +111,11 @@ const phraseBank = {
       "Coffee break?",
       "I'm just here... thinking.",
       "I deserve a raise for this."
+    ],
+    error: [
+      "Pipeline halted. Let me check the logs.",
+      "We hit a blocker. Review needed.",
+      "Process stopped. Waiting for the fix."
     ]
   },
   junior: {
@@ -323,6 +328,12 @@ export function App() {
       if (["autonomy-complete", "autonomy-error"].includes(progress.stage)) {
         setIsRunning(false);
         setIsAutonomyRunning(false);
+        setAgents((currentAgents) =>
+          currentAgents.map((agent) => ({
+            ...agent,
+            status: progress.stage === "autonomy-error" ? "error" : "idle"
+          }))
+        );
         const outputFiles = getResultOutputFiles(progress.partialResult);
         if (progress.partialResult) {
           const generatedProject = normalizeGeneratedProject(progress.partialResult, project);
@@ -4912,7 +4923,7 @@ function countTrailingChatter(messages) {
 
 function buildChatterMessage({ agents, project, selectedFiles, timestamp }) {
   const eligibleAgents = (agents || []).filter((agent) =>
-    ["idle", "waiting", "thinking", "coding", "installing", "testing", "unpacking"].includes(agent.status)
+    ["idle", "waiting", "thinking", "coding", "installing", "testing", "unpacking", "error"].includes(agent.status)
   );
   const speaker = pickRandom(eligibleAgents);
   if (!speaker) {
@@ -5069,6 +5080,10 @@ function getStatusFallbackPhrase(status) {
     return "Still waiting...";
   }
 
+  if (status === "error") {
+    return "Pipeline encountered an error. Waiting for review.";
+  }
+
   return "";
 }
 
@@ -5083,6 +5098,10 @@ function getChatterCategory(agent) {
 
   if (agent.status === "waiting") {
     return "waiting";
+  }
+
+  if (agent.status === "error") {
+    return "error";
   }
 
   if (["coding"].includes(agent.status)) {

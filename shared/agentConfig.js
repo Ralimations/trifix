@@ -9,6 +9,12 @@ const envNumber = (value, fallback) => {
 const PM_TIMEOUT_MS = envNumber(ENV.TRIFIX_PM_TIMEOUT_MS, 180000);
 const DEV_TIMEOUT_MS = envNumber(ENV.TRIFIX_DEV_TIMEOUT_MS, 600000);
 const QA_TIMEOUT_MS = envNumber(ENV.TRIFIX_QA_TIMEOUT_MS, 180000);
+
+// Additional models available via 10.8.0.3 endpoint (VPN only):
+// google/gemma-4-e2b (Available for future fallback/cosmetic chatter support)
+// ENV.TRIFIX_CHATTER_MODEL || "google/gemma-4-e2b"
+// ENV.TRIFIX_CHATTER_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat"
+
 export const AGENT_CONFIGS = {
   junior: {
     id: "junior",
@@ -16,9 +22,9 @@ export const AGENT_CONFIGS = {
     name: "Junior Dev",
     title: "Junior Dev",
     roleLabel: "junior dev / local patch applier",
-    summary: "uses Qwen 3.5 9B to implement scoped code changes and apply patches",
+    summary: "uses DeepSeek Coder 6.7B Instruct to implement scoped code changes and apply patches",
     endpoint: ENV.TRIFIX_DEV_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
-    model: ENV.TRIFIX_DEV_MODEL || "qwen/qwen3.5-9b",
+    model: ENV.TRIFIX_DEV_MODEL || "deepseek-coder-6.7b-instruct",
     timeoutMs: DEV_TIMEOUT_MS,
     color: "blue",
     prompts: {

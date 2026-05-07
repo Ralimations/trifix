@@ -839,6 +839,22 @@ async function callAgent({ agent, systemPrompt, input, onRequestStatus, allowPar
 
     emitRequestStatus("receiving-output", "Receiving output");
     const text = await response.text();
+    
+    try {
+      const json = JSON.parse(text);
+      if (json.usage || json.usage_info || json.stats) {
+        const usage = json.usage || json.usage_info || {};
+        const stats = json.stats || {};
+        debugPipeline("agent generation stats", {
+          agent: agent.name,
+          total_output_tokens: usage.completion_tokens || usage.total_output_tokens || stats.total_output_tokens,
+          reasoning_output_tokens: usage.reasoning_tokens || usage.reasoning_output_tokens || usage.completion_tokens_details?.reasoning_tokens || stats.reasoning_output_tokens,
+          tokens_per_second: usage.tokens_per_second || usage.completion_tokens_per_second || stats.tokens_per_second,
+          time_to_first_token_seconds: stats.time_to_first_token_seconds
+        });
+      }
+    } catch {}
+
     const parsed = parseChatResponse(text);
 
     if (!parsed.trim()) {
@@ -1150,7 +1166,7 @@ function readChatText(value) {
   }
 
   if (typeof value === "string") {
-    return value;
+    return value.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
   }
 
   if (Array.isArray(value)) {
@@ -2170,7 +2186,10 @@ function buildJuniorInitialSystemPrompt() {
     "Do not create extra folders. Do not rename files unless required.",
     "Do not redesign the app.",
     "Return ONLY parseable JSON.",
-    "Do not include Thinking Process, reasoning, markdown, code fences, comments, or explanations outside JSON.",
+    "Do not think aloud.",
+    "Do not output 'Thinking Process'.",
+    "Do not output reasoning.",
+    "Return final answer only.",
     "Do not return partial JSON.",
     "Return machine-readable fileOperations when creating or editing files.",
     "For new-project or FSD-only tasks, output the full file content needed for each write operation."
