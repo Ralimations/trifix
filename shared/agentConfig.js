@@ -6,9 +6,9 @@ const envNumber = (value, fallback) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
-const PM_TIMEOUT_MS = envNumber(ENV.TRIFIX_PM_TIMEOUT_MS, 180000);
+const PM_TIMEOUT_MS = envNumber(ENV.TRIFIX_PM_TIMEOUT_MS, 1800000);
 const DEV_TIMEOUT_MS = envNumber(ENV.TRIFIX_DEV_TIMEOUT_MS, 3600000);
-const QA_TIMEOUT_MS = envNumber(ENV.TRIFIX_QA_TIMEOUT_MS, 180000);
+const QA_TIMEOUT_MS = envNumber(ENV.TRIFIX_QA_TIMEOUT_MS, 1800000);
 
 export const AGENT_CONFIGS = {
   junior: {

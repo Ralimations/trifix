@@ -11,6 +11,8 @@ $stdoutLog = Join-Path $workspaceRoot "dev.ps1.stdout.log"
 $stderrLog = Join-Path $workspaceRoot "dev.ps1.stderr.log"
 $currentStderrLog = Join-Path $workspaceRoot "dev.current.stderr.log"
 $currentStdoutLog = Join-Path $workspaceRoot "dev.current.stdout.log"
+$legacyStdoutLog = Join-Path $workspaceRoot "dev.stdout.log"
+$legacyStderrLog = Join-Path $workspaceRoot "dev.stderr.log"
 $verificationWork = Join-Path $workspaceRoot ".verification-work"
 $logWatcherScript = Join-Path $PSScriptRoot "watch-dev-log.ps1"
 
@@ -70,7 +72,7 @@ function Stop-WorkspaceProcesses {
 }
 
 function Remove-StaleLogs {
-  Remove-Item $stdoutLog, $stderrLog, $currentStdoutLog, $currentStderrLog -Force -ErrorAction SilentlyContinue
+  Remove-Item $stdoutLog, $stderrLog, $currentStdoutLog, $currentStderrLog, $legacyStdoutLog, $legacyStderrLog -Force -ErrorAction SilentlyContinue
 }
 
 function Clear-VerificationWork {
@@ -124,6 +126,7 @@ Write-Host "TriFix dev restarted from a fresh build."
 Write-Host "PID: $($process.Id)"
 Write-Host "Stdout: $stdoutLog"
 Write-Host "Stderr: $stderrLog"
+Write-Host "Current main-process stderr mirror: $currentStderrLog"
 Write-Host "Log watcher: $logWatcherScript"
 if ($CleanVerificationWork) {
   Write-Host "Verification work cleanup requested for: $verificationWork"

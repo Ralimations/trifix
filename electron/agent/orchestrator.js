@@ -19,11 +19,13 @@ import {
 } from "./runState.js";
 import {
   trackCommandRequests,
+  loadArtifactLedger,
   trackPlannedFiles,
   trackProposedFiles,
   trackQaResult
 } from "./artifactLedger.js";
 import { getAgentHealth } from "./modelHealth.js";
+import { buildBrainContext, injectBrainContext, resolveBrainCharLimit } from "./brainMemory.js";
 
 const REQUEST_TIMEOUT_MS = 1800000;
 const SPEAKING_DELAY_MS = 800;
@@ -51,10 +53,11 @@ export async function runAgentTest(payload) {
     projectRoot: payload?.projectRoot || ""
   });
 
-  const output = await callAgent({
+  const output = await callAgentWithBrain({
     agent,
     systemPrompt: buildAgentTestPrompt(agent, scenario),
-    input
+    input,
+    brainSeed: input
   });
 
   return {
@@ -77,8 +80,10 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const loopCount = Number(payload?.loopCount || 0);
   const runId = payload?.runId || randomUUID();
   const runMode = payload?.mode === "autonomous" || payload?.autonomy ? "autonomous" : "manual";
+  const executionMode = String(payload?.executionMode || payload?.preflight?.runMode || "normal").trim().toLowerCase();
+  const developerOnlyMode = executionMode === "degraded_developer_only";
   let pipelineRunPath = String(payload?.runPath || payload?.projectRoot || "").trim();
-  debugPipeline("runPipeline start", { runId, runMode, hasProjectRoot: Boolean(projectRoot) });
+  debugPipeline("runPipeline start", { runId, runMode, executionMode, hasProjectRoot: Boolean(projectRoot) });
 
   if (!input && files.length === 0 && contextDocuments.length === 0) {
     throw new Error("Add an instruction, upload context, or select at least one project file.");
@@ -91,13 +96,13 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       taskInput: input,
       mode: runMode
     });
-    await markPipelineStage(pipelineRunPath, "pm_plan", "running", {
+    await markPipelineStage(pipelineRunPath, developerOnlyMode ? "dev" : "pm_plan", "running", {
       status: "running",
       attempt: loopCount,
       maxAttempts: 3
     }, {
       type: "stage-detail",
-      event: "supervisor-spec started"
+      event: developerOnlyMode ? "developer-only started" : "supervisor-spec started"
     });
   }
 
@@ -145,19 +150,42 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       }
     });
 
-  emitStage({ agent: "architect", stage: "supervisor-spec", status: "thinking" });
-  debugPipeline("pm call start", { runId });
-  const pmPlan = await callAgent({
-    agent: AGENTS.architect,
-    systemPrompt: buildSupervisorSpecSystemPrompt(),
-    input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }),
-    onRequestStatus: (requestStatus) =>
-      emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount })
-  });
-  debugPipeline("pm call end", { runId });
-  addParallelLog("Supervisor spec created");
+  let pmPlan = "";
+  let pmArchitecture = null;
+  let projectPlan = null;
+  let qaStructureReview = null;
+  let qaInstructions = "";
+  let qaDevHandoff = "";
 
-  const pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, null, pmPlan);
+  if (developerOnlyMode) {
+    pmPlan = buildDeveloperOnlyPmPlan(input);
+    pmArchitecture = normalizePmArchitecture(null, input, null, pmPlan);
+    addParallelLog("PM planning skipped because developer-only degraded mode was selected");
+  } else {
+    emitStage({ agent: "architect", stage: "supervisor-spec", status: "thinking" });
+    const pmBrainSeed = [input, compactContext, feedback, revisionBrief].filter(Boolean).join("\n\n");
+    debugPipeline("pm call start", {
+      runId,
+      endpoint: AGENTS.architect.endpoint,
+      model: AGENTS.architect.model,
+      systemPromptLength: buildSupervisorSpecSystemPrompt().length,
+      inputLength: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }).length,
+      timeoutMs: AGENTS.architect.timeoutMs,
+      timeoutSource: AGENTS.architect.timeoutSource || "default"
+    });
+    pmPlan = await callAgentWithBrain({
+      agent: AGENTS.architect,
+      systemPrompt: buildSupervisorSpecSystemPrompt(),
+      input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }),
+      brainSeed: pmBrainSeed,
+      onRequestStatus: (requestStatus) =>
+        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount })
+    });
+    debugPipeline("pm call end", { runId });
+    addParallelLog("Supervisor spec created");
+    pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, null, pmPlan);
+  }
+
   const singleFileHtmlMode = isSingleFileHtmlSmokeRequest(input, pmArchitecture);
   if (singleFileHtmlMode) {
     pmArchitecture.fileArchitecture = [{ path: "index.html", purpose: "Single-file HTML app" }];
@@ -177,87 +205,100 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     }
   }
   const prd = buildPrd(pmPlan, contextDocuments, input, pmArchitecture);
-  const projectPlan = buildProjectPlan(prd);
-  const qaStructureReview = isExistingProjectRequest
+  projectPlan = buildProjectPlan(prd);
+  qaStructureReview = isExistingProjectRequest
     ? buildExistingProjectQaReview({ prd, files, input })
     : normalizeQaStructureReview(null, pmArchitecture);
-  const qaInstructions = formatQaStructureReview(qaStructureReview);
-  const qaDevHandoff = buildDevHandoffFromQa(qaInstructions, qaStructureReview);
+  qaInstructions = developerOnlyMode
+    ? "Developer-only degraded mode. PM planning is unavailable. Deterministic verification must be used."
+    : formatQaStructureReview(qaStructureReview);
+  qaDevHandoff = developerOnlyMode
+    ? "Developer-only degraded mode. Follow the user request exactly, create actual files, and keep scope minimal."
+    : buildDevHandoffFromQa(qaInstructions, qaStructureReview);
 
-  emitStage({
-    agent: "architect",
-    stage: "supervisor-spec",
-    status: "speaking",
-    projectPlan,
-    partialResult: {
-      architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
-      project: {
-        projectName: pmArchitecture.projectName,
-        projectSlug: pmArchitecture.projectSlug,
-        fileArchitecture: pmArchitecture.fileArchitecture,
-        implementationPlan: pmArchitecture.implementationPlan,
-        requiredFiles: pmArchitecture.requiredFiles,
-        fsd: buildFsdState(projectFsd, contextDocuments),
-        prd,
-        phases: projectPlan.phases,
-        tasks: projectPlan.tasks
+  if (!developerOnlyMode) {
+    emitStage({
+      agent: "architect",
+      stage: "supervisor-spec",
+      status: "speaking",
+      projectPlan,
+      partialResult: {
+        architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
+        project: {
+          projectName: pmArchitecture.projectName,
+          projectSlug: pmArchitecture.projectSlug,
+          fileArchitecture: pmArchitecture.fileArchitecture,
+          implementationPlan: pmArchitecture.implementationPlan,
+          requiredFiles: pmArchitecture.requiredFiles,
+          fsd: buildFsdState(projectFsd, contextDocuments),
+          prd,
+          phases: projectPlan.phases,
+          tasks: projectPlan.tasks
+        }
       }
-    }
-  });
-  await delay(SPEAKING_DELAY_MS);
+    });
+    await delay(SPEAKING_DELAY_MS);
+  }
   if (pipelineRunPath) {
     await trackPlannedFiles(pipelineRunPath, pmArchitecture?.requiredFiles || pmArchitecture?.fileArchitecture || []);
-    await markPipelineStage(pipelineRunPath, "pm_plan", "running", {
+    await markPipelineStage(pipelineRunPath, developerOnlyMode ? "dev" : "pm_plan", "running", {
       changedFiles: uniqueStrings(pmArchitecture?.requiredFiles || []),
       status: "running"
     }, {
       type: "stage-detail",
-      event: "supervisor-spec done"
+      event: developerOnlyMode ? "developer-only plan synthesized" : "supervisor-spec done"
     });
   }
-  emitStage({
-    agent: "architect",
-    stage: "supervisor-spec",
-    status: "done",
-    projectPlan,
-    partialResult: {
-      architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
-      project: {
-        projectName: pmArchitecture.projectName,
-        projectSlug: pmArchitecture.projectSlug,
-        fileArchitecture: pmArchitecture.fileArchitecture,
-        implementationPlan: pmArchitecture.implementationPlan,
-        requiredFiles: pmArchitecture.requiredFiles,
-        fsd: buildFsdState(projectFsd, contextDocuments),
-        prd,
-        phases: projectPlan.phases,
-        tasks: projectPlan.tasks
+  if (!developerOnlyMode) {
+    emitStage({
+      agent: "architect",
+      stage: "supervisor-spec",
+      status: "done",
+      projectPlan,
+      partialResult: {
+        architect: buildPmResult(pmPlan, "PM created the PRD and phase direction."),
+        project: {
+          projectName: pmArchitecture.projectName,
+          projectSlug: pmArchitecture.projectSlug,
+          fileArchitecture: pmArchitecture.fileArchitecture,
+          implementationPlan: pmArchitecture.implementationPlan,
+          requiredFiles: pmArchitecture.requiredFiles,
+          fsd: buildFsdState(projectFsd, contextDocuments),
+          prd,
+          phases: projectPlan.phases,
+          tasks: projectPlan.tasks
+        }
       }
-    }
-  });
+    });
+  }
 
   const qaInstructionResult = buildSupervisorResult(qaDevHandoff);
-  debugPipeline("qa health check start", { runId });
-  const qaHealth = await getQaHealthSnapshot();
-  debugPipeline("qa health check end", { runId, qaOnline: qaHealth.online, qaError: qaHealth.error || "" });
-  const qaEndpointOnline = qaHealth.online;
-  const qaUnavailableReason = qaEndpointOnline
-    ? ""
-    : `QA unavailable. Continuing with deterministic verification. ${qaHealth.error || "QA endpoint is offline."}`.trim();
-  emitStage({
-    agent: "supervisor",
-    stage: "senior-parallel-review",
-    status: "thinking",
-    projectPlan,
-    partialResult: {
-      supervisor: qaInstructionResult,
-      critique: qaDevHandoff.trim(),
-      qa: {
-        structureReview: qaStructureReview,
-        instructions: qaDevHandoff.trim()
+  let qaHealth = { online: false, error: "" };
+  let qaEndpointOnline = false;
+  let qaUnavailableReason = "QA skipped in developer-only degraded mode.";
+  if (!developerOnlyMode) {
+    debugPipeline("qa health check start", { runId });
+    qaHealth = await getQaHealthSnapshot();
+    debugPipeline("qa health check end", { runId, qaOnline: qaHealth.online, qaError: qaHealth.error || "" });
+    qaEndpointOnline = qaHealth.online;
+    qaUnavailableReason = qaEndpointOnline
+      ? ""
+      : `QA unavailable. Continuing with deterministic verification. ${qaHealth.error || "QA endpoint is offline."}`.trim();
+    emitStage({
+      agent: "supervisor",
+      stage: "senior-parallel-review",
+      status: "thinking",
+      projectPlan,
+      partialResult: {
+        supervisor: qaInstructionResult,
+        critique: qaDevHandoff.trim(),
+        qa: {
+          structureReview: qaStructureReview,
+          instructions: qaDevHandoff.trim()
+        }
       }
-    }
-  });
+    });
+  }
 
   addParallelLog("Junior Dev started");
   if (pipelineRunPath) {
@@ -271,20 +312,31 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   emitStage({ agent: "junior", stage: "junior-initial", status: "coding", projectPlan });
   debugPipeline("junior call start", { runId });
   const juniorSystemPrompt = buildJuniorInitialSystemPrompt();
-  const juniorInput = buildJuniorInitialContext({
-    compactContext,
-    prd,
-    pmPlan,
-    pmArchitecture,
-    qaInstructions: qaDevHandoff,
-    qaStructureReview,
-    language,
-    feedback,
-    revisionBrief,
-    loopCount,
-    isExistingProjectRequest,
-    singleFileHtmlMode
-  });
+  const juniorInput = developerOnlyMode
+    ? buildJuniorDeveloperOnlyContext({
+        compactContext,
+        pmArchitecture,
+        language,
+        feedback,
+        revisionBrief,
+        loopCount,
+        isExistingProjectRequest,
+        singleFileHtmlMode
+      })
+    : buildJuniorInitialContext({
+        compactContext,
+        prd,
+        pmPlan,
+        pmArchitecture,
+        qaInstructions: qaDevHandoff,
+        qaStructureReview,
+        language,
+        feedback,
+        revisionBrief,
+        loopCount,
+        isExistingProjectRequest,
+        singleFileHtmlMode
+      });
   
   debugPipeline("junior payload details", {
     runId,
@@ -295,10 +347,11 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     totalPayloadSize: juniorSystemPrompt.length + juniorInput.length
   });
 
-  const juniorInitialTask = trackAgentCall(callAgent({
+  const juniorInitialTask = trackAgentCall(callAgentWithBrain({
     agent: AGENTS.junior,
     systemPrompt: juniorSystemPrompt,
     input: juniorInput,
+    brainSeed: [input, compactContext, pmPlan, JSON.stringify(pmArchitecture || {})].filter(Boolean).join("\n\n"),
     allowPartialResponse: singleFileHtmlMode,
     onRequestStatus: (requestStatus) =>
       emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-initial", status: "coding", requestStatus, loopCount, projectPlan })
@@ -308,16 +361,19 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   if (qaEndpointOnline) {
     addParallelLog("Senior Dev started");
     debugPipeline("qa task create", { runId, skipped: false });
-  } else {
+  } else if (!developerOnlyMode) {
     addParallelLog("Senior Dev skipped because QA endpoint is offline");
     debugPipeline("qa skip branch", { runId, reason: qaUnavailableReason });
   }
-  emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "testing", projectPlan });
+  if (!developerOnlyMode) {
+    emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "testing", projectPlan });
+  }
   if (qaEndpointOnline) {
-    seniorParallelTask = trackAgentCall(callAgent({
+    seniorParallelTask = trackAgentCall(callAgentWithBrain({
       agent: AGENTS.supervisor,
       systemPrompt: buildSeniorParallelSystemPrompt(),
       input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }),
+      brainSeed: [input, compactContext, pmPlan, JSON.stringify(pmArchitecture || {})].filter(Boolean).join("\n\n"),
       onRequestStatus: (requestStatus) =>
         emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
     }));
@@ -424,7 +480,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
 
   const seniorParallelResult = buildSupervisorResult(seniorParallelReview);
-  if (pipelineRunPath) {
+  if (pipelineRunPath && !developerOnlyMode) {
     await markPipelineStage(pipelineRunPath, "qa", "running", {
       status: "running"
     }, {
@@ -433,45 +489,47 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     });
     await trackQaResult(pipelineRunPath, seniorParallelReview.trim());
   }
-  emitStage({
-    agent: "supervisor",
-    stage: "senior-parallel-review",
-    status: "speaking",
-    projectPlan,
-    partialResult: {
-      supervisor: seniorParallelResult,
-      critique: seniorParallelReview.trim(),
-      qa: {
-        structureReview: qaStructureReview,
-        instructions: qaDevHandoff.trim(),
-        parallelReview: seniorParallelReview.trim()
+  if (!developerOnlyMode) {
+    emitStage({
+      agent: "supervisor",
+      stage: "senior-parallel-review",
+      status: "speaking",
+      projectPlan,
+      partialResult: {
+        supervisor: seniorParallelResult,
+        critique: seniorParallelReview.trim(),
+        qa: {
+          structureReview: qaStructureReview,
+          instructions: qaDevHandoff.trim(),
+          parallelReview: seniorParallelReview.trim()
+        }
       }
+    });
+    await delay(SPEAKING_DELAY_MS);
+    if (pipelineRunPath) {
+      await markPipelineStage(pipelineRunPath, "qa", "running", {
+        status: "running"
+      }, {
+        type: "stage-detail",
+        event: "senior review done"
+      });
     }
-  });
-  await delay(SPEAKING_DELAY_MS);
-  if (pipelineRunPath) {
-    await markPipelineStage(pipelineRunPath, "qa", "running", {
-      status: "running"
-    }, {
-      type: "stage-detail",
-      event: "senior review done"
+    emitStage({
+      agent: "supervisor",
+      stage: "senior-parallel-review",
+      status: "done",
+      projectPlan,
+      partialResult: {
+        supervisor: seniorParallelResult,
+        critique: seniorParallelReview.trim(),
+        qa: {
+          structureReview: qaStructureReview,
+          instructions: qaDevHandoff.trim(),
+          parallelReview: seniorParallelReview.trim()
+        }
+      }
     });
   }
-  emitStage({
-    agent: "supervisor",
-    stage: "senior-parallel-review",
-    status: "done",
-    projectPlan,
-    partialResult: {
-      supervisor: seniorParallelResult,
-      critique: seniorParallelReview.trim(),
-      qa: {
-        structureReview: qaStructureReview,
-        instructions: qaDevHandoff.trim(),
-        parallelReview: seniorParallelReview.trim()
-      }
-    }
-  });
 
   let juniorPatchOutput = "";
   let finalLeadResult = juniorInitialLeadResult;
@@ -487,7 +545,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     }
     emitStage({ agent: "junior", stage: "junior-patch", status: "coding", projectPlan });
     try {
-      juniorPatchOutput = await callAgent({
+      juniorPatchOutput = await callAgentWithBrain({
         agent: AGENTS.junior,
         systemPrompt: buildJuniorPatchSystemPrompt(),
         input: buildJuniorPatchContext({
@@ -503,6 +561,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
           loopCount,
           isExistingProjectRequest
         }),
+        brainSeed: [input, compactContext, pmPlan, seniorParallelReview, juniorInitialOutput].filter(Boolean).join("\n\n"),
         onRequestStatus: (requestStatus) =>
           emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-patch", status: "coding", requestStatus, loopCount, projectPlan })
       });
@@ -550,15 +609,47 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   });
 
   addParallelLog("Final review started");
-  emitStage({ agent: "supervisor", stage: "senior-final-review", status: "testing", projectPlan });
+  if (!developerOnlyMode) {
+    emitStage({ agent: "supervisor", stage: "senior-final-review", status: "testing", projectPlan });
+  }
   let seniorFinalReview = "";
   let seniorFinalReviewAvailable = false;
-  if (seniorParallelAvailable) {
+  const qaArtifactLedger = pipelineRunPath
+    ? await loadArtifactLedger(pipelineRunPath).catch(() => null)
+    : null;
+  if (developerOnlyMode) {
+    seniorFinalReview = `FINAL REVIEW:
+UNAVAILABLE
+
+ISSUES:
+- Developer-only degraded mode was used because PM / Architect was unavailable.
+- QA review was skipped for this degraded run.
+
+REQUIRED FIXES:
+- none
+
+NOTE:
+Deterministic verification still applies. Manual review is required before considering this complete.`;
+    addParallelLog("Senior Dev final review skipped because developer-only degraded mode was selected");
+  } else if (seniorParallelAvailable) {
     try {
-      seniorFinalReview = await callAgent({
+      seniorFinalReview = await callAgentWithBrain({
         agent: AGENTS.supervisor,
         systemPrompt: buildSeniorFinalReviewSystemPrompt(),
-        input: buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, seniorParallelReview, finalDevOutput, finalLeadResult, feedback, revisionBrief, loopCount }),
+        input: buildSeniorFinalReviewContext({
+          compactContext,
+          prd,
+          pmPlan,
+          pmArchitecture,
+          seniorParallelReview,
+          finalDevOutput,
+          finalLeadResult,
+          artifactLedger: qaArtifactLedger,
+          feedback,
+          revisionBrief,
+          loopCount
+        }),
+        brainSeed: [input, compactContext, pmPlan, seniorParallelReview, JSON.stringify(finalLeadResult || {})].filter(Boolean).join("\n\n"),
         onRequestStatus: (requestStatus) =>
           emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-final-review", status: "testing", requestStatus, loopCount, projectPlan })
       });
@@ -575,16 +666,21 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     seniorFinalReview = "FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- Senior Dev review unavailable.\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.";
   }
 
-  emitStage({
-    agent: "supervisor",
-    stage: "senior-final-review",
-    status: "done",
-    projectPlan,
-    partialResult: {
-      supervisor: buildSupervisorResult(seniorFinalReview),
-      critique: seniorFinalReview.trim()
-    }
-  });
+  if (!developerOnlyMode) {
+    emitStage({
+      agent: "supervisor",
+      stage: "senior-final-review",
+      status: "done",
+      projectPlan,
+      partialResult: {
+        supervisor: buildSupervisorResult(seniorFinalReview),
+        critique: seniorFinalReview.trim()
+      }
+    });
+  }
+  if (pipelineRunPath && !developerOnlyMode) {
+    await trackQaResult(pipelineRunPath, seniorFinalReview.trim());
+  }
 
   addParallelLog("Final status started");
   if (pipelineRunPath) {
@@ -595,40 +691,58 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       event: "final decision started"
     });
   }
-  emitStage({ agent: "architect", stage: "supervisor-final", status: "thinking", projectPlan });
+  if (!developerOnlyMode) {
+    emitStage({ agent: "architect", stage: "supervisor-final", status: "thinking", projectPlan });
+  }
   let pmDecision = "";
+  let finalPmStatus = developerOnlyMode ? "unavailable" : "completed";
+  let finalPmError = "";
   try {
+    if (developerOnlyMode) {
+      pmDecision = `FINAL STATUS:
+NEEDS REVIEW
+
+REASON:
+Developer-only degraded mode was used. PM planning was unavailable. Generated files were preserved and manual review is required.`;
+      addParallelLog("Final PM decision skipped because developer-only degraded mode was selected");
+    } else {
     debugPipeline("final pm call start", {
       runId,
       qaAvailable: seniorFinalReviewAvailable,
-      qaEndpointOnline
+      qaEndpointOnline,
+      timeoutMs: AGENTS.architect.timeoutMs,
+      timeoutSource: AGENTS.architect.timeoutSource || "default"
     });
-    pmDecision = await callAgent({
-      agent: AGENTS.architect,
-      systemPrompt: buildSupervisorFinalSystemPrompt(),
-      input: buildSupervisorFinalContext({
-        compactContext,
-        prd,
-        pmPlan,
-        qaInstructions: qaDevHandoff,
-        devOutput: finalDevOutput,
-        qaReview: seniorFinalReview,
-        qaReviewAvailable: seniorFinalReviewAvailable,
-        devLeadResult: finalLeadResult,
-        language,
-        feedback,
-        revisionBrief,
-        loopCount,
-        isExistingProjectRequest
-      }),
-      onRequestStatus: (requestStatus) =>
-        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
-    });
-    debugPipeline("final pm call end", { runId });
-    addParallelLog("Final status finished");
+      pmDecision = await callAgentWithBrain({
+        agent: AGENTS.architect,
+        systemPrompt: buildSupervisorFinalSystemPrompt(),
+        input: buildSupervisorFinalContext({
+          compactContext,
+          prd,
+          pmPlan,
+          qaInstructions: qaDevHandoff,
+          devOutput: finalDevOutput,
+          qaReview: seniorFinalReview,
+          qaReviewAvailable: seniorFinalReviewAvailable,
+          devLeadResult: finalLeadResult,
+          language,
+          feedback,
+          revisionBrief,
+          loopCount,
+          isExistingProjectRequest
+        }),
+        brainSeed: [input, compactContext, pmPlan, seniorFinalReview, finalDevOutput].filter(Boolean).join("\n\n"),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
+      });
+      debugPipeline("final pm call end", { runId });
+      addParallelLog("Final status finished");
+    }
   } catch (error) {
-    debugPipeline("final pm call error", { runId, error: formatAgentFailure(error) });
-    pmDecision = `FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSupervisor final status failed: ${formatAgentFailure(error)}`;
+    finalPmStatus = "timed_out";
+    finalPmError = formatAgentFailure(error);
+    debugPipeline("final pm call error", { runId, error: finalPmError });
+    pmDecision = `FINAL STATUS:\nNEEDS REVIEW\n\nREASON:\nFinal PM decision unavailable: ${finalPmError}. Generated files were preserved. Manual review required.`;
     addParallelLog("Final status failed");
   }
 
@@ -660,7 +774,8 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     qaInstructions,
     qaStructureReview,
     pmPlan,
-    pmDecision
+    pmDecision,
+    executionMode
   });
   pipelineResult.parallel = {
     supervisor_spec: pmPlan,
@@ -676,15 +791,33 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     parallelReview: seniorParallelReview,
     finalReview: seniorFinalReview
   };
+  pipelineResult.finalization = {
+    pmStatus: finalPmStatus,
+    pmError: finalPmError,
+    qaStatus: developerOnlyMode
+      ? "skipped"
+      : qaEndpointOnline
+      ? (seniorFinalReviewAvailable ? "used" : "unavailable")
+      : "skipped",
+    qaUnavailable: developerOnlyMode || !qaEndpointOnline
+  };
+  pipelineResult.preflight = {
+    ...(payload?.preflight || {}),
+    runMode: executionMode || "normal"
+  };
   pipelineResult.dev = {
     ...pipelineResult.dev,
     initialImplementation: juniorInitialOutput,
     patchOutput: juniorPatchOutput
   };
 
-  emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "speaking", partialResult: pipelineResult });
-  await delay(SPEAKING_DELAY_MS);
-  emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "done", partialResult: pipelineResult });
+  if (developerOnlyMode) {
+    emitProgress({ runId, agent: "junior", stage: "decision", status: "done", partialResult: pipelineResult });
+  } else {
+    emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "speaking", partialResult: pipelineResult });
+    await delay(SPEAKING_DELAY_MS);
+    emitProgress({ runId, agent: "architect", stage: "supervisor-final", status: "done", partialResult: pipelineResult });
+  }
 
   if (pipelineRunPath) {
     await markPipelineStage(pipelineRunPath, "final", runMode === "autonomous" ? "running" : "needs_review", {
@@ -908,6 +1041,52 @@ async function callAgent({ agent, systemPrompt, input, onRequestStatus, allowPar
       }
     }
   }
+}
+
+async function callAgentWithBrain({
+  agent,
+  systemPrompt,
+  input,
+  onRequestStatus,
+  allowPartialResponse = false,
+  brainSeed = ""
+}) {
+  const role = String(agent?.id || "").trim().toLowerCase();
+  let finalInput = input;
+
+  try {
+    const roleMaxChars = resolveBrainCharLimit(role);
+    const brain = await buildBrainContext({
+      role,
+      input: brainSeed || input,
+      maxChars: roleMaxChars
+    });
+    debugPipeline("brain context", {
+      role,
+      enabled: brain.enabled,
+      brainPath: brain.path,
+      taskType: brain.taskType,
+      selectedBrainFiles: brain.selectedFiles,
+      injectedCharCount: brain.charCount,
+      maxChars: roleMaxChars,
+      warning: brain.warning || ""
+    });
+    finalInput = injectBrainContext(input, brain.text);
+  } catch (error) {
+    debugPipeline("brain context warning", {
+      role,
+      enabled: false,
+      warning: error?.message || "Brain loading failed."
+    });
+  }
+
+  return callAgent({
+    agent,
+    systemPrompt,
+    input: finalInput,
+    onRequestStatus,
+    allowPartialResponse
+  });
 }
 
 function postJson({ endpoint, headers, body, timeoutMs }) {
@@ -1752,9 +1931,10 @@ function defaultFileArchitectureForIntent(intent) {
     const minimalReactFiles = [
       { path: "package.json", purpose: "Vite React app dependencies and scripts" },
       { path: "index.html", purpose: "Vite HTML shell" },
+      { path: "vite.config.js", purpose: "Vite config with React plugin" },
       { path: "src/main.jsx", purpose: "React entry point" },
       { path: "src/App.jsx", purpose: intent?.wantsDashboard ? "React dashboard UI" : "React app shell" },
-      { path: "src/styles.css", purpose: "App styles" }
+      { path: "src/index.css", purpose: "App styles" }
     ];
 
     if (!intent?.wantsShadcn) {
@@ -1778,6 +1958,7 @@ function defaultImplementationPlanForIntent(intent, fileArchitecture) {
   if (isModernReactAppIntent(intent)) {
     const plan = [
       "Create a real Vite + React project structure with package.json and src entry files.",
+      "Ensure package.json includes react and react-dom plus vite and @vitejs/plugin-react when vite.config.js imports them.",
       intent?.wantsShadcn
         ? "Implement reusable shadcn/ui-style components and utilities instead of raw HTML controls."
         : "Implement a minimal React UI with local state and plain CSS unless more is requested.",
@@ -1807,7 +1988,7 @@ function defaultSetupCommandsForIntent(intent, fileArchitecture) {
 
 function defaultQaInstructionForIntent(intent) {
   if (isModernReactAppIntent(intent)) {
-    return "Verify the required Vite React files exist, install/build checks are listed when needed, and the result stays within the requested scope.";
+    return "Verify the required Vite React files exist, package.json includes react/react-dom plus vite and @vitejs/plugin-react when needed, install/build checks are listed when needed, and the result stays within the requested scope.";
   }
 
   return "Verify required files and FSD alignment.";
@@ -2075,7 +2256,7 @@ function buildV2Workflow({ loopCount, currentStage, projectPlan }) {
     currentStage,
     loopCount,
     decisionStatus: "pending",
-    currentPhase: projectPlan?.phases?.find((phase) => phase.status === "in_progress")?.name || "Phase 1",
+    currentPhase: projectPlan?.phases?.find((phase) => phase.status === "in_progress")?.name || "Workflow",
     currentTask: projectPlan?.tasks?.find((task) => task.status === "in_progress")?.title || "Plan current work",
     iterationCount: loopCount,
     projectStatus: "In progress",
@@ -2097,7 +2278,7 @@ function buildSupervisorResult(critique) {
   };
 }
 
-function buildPipelineResult({ explanation, critique, files, filesAnalyzed, leadResult, loopCount, project, qaInstructions, qaStructureReview, pmPlan, pmDecision }) {
+function buildPipelineResult({ explanation, critique, files, filesAnalyzed, leadResult, loopCount, project, qaInstructions, qaStructureReview, pmPlan, pmDecision, executionMode = "normal" }) {
   const pmPlanResult = buildPmResult(pmPlan, "");
   const pmDecisionResult = buildPmResult(pmDecision, "");
   const pmCommandRequests = uniqueStrings([
@@ -2133,11 +2314,12 @@ function buildPipelineResult({ explanation, critique, files, filesAnalyzed, lead
       currentStage: "decision",
       loopCount,
       decisionStatus: decisionStatus,
-      currentPhase: project?.phases?.[0]?.name || "Phase 1",
+      currentPhase: project?.phases?.[0]?.name || "Workflow",
       currentTask: project?.tasks?.find((task) => task.status !== "done")?.title || "Review decision",
       iterationCount: loopCount,
-      projectStatus: decisionStatus === "needs_patch" ? "Patch required" : "Waiting for decision",
-      commandStatus: "idle"
+      projectStatus: decisionStatus === "needs_patch" ? "Patch required" : "Ready for review",
+      commandStatus: "idle",
+      runMode: executionMode
     },
     project,
     pm: {
@@ -2188,6 +2370,7 @@ function buildSupervisorSpecSystemPrompt() {
     "Do not inject Tailwind, routing, Jest, React Testing Library, CRUD, or extra dependencies unless the user explicitly requested them.",
     "For Vite/React requests, prefer the smallest runnable file plan.",
     "If project setup commands are required, include only safe local commands such as npm install or npm run build.",
+    "Keep the output compact and do not repeat policy text or the injected brain context.",
     "Keep output under 300 tokens.",
     "Output format:",
     "TASK:",
@@ -2196,6 +2379,35 @@ function buildSupervisorSpecSystemPrompt() {
     "ACCEPTANCE:",
     "COMMAND_REQUESTS:",
     "NOTES:"
+  ].join("\n");
+}
+
+function buildDeveloperOnlyPmPlan(input) {
+  const architecture = defaultFileArchitectureForIntent(analyzeProjectIntent(input));
+  const requiredFiles = uniqueStrings(
+    architecture.map((item) => item?.path || "").filter(Boolean)
+  );
+  return [
+    "TASK:",
+    "Developer-only degraded mode. PM / Architect was unavailable.",
+    "",
+    "FILES:",
+    ...(requiredFiles.length > 0 ? requiredFiles.map((filePath) => `- ${filePath}`) : ["- Determine the minimum required files from the user request."]),
+    "",
+    "CONSTRAINTS:",
+    "- Follow the user request exactly.",
+    "- Do not add dependencies unless they are required by the requested project type.",
+    "- Manual review is required because PM planning was unavailable.",
+    "",
+    "ACCEPTANCE:",
+    "- Create actual files.",
+    "- Keep the implementation minimal and aligned with the prompt.",
+    "",
+    "COMMAND_REQUESTS:",
+    "- none",
+    "",
+    "NOTES:",
+    trimForPrompt(input, 1200)
   ].join("\n");
 }
 
@@ -2218,26 +2430,60 @@ function buildJuniorInitialSystemPrompt() {
     "Do not output reasoning.",
     "Return final answer only.",
     "Do not return partial JSON.",
-    "For new-project or FSD-only tasks, output the full file content needed for each write operation."
+    "For new-project or FSD-only tasks, output the full file content needed for each write operation.",
+    "For Vite React projects, package.json must include react, react-dom, vite, and @vitejs/plugin-react when vite.config.js imports it."
   ].join("\n");
+}
+
+function buildJuniorDeveloperOnlyContext({
+  compactContext,
+  pmArchitecture,
+  language,
+  feedback,
+  revisionBrief,
+  loopCount,
+  isExistingProjectRequest = false,
+  singleFileHtmlMode = false
+}) {
+  return [
+    trimForPrompt(compactContext, isExistingProjectRequest ? 2600 : 3800),
+    `DEVELOPER_ONLY_MODE: yes`,
+    `EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
+    `Preferred language: ${language}`,
+    feedback ? `PATCH_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 900)}` : "",
+    revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 800)}` : "",
+    [
+      "Developer-only mode: no PM plan is available. Follow the user's prompt exactly.",
+      "Return actual files only.",
+      "Keep scope minimal and do not invent extra dependencies.",
+      singleFileHtmlMode
+        ? "Create exactly one full HTML document in index.html."
+        : "If this is a Vite/React request, create a runnable multi-file Vite/React source structure.",
+      "Return fileOperations JSON or path-tagged code blocks only."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
 }
 
 function buildSeniorParallelSystemPrompt() {
   return [
     "You are Senior Dev / QA.",
     "Work in parallel with Junior Dev.",
-    "Review the Supervisor spec.",
+    "Review the Supervisor spec and any evidence provided.",
     "Predict bugs, missing requirements, edge cases, and likely implementation mistakes.",
-    "Suggest exact fixes and tests.",
+    "Do not rubber-stamp.",
+    "Do not approve based only on intent or the PM plan.",
+    "If evidence is missing, say needs_review.",
+    "Cite evidence from expected files, proposed files, known constraints, or missing evidence.",
     "Do not edit files directly. Do not rewrite the whole project.",
     "Keep output under 600 tokens.",
-    "Output format:",
-    "PASS/FAIL RISK:",
-    "RISKS:",
-    "EDGE CASES:",
-    "FILES TO CHECK:",
-    "PATCH SUGGESTIONS:",
-    "TESTS:"
+    "Return concise JSON if possible with this shape:",
+    "{",
+    '  "approved": false,',
+    '  "status": "pass" | "needs_review" | "fail",',
+    '  "issues": [{ "severity": "blocker" | "major" | "minor", "item": "string", "evidence": "string", "requiredFix": "string" }],',
+    '  "checked": ["required files", "user requirements"],',
+    '  "summary": "string"',
+    "}"
   ].join("\n");
 }
 
@@ -2257,15 +2503,31 @@ function buildJuniorPatchSystemPrompt() {
 function buildSeniorFinalReviewSystemPrompt() {
   return [
     "You are Senior Dev / QA performing final verification.",
-    "Check the final output against the original task, acceptance checklist, changed files, and known risks.",
+    "Check the final output against the original task, acceptance checklist, changed files, file evidence, artifact evidence, verifier evidence, and build evidence.",
+    "Do not rubber-stamp.",
+    "Do not approve based only on intent.",
+    "Cite evidence from the actual file list, failed operations, verifier result, build result, or file excerpts.",
+    "If evidence is missing or incomplete, return needs_review.",
+    "If verifier failed, do not approve.",
+    "If buildStatus is failed, approved must be false.",
+    "If verifierStatus is failed, approved must be false.",
+    "If dependencies are missing, approved must be false.",
+    "If required files are missing, do not approve.",
+    "If build was not run, do not say the build passed.",
+    "If Tailwind was requested, check for Tailwind setup. If Tailwind was forbidden, flag Tailwind files or directives.",
+    "If CRUD was requested, check Create, Read, Update, and Delete explicitly.",
     "Do not edit files directly. Do not output code.",
-    "Return only:",
-    "FINAL REVIEW:",
-    "PASS / NEEDS PATCH",
-    "ISSUES:",
-    "- none / issue list",
-    "REQUIRED FIXES:",
-    "- none / exact fixes"
+    "PASS only if required files exist, verifier passed, there are no failed file operations, and there is no missing requested behavior.",
+    "NEEDS_REVIEW if evidence is incomplete, build was requested but not run, or important runtime interactions cannot be proven.",
+    "FAIL if required files are missing, verifier failed, or generated files clearly violate constraints.",
+    "Return concise JSON if possible with this shape:",
+    "{",
+    '  "approved": false,',
+    '  "status": "pass" | "needs_review" | "fail",',
+    '  "issues": [{ "severity": "blocker" | "major" | "minor", "item": "string", "evidence": "string", "requiredFix": "string" }],',
+    '  "checked": ["required files", "verifier result", "build result", "user requirements"],',
+    '  "summary": "string"',
+    "}"
   ].join("\n");
 }
 
@@ -2273,6 +2535,8 @@ function buildSupervisorFinalSystemPrompt() {
   return [
     "You are the Supervisor/PM.",
     "Check if the result satisfies acceptance.",
+    "Deterministic verifier and build evidence outrank optimistic intent-based judgments.",
+    "If validation or build evidence failed, do not return PASS.",
     "If Senior Dev final review is unavailable, decide from the Junior output, changed files, and checklist. Do not fail only because the review is unavailable.",
     "Do not write code. Keep the decision short.",
     "Return only:",
@@ -2416,14 +2680,15 @@ function uniqueStrings(items) {
 }
 
 async function createRevisionBrief({ compactContext, feedback, loopCount }) {
-  const output = await callAgent({
+  const output = await callAgentWithBrain({
     agent: AGENTS.architect,
     systemPrompt:
       "Rewrite the user's denial feedback into a concise revised instruction for the DEV and QA loop. Public instruction only. Maximum four lines.",
     input: [
       trimForPrompt(compactContext, 4000),
       `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 1200)}`
-    ].join("\n\n")
+    ].join("\n\n"),
+    brainSeed: [compactContext, feedback].filter(Boolean).join("\n\n")
   });
 
   return trimForPrompt(output, 800);
@@ -2504,6 +2769,9 @@ function buildJuniorInitialContext({
         ? "For Vite/React requests, create a real package.json + src/ React app structure. Do not fall back to a static single-file page."
         : "Use the simplest valid project structure for the request.",
       isModernReactAppIntent(intent)
+        ? "If vite.config.js imports vite or @vitejs/plugin-react, package.json must include vite and @vitejs/plugin-react. Include react and react-dom as runtime dependencies."
+        : "",
+      isModernReactAppIntent(intent)
         ? `Expected file list:\n${(pmArchitecture?.requiredFiles || []).slice(0, 12).map((filePath) => `- ${filePath}`).join("\n")}`
         : "",
       intent.wantsShadcn
@@ -2512,7 +2780,7 @@ function buildJuniorInitialContext({
       "Primary output format: valid parseable JSON only.",
       "Use the exact top-level keys summary, fileOperations, and commandRequests.",
       "For a single-file HTML task, write the full HTML document into index.html.",
-      "If JSON is difficult, use only path-tagged code blocks such as ```file: package.json, ```jsx src/App.jsx, or ```css src/styles.css.",
+      "If JSON is difficult, use only path-tagged code blocks such as ```file: package.json, ```jsx src/App.jsx, or ```css src/index.css.",
       "No apology. No general suggestions. No tutorial text.",
       "Return this exact shape:",
       "{",
@@ -2524,18 +2792,189 @@ function buildJuniorInitialContext({
   ].filter(Boolean).join("\n\n");
 }
 
+function buildQaEvidenceContext({
+  originalRequest,
+  pmArchitecture,
+  leadResult,
+  artifactLedger,
+  feedback,
+  includeFileExcerpts = false
+}) {
+  const requiredFiles = uniqueStrings([
+    ...(pmArchitecture?.requiredFiles || []),
+    ...((pmArchitecture?.fileArchitecture || []).map((item) => item?.path || ""))
+  ]);
+  const proposedFiles = uniqueStrings([
+    ...(leadResult?.affectedFiles || []),
+    ...((leadResult?.fileOperations || []).map((operation) => operation?.path || ""))
+  ]);
+  const writtenFiles = uniqueStrings((artifactLedger?.filesWritten || []).map((item) => item?.path || ""));
+  const failedOperations = Array.isArray(artifactLedger?.failedOperations) ? artifactLedger.failedOperations : [];
+  const validationEvidence = extractValidationEvidence(feedback);
+  const requirementSignals = buildQaRequirementSignals(originalRequest);
+  const projectType = detectQaProjectType({ pmArchitecture, leadResult, validationEvidence, originalRequest });
+  const validationMode = detectQaValidationMode(projectType, validationEvidence);
+  const fileExcerpts = includeFileExcerpts
+    ? summarizeQaFileExcerpts(leadResult?.fileOperations || [])
+    : "Generated file excerpts not included in this phase.";
+
+  return [
+    `ORIGINAL_USER_REQUEST:\n${trimForPrompt(originalRequest, 1800)}`,
+    `PROJECT_TYPE:\n${projectType}`,
+    `VALIDATION_MODE:\n${validationMode}`,
+    `EXPECTED_FILE_LIST:\n${requiredFiles.length ? requiredFiles.map((filePath) => `- ${filePath}`).join("\n") : "- not specified"}`,
+    `PROPOSED_FILE_LIST:\n${proposedFiles.length ? proposedFiles.map((filePath) => `- ${filePath}`).join("\n") : "- none"}`,
+    `ACTUAL_WRITTEN_FILE_LIST:\n${writtenFiles.length ? writtenFiles.map((filePath) => `- ${filePath}`).join("\n") : "- not yet available in this phase"}`,
+    `FAILED_FILE_OPERATIONS:\n${failedOperations.length ? failedOperations.map((operation) => `- ${operation.path || "(unknown)"}: ${operation.error || "failed"}`).join("\n") : "- none recorded"}`,
+    `VERIFIER_RESULT:\nStatus: ${validationEvidence.verifierStatus}\n${validationEvidence.verifierSummary}`,
+    `BUILD_RESULT:\nCommand: ${validationEvidence.command}\nStatus: ${validationEvidence.commandStatus}\n${validationEvidence.outputSummary}`,
+    `REQUIREMENT_FLAGS:\n${formatQaRequirementSignals(requirementSignals)}`,
+    `GENERATED_FILE_EXCERPTS:\n${fileExcerpts}`,
+    [
+      "Evidence rules:",
+      "- If ACTUAL_WRITTEN_FILE_LIST, VERIFIER_RESULT, or BUILD_RESULT is unavailable, do not claim they passed.",
+      "- If evidence is insufficient, status must be needs_review.",
+      "- If required files are missing or verifier failed, status must be fail.",
+      "- For vite-react projects, do not treat direct index.html opening as validation evidence.",
+      "- For vite-react projects without a build result, say build unverified or needs_review."
+    ].join("\n")
+  ].join("\n\n");
+}
+
+function detectQaProjectType({ pmArchitecture, leadResult, validationEvidence, originalRequest }) {
+  const requiredFiles = uniqueStrings([
+    ...(pmArchitecture?.requiredFiles || []),
+    ...((pmArchitecture?.fileArchitecture || []).map((item) => item?.path || "")),
+    ...(leadResult?.affectedFiles || []),
+    ...((leadResult?.fileOperations || []).map((operation) => operation?.path || ""))
+  ]).map((filePath) => String(filePath || "").toLowerCase());
+  const verificationText = String(validationEvidence?.verifierSummary || "").toLowerCase();
+  const requestText = String(originalRequest || "").toLowerCase();
+
+  if (
+    requiredFiles.some((filePath) => /(^|\/)package\.json$/.test(filePath))
+    || requiredFiles.some((filePath) => /(^|\/)vite\.config\.(js|mjs|ts)$/.test(filePath))
+    || requiredFiles.some((filePath) => /(^|\/)src\/main\.(jsx|js|tsx|ts)$/.test(filePath))
+    || requiredFiles.some((filePath) => /(^|\/)src\/app\.(jsx|js|tsx|ts)$/.test(filePath))
+    || /project type:\s*vite-react/.test(verificationText)
+    || /\bvite\b/.test(requestText)
+  ) {
+    return "vite-react";
+  }
+
+  if (
+    requiredFiles.length === 1
+    && requiredFiles[0] === "index.html"
+    && !/\bvite\b/.test(requestText)
+  ) {
+    return "static-html";
+  }
+
+  if (/project type:\s*static-html/.test(verificationText)) {
+    return "static-html";
+  }
+
+  return "generic";
+}
+
+function detectQaValidationMode(projectType, validationEvidence) {
+  const command = String(validationEvidence?.command || "").trim().toLowerCase();
+  const status = String(validationEvidence?.commandStatus || "").trim().toLowerCase();
+
+  if (projectType === "vite-react") {
+    if (command !== "not_run") {
+      return status === "passed" ? "vite-build" : "vite-build-failed";
+    }
+    return "vite-structure";
+  }
+
+  if (projectType === "static-html") {
+    return "direct-html-preview";
+  }
+
+  return command !== "not_run" ? "command-validation" : "structure-validation";
+}
+
+function extractValidationEvidence(feedback) {
+  const text = String(feedback || "");
+  const verifierMatch = text.match(/Verification status:\s*([^\n\r]+)/i);
+  const commandMatch = text.match(/^Command:\s*(.+)$/im);
+  const statusMatch = text.match(/^Status:\s*(.+)$/im);
+  const outputMatch = text.match(/Output:\s*([\s\S]+)/i);
+  const verifierSummary = (() => {
+    if (!text) return "Verifier evidence not available in this phase.";
+    const start = text.search(/Verification status:/i);
+    if (start < 0) return "Verifier evidence not available in this phase.";
+    const snippet = text.slice(start, start + 1200);
+    return trimForPrompt(snippet, 900);
+  })();
+
+  return {
+    verifierStatus: verifierMatch?.[1]?.trim() || "not_run",
+    verifierSummary,
+    command: commandMatch?.[1]?.trim() || "not_run",
+    commandStatus: statusMatch?.[1]?.trim() || "not_run",
+    outputSummary: outputMatch?.[1]?.trim()
+      ? trimForPrompt(outputMatch[1], 900)
+      : "Build/validation output not available in this phase."
+  };
+}
+
+function buildQaRequirementSignals(sourceText) {
+  const text = String(sourceText || "").toLowerCase();
+  const tailwindRequested = /\btailwind\b/.test(text);
+  const tailwindForbidden = /no tailwind|without tailwind|forbid tailwind|tailwind forbidden/.test(text);
+  const crudRequested = /\bcrud\b/.test(text) || (/\bcreate\b/.test(text) && /\bread\b/.test(text) && /\bupdate\b/.test(text) && /\bdelete\b/.test(text));
+  return {
+    crudRequested,
+    tailwindRequested,
+    tailwindForbidden
+  };
+}
+
+function formatQaRequirementSignals(signals) {
+  return [
+    `- CRUD requested: ${signals.crudRequested ? "yes" : "no"}`,
+    `- Tailwind requested: ${signals.tailwindRequested ? "yes" : "no"}`,
+    `- Tailwind forbidden: ${signals.tailwindForbidden ? "yes" : "no"}`
+  ].join("\n");
+}
+
+function summarizeQaFileExcerpts(fileOperations = []) {
+  const files = (Array.isArray(fileOperations) ? fileOperations : [])
+    .filter((operation) => operation?.path && typeof operation?.content === "string")
+    .slice(0, 5);
+  if (files.length === 0) {
+    return "No generated file excerpts available.";
+  }
+
+  return files.map((operation) => [
+    `FILE: ${operation.path}`,
+    trimForPrompt(operation.content, 500)
+  ].join("\n")).join("\n\n");
+}
+
 function buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }) {
+  const evidence = buildQaEvidenceContext({
+    originalRequest: compactContext,
+    pmArchitecture,
+    leadResult: null,
+    artifactLedger: null,
+    feedback,
+    includeFileExcerpts: false
+  });
   return [
     trimForPrompt(compactContext, 6500),
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1400)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
     `LOCAL_DEV_CHECKLIST:\n${trimForPrompt(qaDevHandoff, 900)}`,
+    `QA_EVIDENCE:\n${evidence}`,
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 800)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 700)}` : "",
     [
       "You are read-only. Do not return full files.",
-      "Focus on likely Junior Dev mistakes, edge cases, and exact tests.",
+      "Focus on likely Junior Dev mistakes, edge cases, missing files, forbidden dependencies, and exact tests.",
       "Patch suggestions must be small and targeted."
     ].join("\n")
   ].filter(Boolean).join("\n\n");
@@ -2576,12 +3015,21 @@ function buildJuniorPatchContext({
   ].filter(Boolean).join("\n\n");
 }
 
-function buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, seniorParallelReview, finalDevOutput, finalLeadResult, feedback, revisionBrief, loopCount }) {
+function buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, pmArchitecture, seniorParallelReview, finalDevOutput, finalLeadResult, artifactLedger, feedback, revisionBrief, loopCount }) {
+  const evidence = buildQaEvidenceContext({
+    originalRequest: compactContext,
+    pmArchitecture,
+    leadResult: finalLeadResult,
+    artifactLedger,
+    feedback,
+    includeFileExcerpts: true
+  });
   return [
     trimForPrompt(compactContext, 4200),
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1100)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `SENIOR_PARALLEL_NOTES:\n${trimForPrompt(seniorParallelReview, 1200)}`,
+    `QA_EVIDENCE:\n${evidence}`,
     `FINAL_CHANGED_FILES:\n${(finalLeadResult.affectedFiles || []).join("\n")}`,
     `FINAL_FILE_OPERATIONS:\n${trimForPrompt(JSON.stringify(finalLeadResult.fileOperations || [], null, 2), 3200)}`,
     `FINAL_DEV_OUTPUT:\n${trimForPrompt(finalDevOutput, 2800)}`,

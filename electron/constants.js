@@ -32,6 +32,30 @@ export const QA_MODEL =
   process.env.TRIFIX_QA_MODEL || AGENT_CONFIGS.supervisor.model;
 export const REQUEST_TIMEOUT_MS = Number(process.env.TRIFIX_REQUEST_TIMEOUT_MS || 0);
 const resolveTimeout = (specificTimeout) => REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS : specificTimeout;
+const resolveTimeoutSource = (agentEnvKey) => {
+  if (REQUEST_TIMEOUT_MS > 0) {
+    return {
+      source: "env:TRIFIX_REQUEST_TIMEOUT_MS",
+      value: REQUEST_TIMEOUT_MS
+    };
+  }
+
+  if (process.env[agentEnvKey]) {
+    return {
+      source: `env:${agentEnvKey}`,
+      value: Number(process.env[agentEnvKey])
+    };
+  }
+
+  return {
+    source: "default",
+    value: 0
+  };
+};
+
+const JUNIOR_TIMEOUT_POLICY = resolveTimeoutSource("TRIFIX_DEV_TIMEOUT_MS");
+const QA_TIMEOUT_POLICY = resolveTimeoutSource("TRIFIX_QA_TIMEOUT_MS");
+const PM_TIMEOUT_POLICY = resolveTimeoutSource("TRIFIX_PM_TIMEOUT_MS");
 
 export const AGENTS = {
   ...AGENT_CONFIGS,
@@ -39,19 +63,42 @@ export const AGENTS = {
     ...AGENT_CONFIGS.junior,
     model: DEV_MODEL,
     endpoint: DEV_ENDPOINT,
-    timeoutMs: resolveTimeout(AGENT_CONFIGS.junior.timeoutMs)
+    timeoutMs: resolveTimeout(AGENT_CONFIGS.junior.timeoutMs),
+    timeoutSource: JUNIOR_TIMEOUT_POLICY.source
   },
   supervisor: {
     ...AGENT_CONFIGS.supervisor,
     model: QA_MODEL,
     endpoint: process.env.TRIFIX_SUPERVISOR_ENDPOINT || AI_ENDPOINT,
-    timeoutMs: resolveTimeout(AGENT_CONFIGS.supervisor.timeoutMs)
+    timeoutMs: resolveTimeout(AGENT_CONFIGS.supervisor.timeoutMs),
+    timeoutSource: QA_TIMEOUT_POLICY.source
   },
   architect: {
     ...AGENT_CONFIGS.architect,
     model: ARCHITECT_MODEL,
     endpoint: ARCHITECT_ENDPOINT,
-    timeoutMs: resolveTimeout(AGENT_CONFIGS.architect.timeoutMs)
+    timeoutMs: resolveTimeout(AGENT_CONFIGS.architect.timeoutMs),
+    timeoutSource: PM_TIMEOUT_POLICY.source
+  }
+};
+
+export const TIMEOUT_POLICY = {
+  requestOverride: {
+    active: REQUEST_TIMEOUT_MS > 0,
+    source: REQUEST_TIMEOUT_MS > 0 ? "env:TRIFIX_REQUEST_TIMEOUT_MS" : "none",
+    value: REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS : 0
+  },
+  architect: {
+    value: AGENTS.architect.timeoutMs,
+    source: AGENTS.architect.timeoutSource || "default"
+  },
+  junior: {
+    value: AGENTS.junior.timeoutMs,
+    source: AGENTS.junior.timeoutSource || "default"
+  },
+  supervisor: {
+    value: AGENTS.supervisor.timeoutMs,
+    source: AGENTS.supervisor.timeoutSource || "default"
   }
 };
 

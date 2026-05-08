@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Component, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Bot,
@@ -100,17 +100,15 @@ const MAX_FEASIBILITY_RETRIES = 4;
 const phraseBank = {
   general: {
     idle: [
-      "How's this project going?",
-      "Anyone seen the logs today?",
-      "I swear this worked yesterday.",
-      "I'm still stuck in this screen.",
-      "This bug fears me. I think."
+      "No new result yet.",
+      "Still monitoring the run.",
+      "Waiting for the next step.",
+      "Review data is updating."
     ],
     waiting: [
-      "Still waiting on input...",
-      "Coffee break?",
-      "I'm just here... thinking.",
-      "I deserve a raise for this."
+      "Still waiting on input.",
+      "Waiting for the next step.",
+      "No new result yet."
     ],
     error: [
       "Pipeline halted. Let me check the logs.",
@@ -119,31 +117,30 @@ const phraseBank = {
     ]
   },
   junior: {
-    idle: ["Ready to implement.", "I can wire that up.", "Please don't crash..."],
+    idle: ["Ready to implement.", "Waiting for the next step.", "Still monitoring the run."],
     thinkingSolo: [
-      "Hmm...",
       "Checking the task scope.",
-      "This looks familiar. Suspiciously familiar.",
-      "Maybe the bug is scared of me."
+      "Still monitoring the run.",
+      "No new result yet."
     ],
     askingHelp: [
       "QA, can you check this later?",
       "I think the implementation path is clear.",
       "PM scope noted."
     ],
-    coding: ["I'm coding carefully... probably.", "Typing fixes with confidence I borrowed."],
+    coding: ["Working on the current patch.", "Applying the current change set."],
     waiting: ["Holding here...", "Waiting on the next clue."]
   },
   supervisor: {
-    idle: ["Review queue is open.", "Let's keep it aligned.", "This needs a test plan."],
-    thinkingSolo: ["Let me review that.", "Checking PRD alignment.", "Reviewing DEV output..."],
+    idle: ["Review queue is open.", "Still monitoring the run.", "Waiting for the next step."],
+    thinkingSolo: ["Checking review evidence.", "Reviewing DEV output.", "No new result yet."],
     replyToJunior: ["Yeah, I'll check it later.", "Send it over.", "Not bad. Needs review.", "Hold on, I'm looking."],
     coding: ["Cleaning this up.", "Making it less fragile."],
     waiting: ["Waiting, but critically.", "Still reviewing from afar."]
   },
   architect: {
-    idle: ["Scope is ready.", "We need a clean PRD.", "This needs structure."],
-    thinkingSolo: ["Looking at the bigger picture.", "Aligning phases.", "Final decision pending."],
+    idle: ["Scope is ready.", "Waiting for the next step.", "Still monitoring the run."],
+    thinkingSolo: ["Checking final status.", "Aligning the current work.", "No new result yet."],
     encouragement: ["You guys can do it.", "Good teamwork so far.", "Keep going. Almost there.", "Let's make this production-ready."],
     coding: ["Shaping the final form.", "Trying not to overengineer this."],
     waiting: ["Waiting for the right moment.", "Holding the final call."]
@@ -201,9 +198,15 @@ export function App() {
   const [decisionPreview, setDecisionPreview] = useState([]);
   const [decisionMessage, setDecisionMessage] = useState("");
   const [modelAvailability, setModelAvailability] = useState(null);
+  const [runPreflight, setRunPreflight] = useState(null);
   const [isDecisionBusy, setIsDecisionBusy] = useState(false);
+  const [reviewFinishedState, setReviewFinishedState] = useState(null);
   const [notifications, setNotifications] = useState([]);
+  const [isRunStarting, setIsRunStarting] = useState(false);
   const currentRunRef = useRef(null);
+  const ignoredRunIdsRef = useRef(new Set());
+  const runStartPendingRef = useRef(false);
+  const userSelectedReviewTabRef = useRef(false);
   const modelAvailabilityRef = useRef(null);
   const stageMessageKeysRef = useRef(new Set());
   const messageSequenceRef = useRef(0);
@@ -220,6 +223,7 @@ export function App() {
   const selectedFileSet = useMemo(() => new Set(selectedFiles), [selectedFiles]);
   const canRun =
     !isRunning &&
+    !isRunStarting &&
     (codeInput.trim().length > 0 || selectedFiles.length > 0 || contextDocuments.length > 0);
   const messageByAgent = getAgentMessageMap(activeMessage, visibleBubble);
   const agentNameMap = useMemo(() => buildAgentNameMap(agents, agentNames), [agents, agentNames]);
@@ -231,6 +235,18 @@ export function App() {
   useEffect(() => {
     modelAvailabilityRef.current = modelAvailability;
   }, [modelAvailability]);
+
+  function updateActiveTab(nextTab, { userInitiated = false, force = false } = {}) {
+    if (userInitiated) {
+      userSelectedReviewTabRef.current = true;
+      setActiveTab(nextTab);
+      return;
+    }
+
+    if (force || !userSelectedReviewTabRef.current) {
+      setActiveTab(nextTab);
+    }
+  }
 
   useEffect(() => {
     const bridge = window.trifix;
@@ -260,7 +276,11 @@ export function App() {
       .catch(() => { });
 
     const unsubscribePipeline = bridge.onPipelineProgress((progress) => {
-      if (progress.runId !== currentRunRef.current) {
+    if (ignoredRunIdsRef.current.has(progress.runId) || progress.runId !== currentRunRef.current) {
+        console.warn("ignored late result for stale runId", {
+          runId: progress.runId,
+          activeRunId: currentRunRef.current
+        });
         return;
       }
 
@@ -290,7 +310,11 @@ export function App() {
       );
     });
     const unsubscribeAutonomy = bridge.onAutonomyProgress((progress) => {
-      if (progress.runId !== currentRunRef.current) {
+      if (ignoredRunIdsRef.current.has(progress.runId) || progress.runId !== currentRunRef.current) {
+        console.warn("ignored late result for stale runId", {
+          runId: progress.runId,
+          activeRunId: currentRunRef.current
+        });
         return;
       }
 
@@ -336,16 +360,22 @@ export function App() {
       if (["autonomy-complete", "autonomy-error"].includes(progress.stage)) {
         setIsRunning(false);
         setIsAutonomyRunning(false);
+        setIsRunStarting(false);
+        runStartPendingRef.current = false;
         const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
+        const nonFatal = hasUsefulOutput(progress.partialResult) || String(progress.status || "").toLowerCase() === "needs_review";
         setAgents((currentAgents) =>
           currentAgents.map((agent) => ({
             ...agent,
             status:
-              progress.stage === "autonomy-error"
+              progress.stage === "autonomy-error" && !nonFatal
                 ? agent.id === "supervisor" && qaUnavailable
                   ? "idle"
                   : "error"
-                : "idle"
+                : mapTerminalAgentStatus(agent.id, progress.partialResult, {
+                  qaUnavailable,
+                  runStatus: progress.status || autonomyRun?.status || "needs_review"
+                })
           }))
         );
         const outputFiles = getResultOutputFiles(progress.partialResult);
@@ -358,13 +388,13 @@ export function App() {
             setCommandLog(generatedProject.commandHistory || []);
             setProjectProcesses(generatedProject.processes || []);
           }
-          setActiveTab("decision");
+          updateActiveTab("decision");
           setActiveView("office");
         }
         pushNotification({
-          type: progress.stage === "autonomy-error" ? "error" : "success",
-          title: progress.stage === "autonomy-error" ? "Autonomy stopped" : "Task finished",
-          message: progress.stage === "autonomy-error"
+          type: progress.stage === "autonomy-error" && !nonFatal ? "error" : "success",
+          title: progress.stage === "autonomy-error" && !nonFatal ? "Autonomy stopped" : "Task finished",
+          message: progress.stage === "autonomy-error" && !nonFatal
             ? (progress.message || "The autonomous run needs review.")
             : `${outputFiles.length} file(s) changed. Output is ready for review.`
         });
@@ -498,12 +528,6 @@ export function App() {
     chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
   }, [chatMessages, visibleBubble, activeMessage]);
 
-  useEffect(() => {
-    if (activeMessage?.from) {
-      setActiveTab(activeMessage.from === "architect" ? "architect" : activeMessage.from);
-    }
-  }, [activeMessage]);
-
   useEffect(
     () => () => {
       if (chatterTimeoutRef.current) {
@@ -531,7 +555,8 @@ export function App() {
       activeMessage,
       isTyping,
       scene,
-      messageQueue
+      messageQueue,
+      workflow
     });
 
     if (!canChatter) {
@@ -1030,6 +1055,13 @@ export function App() {
     }
 
     const snapshot = await window.trifix.getAutonomyStatus(targetRunId);
+    if (ignoredRunIdsRef.current.has(targetRunId) || targetRunId !== currentRunRef.current) {
+      console.warn("ignored late result for stale runId", {
+        runId: targetRunId,
+        activeRunId: currentRunRef.current
+      });
+      return snapshot;
+    }
     if (!snapshot || snapshot.runId !== targetRunId) {
       return snapshot;
     }
@@ -1074,20 +1106,20 @@ export function App() {
     if (terminal) {
       setIsRunning(false);
       setIsAutonomyRunning(false);
+      setIsRunStarting(false);
+      runStartPendingRef.current = false;
       const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
       setAgents((currentAgents) =>
         currentAgents.map((agent) => ({
           ...agent,
-          status:
-            snapshot.status === "failed"
-              ? agent.id === "supervisor" && qaUnavailable
-                ? "idle"
-                : "error"
-              : "idle"
+          status: mapTerminalAgentStatus(agent.id, snapshot.result, {
+            qaUnavailable,
+            runStatus: snapshot.status
+          })
         }))
       );
       if (!options.silent) {
-        setActiveTab("decision");
+        updateActiveTab("decision");
         setActiveView("office");
       }
     }
@@ -1391,8 +1423,9 @@ export function App() {
     reactionCursorRef.current = 0;
     resetSpeechRuntime();
 
-    let runProject = project;
-    let runSelectedFiles = selectedFiles;
+    const explicitNewProject = isExplicitNewProjectRequest(codeInput);
+    let runProject = explicitNewProject ? null : project;
+    let runSelectedFiles = explicitNewProject ? [] : selectedFiles;
     const inlineCommand = parseInlineWorkspaceCommand(codeInput);
 
     try {
@@ -1428,7 +1461,9 @@ export function App() {
 
       setDecisionMessage(runStartMessage);
       setDecisionPreview([]);
-      setActiveTab("architect");
+      userSelectedReviewTabRef.current = false;
+      setReviewFinishedState(null);
+      updateActiveTab("architect", { force: true });
       setResult(null);
       setChatMessages([]);
       setMessageQueue([]);
@@ -1525,7 +1560,7 @@ export function App() {
         folderLoaded: Boolean(generatedProject?.rootPath || runProject?.rootPath),
         contextReady: true
       });
-      setActiveTab("decision");
+      updateActiveTab("decision");
       setActiveView("office");
       pushNotification({
         type: "success",
@@ -1557,64 +1592,78 @@ export function App() {
     }
   }
 
-  async function startAutonomousRun() {
-    if (!canRun) {
-      return;
-    }
-
+  async function runModelPreflight() {
+    console.info("preflight start");
     setError("");
-    let availability = null;
-    try {
-      const nextHealth = await window.trifix.getModelHealth();
-      availability = classifyModelAvailability(nextHealth);
-      setModelAvailability(availability);
-    } catch (healthError) {
-      const message = healthError?.message || "Could not check model availability.";
-      setError(message);
-      setDecisionMessage(message);
-      return;
-    }
+    setDecisionMessage("Initializing TriFix...");
+    setRunPreflight({
+      state: "checking",
+      activeModels: [],
+      unavailableModels: [],
+      warnings: [],
+      message: "Initializing TriFix..."
+    });
 
-    if (!availability?.canRun) {
-      const requiredOffline = [...(availability?.required || [])].find((entry) => entry.availability === "offline");
-      const message = requiredOffline
-        ? `Required model unavailable: ${requiredOffline.name} (${requiredOffline.model || "unknown model"}). Please start the model server and try again.`
-        : "Required model unavailable. Please start the model server and try again.";
-      setError(message);
-      setDecisionMessage("");
-      return;
-    }
+    const nextHealth = await window.trifix.getModelHealth();
+    const availability = classifyModelAvailability(nextHealth);
+    const nextPreflight = buildRunPreflight(availability);
+    console.info("preflight result", {
+      state: nextPreflight.state,
+      activeModels: nextPreflight.activeModels.map((entry) => entry.id),
+      unavailableModels: nextPreflight.unavailableModels.map((entry) => entry.id),
+      selectedRunMode: nextPreflight.selectedRunMode
+    });
+    setModelAvailability(availability);
+    setRunPreflight(nextPreflight);
+    setDecisionMessage(nextPreflight.message);
+    return nextPreflight;
+  }
 
-    setDecisionMessage(buildAvailabilityMessage(availability));
+  function clearRunPreflight() {
+    setRunPreflight(null);
+  }
+
+  async function queueAutonomousRun(selectedRunMode, preflight = runPreflight) {
+    setError("");
+    setDecisionMessage(buildAvailabilityMessage(preflight));
     setIsRunning(true);
     setIsAutonomyRunning(true);
     stageMessageKeysRef.current = new Set();
     reactionCursorRef.current = 0;
     resetSpeechRuntime();
 
-    const runProject = project;
+    const explicitNewProject = isExplicitNewProjectRequest(codeInput);
+    const runProject = explicitNewProject ? null : project;
     const runSelectedFiles = runProject?.rootPath ? selectedFiles : [];
     const runId =
       typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `auto-${Date.now()}`;
     currentRunRef.current = runId;
+    ignoredRunIdsRef.current.delete(runId);
     const effectiveInput = !runProject?.rootPath && taskTitle.trim()
       ? [`PROJECT_TITLE: ${taskTitle.trim()}`, codeInput].filter(Boolean).join("\n\n")
       : codeInput;
-    const runStartMessage = runProject?.rootPath
-      ? "Autonomous run queued. The backend runner will work inside this sandbox."
-      : "Autonomous run queued. The backend runner will create output files inside a new sandbox.";
+    const developerOnly = selectedRunMode === "degraded_developer_only";
+    const runStartMessage = developerOnly
+      ? "Developer-only autonomous run queued. The backend runner will generate output without PM planning."
+      : runProject?.rootPath
+        ? "Autonomous run queued. The backend runner will work inside this sandbox."
+        : "Autonomous run queued. The backend runner will create output files inside a new sandbox.";
 
+    console.info("selected run mode", selectedRunMode);
     setAutonomyRun({
       runId,
       status: "queued",
       maxRuntimeMs: 8 * 60 * 60 * 1000,
       lastStage: "queued",
       message: runStartMessage,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      preflight
     });
     setDecisionMessage(runStartMessage);
     setDecisionPreview([]);
-    setActiveTab("architect");
+    userSelectedReviewTabRef.current = false;
+    setReviewFinishedState(null);
+    updateActiveTab("architect", { force: true });
     setResult(null);
     setChatMessages([]);
     setMessageQueue([]);
@@ -1630,21 +1679,23 @@ export function App() {
     setWorkflow((current) => ({
       ...current,
       contextReady: true,
-      currentStage: "autonomy-queued",
+      currentStage: developerOnly ? "junior-initial" : "autonomy-queued",
       decisionStatus: "pending",
-      currentPhase: "Planning",
-      currentTask: "Backend autonomy queue",
-      projectStatus: "Queued",
-      commandStatus: "idle"
+      currentPhase: "Workflow",
+      currentTask: developerOnly ? "Developer-only generation" : "Backend autonomy queue",
+      projectStatus: developerOnly ? "Developer-only mode" : "Queued",
+      commandStatus: "idle",
+      runMode: selectedRunMode
     }));
+    clearRunPreflight();
     enqueueAgentMessage({
-      from: "architect",
+      from: developerOnly ? "junior" : "architect",
       to: "team",
       text: runStartMessage,
       message: runStartMessage,
       type: "status",
       priority: "high",
-      restoreState: "thinking"
+      restoreState: developerOnly ? "coding" : "thinking"
     });
 
     try {
@@ -1663,17 +1714,24 @@ export function App() {
           summary: contextDocuments.map((doc) => `${doc.name}: ${doc.summary}`).join("\n")
         },
         loopCount: workflow.loopCount || 0,
-        maxRuntimeMinutes: 480
+        maxRuntimeMinutes: 480,
+        executionMode: selectedRunMode,
+        preflight
       });
       setAutonomyRun((current) => ({
         ...(current || {}),
         ...(queuedRun || {}),
-        message: runStartMessage
+        message: runStartMessage,
+        preflight
       }));
+      setIsRunStarting(false);
+      runStartPendingRef.current = false;
       void syncAutonomyRunStatus(runId, { silent: true });
     } catch (runError) {
       setIsRunning(false);
       setIsAutonomyRunning(false);
+      setIsRunStarting(false);
+      runStartPendingRef.current = false;
       setAutonomyRun((current) => ({
         ...(current || {}),
         status: "failed",
@@ -1684,6 +1742,74 @@ export function App() {
     }
   }
 
+  async function startAutonomousRun() {
+    if (isRunning || isAutonomyRunning || isRunStarting || runStartPendingRef.current) {
+      console.warn("renderer run click ignored because active");
+      setDecisionMessage("A run is already in progress.");
+      return;
+    }
+
+    if (!canRun) {
+      return;
+    }
+
+    runStartPendingRef.current = true;
+    setIsRunStarting(true);
+    try {
+      if (window.trifix?.getAutonomyStatus) {
+        const statusSnapshot = await window.trifix.getAutonomyStatus();
+        if (statusSnapshot?.active) {
+          console.warn("renderer run click ignored because active");
+          setDecisionMessage("A run is already in progress.");
+          return;
+        }
+      }
+      await runModelPreflight();
+    } catch (healthError) {
+      const message = healthError?.message || "Could not check model availability.";
+      setError(message);
+      setDecisionMessage(message);
+      setRunPreflight({
+        state: "blocked",
+        activeModels: [],
+        unavailableModels: [],
+        warnings: [],
+        message
+      });
+    } finally {
+      setIsRunStarting(false);
+      runStartPendingRef.current = false;
+    }
+  }
+
+  async function confirmPreflightStart(selectedRunMode = runPreflight?.selectedRunMode || "normal") {
+    if (isRunning || isAutonomyRunning || isRunStarting || runStartPendingRef.current) {
+      console.warn("renderer run click ignored because active");
+      setDecisionMessage("A run is already in progress.");
+      return;
+    }
+
+    if (!runPreflight) {
+      return;
+    }
+
+    if (selectedRunMode === "degraded_developer_only") {
+      console.info("proceed anyway clicked", { runMode: selectedRunMode });
+    }
+
+    runStartPendingRef.current = true;
+    setIsRunStarting(true);
+    try {
+      await queueAutonomousRun(selectedRunMode, {
+        ...runPreflight,
+        selectedRunMode
+      });
+    } finally {
+      setIsRunStarting(false);
+      runStartPendingRef.current = false;
+    }
+  }
+
   async function stopAutonomousRun() {
     const runId = autonomyRun?.runId || currentRunRef.current;
     if (!runId) {
@@ -1691,6 +1817,7 @@ export function App() {
     }
 
     try {
+      ignoredRunIdsRef.current.add(runId);
       const stopped = await window.trifix.stopAutonomyRun(runId);
       setAutonomyRun((current) => ({
         ...(current || {}),
@@ -1702,8 +1829,11 @@ export function App() {
       if (stopped?.status === "stopped") {
         setIsRunning(false);
         setIsAutonomyRunning(false);
+        setIsRunStarting(false);
+        runStartPendingRef.current = false;
       }
     } catch (stopError) {
+      ignoredRunIdsRef.current.delete(runId);
       setDecisionMessage(stopError?.message || "Could not stop autonomous run.");
     }
   }
@@ -1801,16 +1931,16 @@ export function App() {
       });
       setDecisionMessage(
         advancePhase
-          ? `Cycle accepted. Proceed to ${planState.currentPhase}.`
+          ? "Cycle accepted. Continue to the next work unit."
           : (result?.executor?.applied?.length
               ? "Cycle finished. Junior Dev file operations were already applied."
               : "Cycle finished. No files were changed.")
       );
       pushNotification({
         type: "success",
-        title: advancePhase ? "Phase ready" : "Cycle finished",
+        title: advancePhase ? "Workflow ready" : "Cycle finished",
         message: advancePhase
-          ? `Ready for ${planState.currentPhase || "the next phase"}.`
+          ? "Ready for the next work unit."
           : `${getResultOutputFiles(result).length} file(s) are finalized.`
       });
       await wait(1100);
@@ -1994,6 +2124,88 @@ export function App() {
     }
   }
 
+  async function downloadAllReviewData() {
+    const outputProject = resultProject || project || normalizeGeneratedProject(result, null);
+    if (!outputProject?.rootPath) {
+      setDecisionMessage("No review data is available until a project output exists.");
+      return;
+    }
+
+    setIsDecisionBusy(true);
+    try {
+      const exported = await window.trifix.exportReviewData({
+        runId: autonomyRun?.runId || currentRunRef.current,
+        projectId: outputProject.projectId,
+        projectName: outputProject.projectName || outputProject.name,
+        projectRoot: outputProject.rootPath,
+        input: codeInput,
+        result,
+        workflow,
+        preflight: runPreflight || result?.preflight || autonomyRun?.preflight || null,
+        autonomyRun
+      });
+      if (exported?.cancelled) {
+        setDecisionMessage("Review data export cancelled.");
+        return;
+      }
+      setDecisionMessage(`Review data exported to ${exported.path}.`);
+      pushNotification({
+        type: "success",
+        title: "Review data exported",
+        message: exported.path
+      });
+    } catch (exportError) {
+      setDecisionMessage(exportError?.message || "Could not export review data.");
+    } finally {
+      setIsDecisionBusy(false);
+    }
+  }
+
+  async function finishReviewState() {
+    const outputProject = resultProject || project || normalizeGeneratedProject(result, null);
+    if (!outputProject?.rootPath) {
+      return;
+    }
+
+    setIsDecisionBusy(true);
+    try {
+      const finished = await window.trifix.finishReview({
+        projectId: outputProject.projectId,
+        projectRoot: outputProject.rootPath,
+        result
+      });
+      setReviewFinishedState(finished);
+      setWorkflow((current) => ({
+        ...current,
+        decisionStatus: finished?.decisionStatus || "acknowledged",
+        currentStage: "decision",
+        projectStatus: finished?.status || current.projectStatus,
+        currentTask: "Ready for next prompt"
+      }));
+      setResult((current) => current ? ({
+        ...current,
+        workflow: {
+          ...(current.workflow || {}),
+          decisionStatus: finished?.decisionStatus || "acknowledged",
+          currentStage: "decision",
+          projectStatus: finished?.status || current.workflow?.projectStatus || "Ready for next prompt",
+          currentTask: "Ready for next prompt"
+        }
+      }) : current);
+      setDecisionMessage(finished?.status || "Review finished.");
+      pushNotification({
+        type: "success",
+        title: "Review finished",
+        message: finished?.status || "Ready for next prompt."
+      });
+      await refreshTrackedProjects();
+    } catch (finishError) {
+      setDecisionMessage(finishError?.message || "Could not finish review.");
+    } finally {
+      setIsDecisionBusy(false);
+    }
+  }
+
   async function startNewTask() {
     resetTaskState({ clearProjectSelection: true });
     setActiveView("landing");
@@ -2024,8 +2236,16 @@ export function App() {
       setCommandLog(reopened.commandHistory || []);
       setProjectProcesses(reopened.processes || []);
       setProcessLogView(null);
+      setReviewFinishedState(
+        String(entry?.decisionStatus || "").toLowerCase() === "acknowledged"
+          ? { decisionStatus: "acknowledged", status: entry?.status || "Ready for next prompt" }
+          : null
+      );
       const persistedAutonomy = reopened.autonomyState || entry.autonomyState || null;
       currentRunRef.current = persistedAutonomy?.runId || "";
+      if (persistedAutonomy?.runId) {
+        ignoredRunIdsRef.current.delete(persistedAutonomy.runId);
+      }
       setAutonomyRun(persistedAutonomy ? {
         runId: persistedAutonomy.runId,
         status: persistedAutonomy.status,
@@ -2168,6 +2388,8 @@ export function App() {
     setScene(null);
     resetSpeechRuntime();
     setCodeInput("");
+    setReviewFinishedState(null);
+    userSelectedReviewTabRef.current = false;
     setAgents(agentCatalog.map((agent) => ({ ...agent, status: "idle" })));
     setWorkflow({
       folderLoaded: Boolean(project?.rootPath),
@@ -2331,65 +2553,77 @@ export function App() {
         ) : null}
 
         {activeView === "office" ? (
-          <OfficeView
-            agents={agents}
-            agentNameMap={agentNameMap}
-            project={project}
-            taskTitle={taskTitle}
-            contextDocuments={contextDocuments}
-            commandLog={commandLog}
-            processes={projectProcesses}
-            processLogView={processLogView}
-            selectedFiles={selectedFiles}
-            selectedFileSet={selectedFileSet}
-            codeInput={codeInput}
-            language={language}
-            result={result}
-            error={error}
-            isRunning={isRunning}
-            isAutonomyRunning={isAutonomyRunning}
-            autonomyRun={autonomyRun}
-            canRun={canRun}
-            workflow={workflow}
-            chatMessages={chatMessages}
-            activeMessage={activeMessage}
-            chatScrollRef={chatScrollRef}
-            onTypewriterComplete={handleTypewriterComplete}
-            activeTab={activeTab}
-            decisionPreview={decisionPreview}
-            decisionReason={decisionReason}
-            decisionMessage={decisionMessage}
-            isDecisionBusy={isDecisionBusy}
-            messageByAgent={messageByAgent}
-            onOpenProject={openProject}
-            onRefreshProject={refreshProject}
-            onCheckGraphify={checkGraphifyStatus}
-            onBuildGraphify={buildGraphifyIndex}
-            onOpenGraphify={openGraphifyView}
-            isGraphRunning={isGraphRunning}
-            onUploadContext={uploadContextDocuments}
-            onToggleFile={toggleFile}
-            onCodeInput={setCodeInput}
-            onLanguage={setLanguage}
-            onRun={startAutonomousRun}
-            onStopAutonomy={stopAutonomousRun}
-            onRunProject={() => runProjectControl("run")}
-            onOpenProcessUrl={openProcessUrl}
-            onStopProcess={stopProjectProcess}
-            onRestartProcess={restartProjectProcess}
-            onViewProcessLog={viewProjectProcessLog}
-            onCloseProcessLog={() => setProcessLogView(null)}
-            isCommandRunning={isCommandRunning}
-            isChatOpen={isChatOpen}
-            onToggleChat={() => setIsChatOpen((current) => !current)}
-            onTabChange={setActiveTab}
-            onDecisionReason={setDecisionReason}
-        onAccept={finishCycle}
-        onAcceptAndApply={previewAndApply}
-        onAdvanceCycle={proceedToNextPhase}
-        onNeedsPatch={denyDecision}
-        onDiscardOutput={discardOutputDecision}
-      />
+          <WorkspaceErrorBoundary resetKey={`${activeView}:${project?.rootPath || "none"}:${autonomyRun?.runId || "idle"}:${workflow?.decisionStatus || "pending"}`}>
+            <OfficeView
+              agents={agents}
+              agentNameMap={agentNameMap}
+              project={project}
+              taskTitle={taskTitle}
+              contextDocuments={contextDocuments}
+              commandLog={commandLog}
+              processes={projectProcesses}
+              processLogView={processLogView}
+              selectedFiles={selectedFiles}
+              selectedFileSet={selectedFileSet}
+              codeInput={codeInput}
+              language={language}
+              result={result}
+              error={error}
+              isRunning={isRunning}
+              isAutonomyRunning={isAutonomyRunning}
+              autonomyRun={autonomyRun}
+              canRun={canRun}
+              workflow={workflow}
+              chatMessages={chatMessages}
+              activeMessage={activeMessage}
+              chatScrollRef={chatScrollRef}
+              onTypewriterComplete={handleTypewriterComplete}
+              activeTab={activeTab}
+              decisionPreview={decisionPreview}
+              decisionReason={decisionReason}
+              decisionMessage={decisionMessage}
+              runPreflight={runPreflight}
+              isDecisionBusy={isDecisionBusy}
+              messageByAgent={messageByAgent}
+              onOpenProject={openProject}
+              onRefreshProject={refreshProject}
+              onCheckGraphify={checkGraphifyStatus}
+              onBuildGraphify={buildGraphifyIndex}
+              onOpenGraphify={openGraphifyView}
+              isGraphRunning={isGraphRunning}
+              onUploadContext={uploadContextDocuments}
+              onToggleFile={toggleFile}
+              onCodeInput={setCodeInput}
+              onLanguage={setLanguage}
+              onRun={startAutonomousRun}
+              onConfirmPreflightStart={confirmPreflightStart}
+              onRecheckPreflight={runModelPreflight}
+              onBackFromPreflight={() => {
+                clearRunPreflight();
+                setActiveView("landing");
+              }}
+              onStopAutonomy={stopAutonomousRun}
+              onRunProject={() => runProjectControl("run")}
+              onOpenProcessUrl={openProcessUrl}
+              onStopProcess={stopProjectProcess}
+              onRestartProcess={restartProjectProcess}
+              onViewProcessLog={viewProjectProcessLog}
+              onCloseProcessLog={() => setProcessLogView(null)}
+              isCommandRunning={isCommandRunning}
+              isChatOpen={isChatOpen}
+              onToggleChat={() => setIsChatOpen((current) => !current)}
+              onTabChange={(tab) => updateActiveTab(tab, { userInitiated: true })}
+              onDecisionReason={setDecisionReason}
+              onAccept={finishCycle}
+              onAcceptAndApply={previewAndApply}
+              onAdvanceCycle={proceedToNextPhase}
+              onNeedsPatch={denyDecision}
+              onDiscardOutput={discardOutputDecision}
+              onExportReviewData={downloadAllReviewData}
+              onFinishReview={finishReviewState}
+              reviewFinishedState={reviewFinishedState}
+            />
+          </WorkspaceErrorBoundary>
         ) : null}
 
         {activeView === "reports" ? <ReportsView result={result} testerResult={testerResult} /> : null}
@@ -2452,6 +2686,41 @@ function NotificationStack({ notifications = [], onDismiss }) {
   );
 }
 
+class WorkspaceErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidUpdate(prevProps) {
+    if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <section className="output-panel tone-red workspace-error-boundary" role="alert">
+          <div className="output-panel-header">
+            <span className="output-tab">Workspace Error</span>
+            <h2>TriFix UI crashed while rendering this view.</h2>
+          </div>
+          <div className="decision-summary">
+            <p>{this.state.error?.message || "Unknown renderer error."}</p>
+          </div>
+        </section>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 function OfficeView({
   agents,
   agentNameMap,
@@ -2480,6 +2749,7 @@ function OfficeView({
   decisionPreview,
   decisionReason,
   decisionMessage,
+  runPreflight,
   isDecisionBusy,
   messageByAgent,
   onOpenProject,
@@ -2493,6 +2763,9 @@ function OfficeView({
   onCodeInput,
   onLanguage,
   onRun,
+  onConfirmPreflightStart,
+  onRecheckPreflight,
+  onBackFromPreflight,
   onStopAutonomy,
   onRunProject,
   onOpenProcessUrl,
@@ -2509,19 +2782,22 @@ function OfficeView({
   onAcceptAndApply,
   onAdvanceCycle,
   onNeedsPatch,
-  onDiscardOutput
+  onDiscardOutput,
+  onExportReviewData,
+  onFinishReview,
+  reviewFinishedState
 }) {
   const activeAgentId = getVisibleActiveAgentId(agents, activeMessage, isRunning);
   const displayAgents = agents.map((agent) => ({
     ...agent,
     status: getDisplayAgentStatus(agent, activeMessage)
   }));
+  const workflowProgress = buildWorkflowProgress({ workflow, result, preflight: runPreflight, autonomyRun });
   const focusedSpeakerId = activeMessage && isImportantVisualMessage(activeMessage) ? activeAgentId : "";
   const showCycleReview = shouldShowCycleReview({ result, workflow, isRunning });
   const [isCycleReviewOpen, setIsCycleReviewOpen] = useState(false);
   const lastOpenedReviewKey = useRef("");
   const reviewKey = `${workflow?.loopCount || 0}:${workflow?.decisionStatus || ""}:${result?.decision?.summary || ""}`;
-  const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
   const needsPatch = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase() === "needs_patch";
 
   useEffect(() => {
@@ -2600,12 +2876,25 @@ function OfficeView({
               Stop Auto
             </button>
           ) : null}
-          <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
-            {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+          <button className="primary-button" type="button" onClick={onRun} disabled={!canRun || isAutonomyRunning || Boolean(runPreflight)}>
+            {isRunning || runPreflight?.state === "checking" ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
             Run
           </button>
         </div>
       </header>
+
+      <CompactWorkflowStepper workflow={workflow} result={result} progress={workflowProgress} preflight={runPreflight} autonomyRun={autonomyRun} />
+
+      {runPreflight ? (
+        <PreflightPanel
+          preflight={runPreflight}
+          isBusy={isRunning}
+          onStartRun={() => onConfirmPreflightStart?.(runPreflight.selectedRunMode || "normal")}
+          onProceedAnyway={() => onConfirmPreflightStart?.("degraded_developer_only")}
+          onRecheck={onRecheckPreflight}
+          onBack={onBackFromPreflight}
+        />
+      ) : null}
 
       {autonomyRun?.runId ? (
         <AutonomyStatusCard
@@ -2614,11 +2903,9 @@ function OfficeView({
           workflow={workflow}
           result={result}
           isDecisionBusy={isDecisionBusy}
-          canContinue={Boolean(nextPhase) && !needsPatch}
           onOpenChanges={openChangesReview}
-          onContinue={onAdvanceCycle}
-          onDeny={onNeedsPatch}
-          onEnd={onAccept}
+          onNeedsPatch={onNeedsPatch}
+          onDiscardOutput={onDiscardOutput}
         />
       ) : null}
       <ProcessManagerCard
@@ -2758,10 +3045,10 @@ function OfficeView({
         </div>
       </section>
 
-      <OutputBin
-        result={result}
-        activeTab={activeTab}
-        workflow={workflow}
+            <OutputBin
+              result={result}
+              activeTab={activeTab}
+              workflow={workflow}
         commandLog={commandLog}
         decisionPreview={decisionPreview}
         decisionReason={decisionReason}
@@ -3014,11 +3301,15 @@ function OutputBin({
   onAdvanceCycle,
   onNeedsPatch,
   onDiscardOutput,
+  onExportReviewData,
+  onFinishReview,
+  reviewFinishedState,
   onOpenProcessUrl,
   onStopProcess,
   onRestartProcess,
   onViewProcessLog
 }) {
+  const workflowProgress = buildWorkflowProgress({ workflow, result });
   return (
     <section className="output-section" aria-label="Output Bin">
       <div className="output-section-header">
@@ -3029,7 +3320,7 @@ function OutputBin({
         <div className="workflow-meta">
           <span>Stage: {workflow.currentStage}</span>
           <span>Loop: {workflow.loopCount}</span>
-          {workflow.currentPhase ? <span>Phase: {workflow.currentPhase}</span> : null}
+          <span>Run: {workflowProgress.summary}</span>
           {workflow.currentTask ? <span>Task: {workflow.currentTask}</span> : null}
           {workflow.commandStatus ? <span>Command: {workflow.commandStatus}</span> : null}
           <span>Decision: {workflow.decisionStatus}</span>
@@ -3088,7 +3379,7 @@ function OutputBin({
           <PrdPanel prd={result?.project?.prd} />
         ) : null}
         {activeTab === "tasks" ? (
-          <TasksPanel phases={result?.project?.phases} tasks={result?.project?.tasks} />
+          <WorkflowProgressPanel workflow={workflow} result={result} progress={workflowProgress} />
         ) : null}
         {activeTab === "logs" ? (
           <CommandLogPanel
@@ -3114,6 +3405,9 @@ function OutputBin({
             onAdvanceCycle={onAdvanceCycle}
             onNeedsPatch={onNeedsPatch}
             onDiscardOutput={onDiscardOutput}
+            onExportReviewData={onExportReviewData}
+            onFinishReview={onFinishReview}
+            reviewFinishedState={reviewFinishedState}
           />
         ) : null}
       </div>
@@ -3133,10 +3427,25 @@ function DecisionPanel({
   onAcceptAndApply,
   onAdvanceCycle,
   onNeedsPatch,
-  onDiscardOutput
+  onDiscardOutput,
+  onExportReviewData,
+  onFinishReview,
+  reviewFinishedState
 }) {
   const decision = result?.decision;
   const needsPatch = String(workflow?.decisionStatus || decision?.decisionStatus || "").toLowerCase() === "needs_patch";
+  const requiresManualReview = String(workflow?.decisionStatus || "").toLowerCase() === "manual_review_required";
+  const reviewAcknowledged = String(workflow?.decisionStatus || "").toLowerCase() === "acknowledged";
+  const canDiscard = canDiscardGeneratedOutput(result?.project, result);
+  const validationStatus = getResultValidationStatus(result);
+  const terminalReviewState =
+    reviewAcknowledged
+    || requiresManualReview
+    || needsPatch
+    || ["passed", "needs_review", "failed"].includes(validationStatus)
+    || String(result?.finalization?.pmStatus || "").trim().toLowerCase() === "timed_out";
+  const canFinishReview = terminalReviewState && hasUsefulOutput(result) && !reviewAcknowledged;
+  const override = result?.finalization?.deterministicOverride;
 
   return (
     <div className="output-panel output-decision tone-green">
@@ -3147,11 +3456,21 @@ function DecisionPanel({
 
       <div className="decision-summary">
         <h3>Summary</h3>
-        <p>{formatDecisionSummary(decision?.summary) || "No decision summary yet."}</p>
+        <p>{formatDecisionSummaryForResult(decision?.summary, result) || "No decision summary yet."}</p>
         {decision?.verdict ? (
           <>
-            <h3>PM verdict</h3>
-            <p>{formatDecisionSummary(decision.verdict)}</p>
+            <h3>{override?.applied ? "PM verdict (model)" : "PM verdict"}</h3>
+            <p>{formatDecisionSummaryForResult(decision.verdict, result)}</p>
+          </>
+        ) : null}
+        {override?.applied ? (
+          <>
+            <h3>Effective result</h3>
+            <p>
+              {override.reason === "validation_failed"
+                ? "Deterministic validation failed. Final status was overridden to needs patch."
+                : "Deterministic evidence is incomplete. Final status was overridden to needs review."}
+            </p>
           </>
         ) : null}
         {result?.project?.rootPath ? (
@@ -3159,6 +3478,7 @@ function DecisionPanel({
             {result.project.projectName || result.project.name || "Project"}: {result.project.rootPath}
           </p>
         ) : null}
+        {getProjectValidationMessage(result) ? <p>{getProjectValidationMessage(result)}</p> : null}
       </div>
 
       <div className="decision-columns">
@@ -3193,24 +3513,26 @@ function DecisionPanel({
         </div>
       </div>
 
-      <div className="decision-actions">
-        <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isDecisionBusy}>
-          <Play size={16} />
-          Proceed to Next Phase
-        </button>
-        <button className="secondary-button" type="button" onClick={onAccept} disabled={isDecisionBusy}>
-          <CheckCircle2 size={16} />
-          Finish Cycle
-        </button>
-        <button className="secondary-button" type="button" onClick={onNeedsPatch} disabled={isDecisionBusy}>
-          <XCircle size={16} />
-          Needs Patch
-        </button>
-        <button className="secondary-button danger" type="button" onClick={onDiscardOutput} disabled={isDecisionBusy}>
-          <XCircle size={16} />
-          Discard Output
-        </button>
-      </div>
+      {needsPatch || requiresManualReview ? (
+        <div className="decision-actions">
+          <button className="secondary-button" type="button" onClick={onNeedsPatch} disabled={isDecisionBusy}>
+            <XCircle size={16} />
+            Needs Patch
+          </button>
+          {canDiscard ? (
+            <button className="secondary-button danger" type="button" onClick={onDiscardOutput} disabled={isDecisionBusy}>
+              <XCircle size={16} />
+              Discard Output
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <div className="context-banner">
+          {reviewAcknowledged
+            ? (reviewFinishedState?.status || "Review finished. Ready for the next prompt.")
+            : "Output generated. Review it or send another prompt to patch or extend this project."}
+        </div>
+      )}
 
       <label className="deny-reason">
         <span>Patch request / correction feedback</span>
@@ -3249,30 +3571,178 @@ function DecisionPanel({
           <span>Manual review required.</span>
         </div>
       ) : null}
+      <div className="decision-actions">
+        <button className="secondary-button" type="button" onClick={onExportReviewData} disabled={isDecisionBusy}>
+          <FilePlus2 size={16} />
+          Download All Review Data
+        </button>
+        {canFinishReview ? (
+          <button className="primary-button" type="button" onClick={onFinishReview} disabled={isDecisionBusy}>
+            <CheckCircle2 size={16} />
+            Finish Review
+          </button>
+        ) : null}
+      </div>
+      <p className="decision-footnote">
+        Finish Review closes this run state. It does not change files or mark failed validation as passed.
+      </p>
     </div>
   );
 }
 
 function CycleReviewLauncher({ result, workflow, onOpen }) {
   const affectedFiles = result?.decision?.affectedFiles || [];
-  const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
   const needsPatch = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase() === "needs_patch";
 
   return (
     <button className="cycle-review-launcher" type="button" onClick={onOpen} aria-label="Open cycle review">
       <span>
         <strong>{needsPatch ? "Patch required" : "Cycle ready"}</strong>
-        <small>{affectedFiles.length} file(s) affected{nextPhase ? ` - Next: ${nextPhase}` : ""}</small>
+        <small>{affectedFiles.length} file(s) affected - Ready for review</small>
       </span>
       <CheckCircle2 size={18} />
     </button>
   );
 }
 
+function CompactWorkflowStepper({ workflow, result, progress, preflight, autonomyRun }) {
+  const summary = preflight?.state === "checking"
+    ? "Initializing TriFix..."
+    : preflight?.message || progress.summary;
+
+  return (
+    <section className="output-panel tone-blue workflow-hero-panel" aria-label="Run progress">
+      <div className="output-panel-header">
+        <span className="output-tab">Run Progress</span>
+        <h2>Workflow</h2>
+      </div>
+      <div className="workflow-hero-summary">
+        <p>{summary}</p>
+        {autonomyRun?.runId ? <p className="project-path">{autonomyRun.runId}</p> : null}
+      </div>
+      <div className="workflow-stepper-shell">
+        <ul className="workflow-stepper-list" role="list" aria-label="Workflow steps">
+          {progress.steps.map((step) => (
+            <li key={step.key} className={`workflow-step ${step.state}`}>
+              <div className="workflow-step-node">
+                <span className="workflow-step-state-icon">{renderWorkflowStepIcon(step.state)}</span>
+              </div>
+              <div className="workflow-step-copy">
+                <strong>{step.label}</strong>
+                <span className="workflow-step-badge">{formatWorkflowStepState(step.state)}</span>
+                {step.note ? <small>{step.note}</small> : null}
+              </div>
+              <div className="workflow-step-connector" aria-hidden="true" />
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  );
+}
+
+function PreflightPanel({ preflight, isBusy, onStartRun, onProceedAnyway, onRecheck, onBack }) {
+  if (!preflight) {
+    return null;
+  }
+
+  const showStart = ["ready", "ready_with_warnings", "normal_qa_unavailable"].includes(preflight.state);
+  const showProceedAnyway = preflight.state === "degraded_available";
+  const showRecheck = preflight.state !== "checking";
+  const showBack = preflight.state !== "checking";
+
+  return (
+    <section className="output-panel tone-green preflight-panel" aria-label="TriFix initialization">
+      <div className="output-panel-header">
+        <span className="output-tab">Initialization</span>
+        <h2>Initializing TriFix...</h2>
+      </div>
+      <div className="decision-summary preflight-summary">
+        <p>{preflight.message}</p>
+      </div>
+      <div className="preflight-grid">
+        <div>
+          <h3>Active models</h3>
+          <div className="preflight-model-list">
+            {(preflight.activeModels || []).length > 0
+              ? preflight.activeModels.map((entry) => (
+                <article key={entry.id} className="preflight-model-card active">
+                  <div className="preflight-model-card-head">
+                    <strong>{entry.name}</strong>
+                    <span className="preflight-status-badge active">{formatAvailabilityBadge(entry)}</span>
+                  </div>
+                  <span>{entry.model}</span>
+                  <code>{entry.endpoint}</code>
+                  <small>{formatHealthAttempts(entry)}</small>
+                </article>
+              ))
+              : <p className="preflight-empty">None yet.</p>}
+          </div>
+        </div>
+        <div>
+          <h3>Unavailable models</h3>
+          <div className="preflight-model-list">
+            {(preflight.unavailableModels || []).length > 0
+              ? preflight.unavailableModels.map((entry) => (
+                <article key={entry.id} className="preflight-model-card unavailable">
+                  <div className="preflight-model-card-head">
+                    <strong>{entry.name}</strong>
+                    <span className={`preflight-status-badge ${String(entry.classification || "").toLowerCase()}`}>{formatAvailabilityBadge(entry)}</span>
+                  </div>
+                  <span>{entry.model}</span>
+                  <code>{entry.endpoint}</code>
+                  <small>{formatHealthAttempts(entry)}</small>
+                  <p>{buildUnavailableModelMessage(entry, { allowDeveloperOnly: true })}</p>
+                  <small>{getSuggestedFix(entry)}</small>
+                </article>
+              ))
+              : <p className="preflight-empty">None.</p>}
+          </div>
+        </div>
+      </div>
+      {(preflight.warnings || []).length > 0 ? (
+        <div className="context-banner preflight-warning-banner">
+          {preflight.warnings.join(" ")}
+        </div>
+      ) : null}
+      <div className="preflight-recommended-mode">
+        <strong>Recommended mode</strong>
+        <span>{formatRunModeLabel(preflight.selectedRunMode)}</span>
+      </div>
+      <div className="decision-actions">
+        {showStart ? (
+          <button className="primary-button" type="button" onClick={onStartRun} disabled={isBusy}>
+            <Play size={16} />
+            Start Run
+          </button>
+        ) : null}
+        {showProceedAnyway ? (
+          <button className="primary-button" type="button" onClick={onProceedAnyway} disabled={isBusy}>
+            <Play size={16} />
+            Proceed Anyway
+          </button>
+        ) : null}
+        {showRecheck ? (
+          <button className="secondary-button" type="button" onClick={onRecheck} disabled={isBusy}>
+            <RefreshCw size={16} />
+            Recheck Models
+          </button>
+        ) : null}
+        {showBack ? (
+          <button className="secondary-button" type="button" onClick={onBack} disabled={isBusy}>
+            <ChevronRight size={16} />
+            Back to Landing
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCycle, onNeedsPatch, onDiscardOutput, onClose }) {
   const affectedFiles = result?.decision?.affectedFiles || [];
-  const nextPhase = getUpcomingPhaseName(result?.project?.phases || []);
   const needsPatch = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase() === "needs_patch";
+  const workflowProgress = buildWorkflowProgress({ workflow, result });
 
   return (
     <section className="cycle-review-card" aria-label="Cycle review">
@@ -3282,7 +3752,7 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
           <h2>{formatDecisionHeadline(result?.decision?.summary) || "Cycle finished and is ready for review."}</h2>
         </div>
         <div className="cycle-review-header-actions">
-          <span className="cycle-review-badge">{workflow.currentPhase || result?.project?.phases?.[0]?.name || "Phase 1"}</span>
+          <span className="cycle-review-badge">{workflowProgress.summary}</span>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close cycle review">
             <XCircle size={18} />
           </button>
@@ -3314,12 +3784,12 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
       <div className="cycle-review-footer">
         <div className="cycle-review-meta">
           <span>{affectedFiles.length} file(s) affected</span>
-          <span>{nextPhase ? `Next: ${nextPhase}` : "No next phase planned"}</span>
+          <span>{workflowProgress.summary}</span>
         </div>
         <div className="decision-actions">
-          <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isBusy || !nextPhase || needsPatch}>
+          <button className="primary-button" type="button" onClick={onAdvanceCycle} disabled={isBusy || needsPatch}>
             <Play size={16} />
-            Proceed to Next Phase
+            Continue Workflow
           </button>
           <button className="secondary-button" type="button" onClick={onFinishCycle} disabled={isBusy || needsPatch}>
             <CheckCircle2 size={16} />
@@ -3360,15 +3830,41 @@ function PrdPanel({ prd }) {
   );
 }
 
-function TasksPanel({ phases = [], tasks = [] }) {
+function WorkflowProgressPanel({ workflow, result, progress }) {
   return (
     <div className="output-panel tone-blue">
       <div className="output-panel-header">
-        <span className="output-tab">Plan</span>
-        <h2>Phases and tasks</h2>
+        <span className="output-tab">Progress</span>
+        <h2>Workflow Progress</h2>
       </div>
-      <SectionList title="Phases" items={phases.map((phase) => `${phase.name} - ${phase.status}`)} />
-      <SectionList title="Tasks" items={tasks.map((task) => `${task.phase}: ${task.title} - ${task.status}`)} />
+      <div className="section-list">
+        <h3>Current Status</h3>
+        <ul>
+          <li>{formatWorkflowStepper(progress.steps)}</li>
+          <li>{progress.summary}</li>
+          {workflow.currentTask ? <li>Current task: {workflow.currentTask}</li> : null}
+          {workflow.projectStatus ? <li>Run status: {workflow.projectStatus}</li> : null}
+          {progress.verificationNote ? <li>{progress.verificationNote}</li> : null}
+          {progress.finalizationNote ? <li>{progress.finalizationNote}</li> : null}
+        </ul>
+      </div>
+      <div className="section-list">
+        <h3>Workflow Steps</h3>
+        <ul>
+          {progress.steps.map((step) => (
+            <li key={step.key}>
+              {step.label} - {formatWorkflowStepState(step.state)}
+              {step.note ? ` (${step.note})` : ""}
+            </li>
+          ))}
+        </ul>
+      </div>
+      {Array.isArray(result?.project?.tasks) && result.project.tasks.length > 0 ? (
+        <SectionList
+          title="Planned Work Items"
+          items={result.project.tasks.map((task) => `${task.phase || "Workflow"}: ${task.title} - ${task.status}`)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -3548,18 +4044,17 @@ function AutonomyStatusCard({
   workflow,
   result,
   isDecisionBusy,
-  canContinue,
   onOpenChanges,
-  onContinue,
-  onDeny,
-  onEnd
+  onNeedsPatch,
+  onDiscardOutput
 }) {
   const status = autonomyRun?.status || "idle";
   const detail = autonomyRun?.message || autonomyRun?.error || autonomyRun?.lastStage || "Backend autonomy runner is idle.";
   const deadline = autonomyRun?.deadlineAt ? `Deadline: ${formatTimestamp(autonomyRun.deadlineAt)}` : "";
   const runtime = autonomyRun?.maxRuntimeMs ? `Limit: ${Math.round(autonomyRun.maxRuntimeMs / 60000)} min` : "";
   const decisionState = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").toLowerCase();
-  const showDecisionActions = !isRunning && ["waiting_for_decision", "blocked"].includes(status);
+  const showReviewActions = !isRunning && (status === "blocked" || ["needs_patch", "manual_review_required"].includes(decisionState));
+  const canDiscard = canDiscardGeneratedOutput(result?.project, result);
 
   return (
     <section className={`autonomy-status-card ${isRunning ? "running" : ""}`} aria-label="Autonomy status">
@@ -3567,24 +4062,22 @@ function AutonomyStatusCard({
         <span className="output-tab">Autonomy</span>
         <strong>{formatAutonomyStatus(status)}</strong>
         <p>{detail}</p>
-        {showDecisionActions ? (
+        {showReviewActions ? (
           <div className="button-row">
             <button className="secondary-button" type="button" onClick={onOpenChanges} disabled={isDecisionBusy}>
               <Eye size={16} />
               Open Changes
             </button>
-            <button className="primary-button" type="button" onClick={onContinue} disabled={isDecisionBusy || !canContinue}>
-              <Play size={16} />
-              Continue
-            </button>
-            <button className="secondary-button" type="button" onClick={onDeny} disabled={isDecisionBusy}>
+            <button className="secondary-button" type="button" onClick={onNeedsPatch} disabled={isDecisionBusy}>
               <XCircle size={16} />
-              Deny
+              Needs Patch
             </button>
-            <button className="secondary-button danger" type="button" onClick={onEnd} disabled={isDecisionBusy || decisionState === "needs_patch"}>
-              <CheckCircle2 size={16} />
-              End
-            </button>
+            {canDiscard ? (
+              <button className="secondary-button danger" type="button" onClick={onDiscardOutput} disabled={isDecisionBusy}>
+                <XCircle size={16} />
+                Discard Output
+              </button>
+            ) : null}
           </div>
         ) : null}
         {deadline || runtime ? <p>{[runtime, deadline].filter(Boolean).join(" · ")}</p> : null}
@@ -3710,6 +4203,9 @@ function ReportsView({ result, testerResult }) {
         onAdvanceCycle={() => { }}
         onNeedsPatch={() => { }}
         onDiscardOutput={() => { }}
+        onExportReviewData={() => { }}
+        onFinishReview={() => { }}
+        reviewFinishedState={null}
       />
     </section>
   );
@@ -4587,12 +5083,277 @@ function getResultOutputFiles(result) {
   ]).filter(Boolean);
 }
 
+function hasUsefulOutput(result) {
+  return getResultOutputFiles(result).length > 0;
+}
+
+const WORKFLOW_STEP_LABELS = {
+  planning: "Planning",
+  qa: "QA Check",
+  development: "Development",
+  verification: "Verification",
+  finalReview: "Final Review",
+  decision: "Decision"
+};
+
+function buildWorkflowProgress({ workflow, result, preflight = null, autonomyRun = null }) {
+  const currentStage = String(workflow?.currentStage || "").trim().toLowerCase();
+  const decisionStatus = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").trim().toLowerCase();
+  const validationStatus = getResultValidationStatus(result);
+  const qaStatus = getResultQaStatus(result);
+  const finalPmStatus = String(result?.finalization?.pmStatus || "").trim().toLowerCase();
+  const runMode = String(result?.preflight?.runMode || workflow?.runMode || preflight?.selectedRunMode || preflight?.runMode || "").trim().toLowerCase();
+  const hasOutput = hasUsefulOutput(result);
+  const activeKey = mapStageToWorkflowStep(currentStage, workflow, result);
+  const order = ["planning", "qa", "development", "verification", "finalReview", "decision"];
+  const activeIndex = currentStage === "autonomy-queued" || preflight?.state === "checking"
+    ? -1
+    : Math.max(order.indexOf(activeKey), 0);
+  const steps = order.map((key, index) => ({
+    key,
+    label: WORKFLOW_STEP_LABELS[key],
+    state: activeIndex < 0 ? "pending" : index < activeIndex ? "complete" : index === activeIndex ? "active" : "pending",
+    note: ""
+  }));
+
+  if (preflight?.state === "checking") {
+    setWorkflowStepState(steps, "planning", "pending", "initialization in progress");
+  }
+
+  if (qaStatus === "skipped") {
+    setWorkflowStepState(steps, "qa", "skipped", "optional QA unavailable");
+  } else if (qaStatus === "complete") {
+    setWorkflowStepState(steps, "qa", "complete");
+  }
+
+  if (hasOutput) {
+    setWorkflowStepState(steps, "development", "complete");
+  }
+
+  if (runMode === "degraded_developer_only") {
+    setWorkflowStepState(steps, "planning", "skipped", "PM unavailable");
+    setWorkflowStepState(steps, "qa", "skipped", "developer-only mode");
+    if (!hasOutput) {
+      setWorkflowStepState(steps, "development", activeKey === "development" ? "active" : "pending", "developer-only mode");
+    }
+  }
+
+  if (validationStatus === "passed") {
+    setWorkflowStepState(steps, "verification", "complete", "verifier passed");
+  } else if (validationStatus === "needs_review") {
+    setWorkflowStepState(steps, "verification", "needs_review", "build unverified");
+  } else if (validationStatus === "failed") {
+    setWorkflowStepState(steps, "verification", "failed", "verifier or build failed");
+  }
+
+  if (finalPmStatus === "timed_out") {
+    setWorkflowStepState(steps, "finalReview", "needs_review", "final PM timeout");
+    setWorkflowStepState(steps, "decision", "needs_review", "manual review required");
+  } else if (["accepted", "acknowledged"].includes(decisionStatus) || String(workflow?.projectStatus || "").toLowerCase().includes("cycle finished")) {
+    setWorkflowStepState(steps, "decision", "complete");
+  } else if (decisionStatus === "needs_patch" || decisionStatus === "manual_review_required") {
+    setWorkflowStepState(steps, "decision", "needs_review");
+  } else if (validationStatus === "failed" && !hasOutput) {
+    setWorkflowStepState(steps, "decision", "failed");
+  } else if (hasOutput && (validationStatus === "needs_review" || qaStatus === "skipped" || finalPmStatus === "timed_out")) {
+    setWorkflowStepState(steps, "decision", "needs_review");
+  }
+
+  return {
+    steps,
+    summary: buildWorkflowSummary({
+      steps,
+      validationStatus,
+      qaStatus,
+      finalPmStatus,
+      hasOutput,
+      preflight,
+      runMode,
+      autonomyRun,
+      decisionStatus
+    }),
+    verificationNote: validationStatus === "needs_review" ? "Verification pending manual build confirmation." : "",
+    finalizationNote: finalPmStatus === "timed_out" ? "Final PM decision timed out after output was generated." : ""
+  };
+}
+
+function setWorkflowStepState(steps, key, state, note = "") {
+  const step = steps.find((item) => item.key === key);
+  if (!step) {
+    return;
+  }
+  step.state = state;
+  step.note = note;
+}
+
+function buildWorkflowSummary({ steps, validationStatus, qaStatus, finalPmStatus, hasOutput, preflight, runMode, autonomyRun, decisionStatus = "" }) {
+  if (preflight?.state === "checking") {
+    return "Initializing TriFix";
+  }
+  if (preflight?.state === "blocked") {
+    return "Blocked - required model unavailable";
+  }
+  if (preflight?.state === "degraded_available") {
+    return "Ready - developer-only mode available";
+  }
+  if (!hasOutput && autonomyRun?.status === "queued") {
+    return "Run queued";
+  }
+  if (!hasOutput && steps.some((step) => step.state === "failed")) {
+    return "Failed before useful output";
+  }
+  if (validationStatus === "failed" && hasOutput) {
+    return "Validation failed - patch required";
+  }
+  if (finalPmStatus === "timed_out") {
+    return "Needs review - final decision unavailable";
+  }
+  if (decisionStatus === "acknowledged" && validationStatus === "failed") {
+    return "Review finished - follow-up prompt recommended";
+  }
+  if (decisionStatus === "acknowledged" && validationStatus === "needs_review") {
+    return "Review finished - build still unverified";
+  }
+  if (steps.find((step) => step.key === "decision")?.state === "complete" && hasOutput) {
+    return "Ready for next prompt";
+  }
+  if (runMode === "degraded_developer_only" && hasOutput) {
+    return "Needs review - developer-only output";
+  }
+  if (validationStatus === "needs_review") {
+    return "Needs review - build unverified";
+  }
+  if (qaStatus === "skipped") {
+    return "Needs review - QA skipped";
+  }
+  if (steps.every((step) => step.state === "complete")) {
+    return "Workflow complete";
+  }
+  const active = steps.find((step) => step.state === "active");
+  return active ? `${active.label} in progress` : "Run progress available";
+}
+
+function mapStageToWorkflowStep(stage, workflow, result) {
+  if (["supervisor-spec", "pm_plan", "planning", "pipeline-start", "autonomy-runner", "context-ready"].includes(stage)) {
+    return "planning";
+  }
+  if (["senior-parallel-review", "qa"].includes(stage)) {
+    return "qa";
+  }
+  if (["junior-initial", "junior-patch", "dev", "patch", "auto-repair"].includes(stage)) {
+    return "development";
+  }
+  if (["file-executor", "apply_files", "auto-validation", "verify", "validation"].includes(stage)) {
+    return "verification";
+  }
+  if (["senior-final-review"].includes(stage)) {
+    return "finalReview";
+  }
+  if (["supervisor-final", "final", "decision", "accepted", "phase-ready", "autonomy-complete", "autonomy-error"].includes(stage)) {
+    return "decision";
+  }
+  if (String(workflow?.projectStatus || "").toLowerCase().includes("validation")) {
+    return "verification";
+  }
+  if (result?.qa?.finalReview || result?.qa?.parallelReview) {
+    return "finalReview";
+  }
+  return "planning";
+}
+
+function getResultValidationStatus(result) {
+  const value = String(result?.autoRepair?.status || result?.validation?.status || "").trim().toLowerCase();
+  if (value === "passed") return "passed";
+  if (value === "needs_review") return "needs_review";
+  if (value === "failed") return "failed";
+  return "";
+}
+
+function getProjectValidationMessage(result) {
+  const projectType = String(result?.autoRepair?.finalValidation?.projectType || result?.validation?.projectType || "").trim().toLowerCase();
+  const validationStatus = getResultValidationStatus(result);
+
+  if (projectType === "vite-react") {
+    if (validationStatus === "failed") {
+      return "Vite validation failed. Review package.json dependencies, install step, and build output.";
+    }
+    if (validationStatus === "needs_review") {
+      return "Build unverified. Vite source files were generated but build was not run.";
+    }
+    return "Vite project source generated. Use npm install and npm run dev/build to preview or validate.";
+  }
+
+  if (projectType === "static-html" && validationStatus === "passed") {
+    return "open index.html passed";
+  }
+
+  return "";
+}
+
+function getResultQaStatus(result) {
+  if (String(result?.preflight?.runMode || "").trim().toLowerCase() === "degraded_developer_only") {
+    return "skipped";
+  }
+  const qaStatus = String(result?.finalization?.qaStatus || "").trim().toLowerCase();
+  if (["skipped", "unavailable"].includes(qaStatus)) {
+    return "skipped";
+  }
+  if (result?.qa?.finalReview || result?.qa?.parallelReview) {
+    if (/qa unavailable|review unavailable|unavailable/i.test(String(result?.qa?.finalReview || result?.qa?.parallelReview || ""))) {
+      return "skipped";
+    }
+    return "complete";
+  }
+  return "";
+}
+
+function formatWorkflowStepState(state) {
+  const normalized = String(state || "pending").trim().toLowerCase();
+  const labels = {
+    pending: "pending",
+    active: "active",
+    complete: "complete",
+    skipped: "skipped",
+    needs_review: "needs review",
+    failed: "failed"
+  };
+  return labels[normalized] || normalized;
+}
+
+function formatWorkflowStepper(steps = []) {
+  return (steps || [])
+    .map((step) => `${step.label} ${formatWorkflowStepState(step.state)}`)
+    .join(" -> ");
+}
+
+function renderWorkflowStepIcon(state) {
+  const normalized = String(state || "pending").trim().toLowerCase();
+  if (normalized === "complete") {
+    return <CheckCircle2 size={16} />;
+  }
+  if (normalized === "active") {
+    return <Loader2 size={16} className="spin" />;
+  }
+  if (normalized === "failed") {
+    return <XCircle size={16} />;
+  }
+  if (normalized === "needs_review") {
+    return <TriangleAlert size={16} />;
+  }
+  if (normalized === "skipped") {
+    return <ArrowUpDown size={16} />;
+  }
+  return <Clock3 size={16} />;
+}
+
 function shouldShowCycleReview({ result, workflow, isRunning }) {
   if (isRunning || !result?.decision?.summary) {
     return false;
   }
 
-  return String(workflow?.decisionStatus || "pending").toLowerCase() === "pending";
+  return ["needs_patch", "manual_review_required", "denied"].includes(
+    String(workflow?.decisionStatus || "").toLowerCase()
+  );
 }
 
 function canDiscardGeneratedOutput(project, result) {
@@ -4646,6 +5407,10 @@ function formatDecisionHeadline(value) {
   return firstSentence.trim();
 }
 
+function formatDecisionSummaryForResult(value, result) {
+  return sanitizeProjectValidationWording(formatDecisionSummary(value), result);
+}
+
 function sanitizeDecisionText(value) {
   return String(value || "")
     .replace(/<!\[CDATA\[(.*?)\]\]>/gis, "$1")
@@ -4655,6 +5420,19 @@ function sanitizeDecisionText(value) {
     .replace(/\s*\n\s*/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+function sanitizeProjectValidationWording(value, result) {
+  const projectType = String(result?.autoRepair?.finalValidation?.projectType || result?.validation?.projectType || "").trim().toLowerCase();
+  const normalized = String(value || "");
+  if (projectType !== "vite-react") {
+    return normalized;
+  }
+
+  return normalized
+    .replace(/open\s+index\.html\s+passed\.?/gi, "Vite source generated. Direct file preview is not a validation check.")
+    .replace(/file:\/\/\s*index\.html\s+passed\.?/gi, "Vite source generated. Direct file preview is not a validation check.")
+    .replace(/html\s+preview\s+passed\.?/gi, "Vite source generated. Direct file preview is not a validation check.");
 }
 
 function transitionProjectPlan(phases = [], tasks = [], mode = "finish") {
@@ -4742,7 +5520,7 @@ function formatOutputTab(value) {
     supervisor: "Senior Dev",
     junior: "Junior Dev",
     prd: "PRD",
-    tasks: "Tasks",
+    tasks: "Progress",
     logs: "Logs",
     decision: "Decision"
   };
@@ -4859,6 +5637,43 @@ function mapProgressStatus(agentId, status, options = {}) {
   return "thinking";
 }
 
+function mapTerminalAgentStatus(agentId, result, options = {}) {
+  const runStatus = String(options.runStatus || "").trim().toLowerCase();
+  const qaUnavailable = Boolean(options.qaUnavailable);
+  const hasOutput = hasUsefulOutput(result);
+  const finalPmTimedOut = String(result?.finalization?.pmStatus || "").trim().toLowerCase() === "timed_out";
+  const developerOnlyMode = String(result?.preflight?.runMode || "").trim().toLowerCase() === "degraded_developer_only";
+
+  if (agentId === "junior") {
+    return hasOutput ? "done" : (runStatus === "failed" ? "error" : "idle");
+  }
+
+  if (agentId === "supervisor") {
+    if (developerOnlyMode || qaUnavailable || String(result?.finalization?.qaStatus || "").trim().toLowerCase() === "skipped") {
+      return "idle";
+    }
+    if (runStatus === "failed" && !hasOutput) {
+      return "error";
+    }
+    return result?.qa?.finalReview || result?.qa?.parallelReview ? "done" : "idle";
+  }
+
+  if (agentId === "architect") {
+    if (developerOnlyMode) {
+      return "idle";
+    }
+    if (finalPmTimedOut) {
+      return "waiting";
+    }
+    if (runStatus === "failed" && !hasOutput) {
+      return "error";
+    }
+    return "done";
+  }
+
+  return runStatus === "failed" && !hasOutput ? "error" : "idle";
+}
+
 function classifyModelAvailability(health) {
   const roles = [
     { id: "architect", name: "Project Manager", required: true },
@@ -4879,7 +5694,11 @@ function classifyModelAvailability(health) {
       availability,
       endpoint: match.endpoint || "",
       required: role.required,
-      reason: match.error || ""
+      reason: match.error || "",
+      endpointReachable: Boolean(match.endpointReachable || match.online),
+      modelResponded: Boolean(match.modelResponded || match.online),
+      elapsedMs: Number(match.elapsedMs || 0),
+      classification: match.classification || availability
     };
 
     if (role.required) {
@@ -4891,20 +5710,23 @@ function classifyModelAvailability(health) {
   });
 
   const requiredOffline = required.filter((entry) => entry.availability === "offline");
-  const requiredUnknown = required.filter((entry) => entry.availability === "unknown");
   const optionalOffline = optional.filter((entry) => entry.availability !== "online");
+  const architect = required.find((entry) => entry.id === "architect");
+  const junior = required.find((entry) => entry.id === "junior");
   const warnings = [];
   if (optionalOffline.length > 0) {
     warnings.push("Senior Dev / QA is unavailable. The run will continue with deterministic verification and may end as needs_review.");
   }
-  if (requiredUnknown.length > 0) {
-    warnings.push(`${requiredUnknown.map((entry) => entry.name).join(" and ")} did not answer the quick availability check. Proceeding with the run attempt.`);
-  }
+  const canRunNormal = architect?.availability === "online" && junior?.availability === "online";
+  const canRunDeveloperOnly = architect?.availability !== "online" && junior?.availability === "online";
+  const cannotRun = junior?.availability !== "online";
 
   return {
-    canRun: requiredOffline.length === 0,
-    canRunWithWarnings: requiredOffline.length === 0 && (optionalOffline.length > 0 || requiredUnknown.length > 0),
-    cannotRun: requiredOffline.length > 0,
+    canRun: canRunNormal,
+    canRunNormal,
+    canRunDeveloperOnly,
+    canRunWithWarnings: canRunNormal && optionalOffline.length > 0,
+    cannotRun,
     required,
     optional,
     warnings
@@ -4915,13 +5737,7 @@ function classifyAvailabilityState(role, match) {
   if (match?.online) {
     return "online";
   }
-
-  const reason = String(match?.error || "");
-  if (role.required && /timed out after/i.test(reason)) {
-    return "unknown";
-  }
-
-  return "offline";
+  return String(match?.classification || "").trim().toLowerCase() || "unknown_error";
 }
 
 function findAvailabilityEntry(availability, agentId) {
@@ -4934,31 +5750,143 @@ function isSupervisorUnavailable(availability) {
 }
 
 function buildAvailabilityMessage(availability) {
-  const activeModels = [...availability.required, ...availability.optional]
-    .filter((entry) => entry.availability === "online")
+  const source = availability?.availability || availability;
+  const activeModels = preflightEntries(source)
+    .activeModels
     .map((entry) => `${entry.name}: ${entry.model}`);
-  const unavailableOptional = availability.optional
-    .filter((entry) => entry.availability !== "online")
-    .map((entry) => `${entry.name}: ${entry.model}`);
-  const uncertainRequired = availability.required
-    .filter((entry) => entry.availability === "unknown")
+  const unavailableModels = preflightEntries(source)
+    .unavailableModels
     .map((entry) => `${entry.name}: ${entry.model}`);
 
   const parts = [];
   if (activeModels.length > 0) {
     parts.push(`Active models: ${activeModels.join("; ")}.`);
   }
-  if (unavailableOptional.length > 0) {
-    parts.push(`Inactive optional models: ${unavailableOptional.join("; ")}.`);
+  if (unavailableModels.length > 0) {
+    parts.push(`Unavailable models: ${unavailableModels.join("; ")}.`);
   }
-  if (uncertainRequired.length > 0) {
-    parts.push(`Required model availability check timed out: ${uncertainRequired.join("; ")}. Proceeding with the run attempt.`);
-  }
-  if (availability.warnings.length > 0) {
-    parts.push(availability.warnings.join(" "));
+  if ((source?.warnings || []).length > 0) {
+    parts.push(source.warnings.join(" "));
   }
 
   return parts.join(" ");
+}
+
+function preflightEntries(availability) {
+  const all = [...(availability?.required || []), ...(availability?.optional || [])];
+  return {
+    activeModels: all.filter((entry) => entry.availability === "online"),
+    unavailableModels: all.filter((entry) => entry.availability !== "online")
+  };
+}
+
+function buildRunPreflight(availability) {
+  const { activeModels, unavailableModels } = preflightEntries(availability);
+  const architect = findAvailabilityEntry(availability, "architect");
+  const junior = findAvailabilityEntry(availability, "junior");
+  const qa = findAvailabilityEntry(availability, "supervisor");
+
+  let state = "blocked";
+  let selectedRunMode = "blocked";
+  let message = "Required model unavailable. Please start the model server and try again.";
+  const warnings = [...(availability?.warnings || [])];
+
+  if (junior?.availability !== "online") {
+    state = "blocked";
+    selectedRunMode = "blocked";
+    message = buildUnavailableModelMessage(junior, { allowDeveloperOnly: false });
+  } else if (architect?.availability !== "online") {
+    state = "degraded_available";
+    selectedRunMode = "degraded_developer_only";
+    message = `${buildUnavailableModelMessage(architect, { allowDeveloperOnly: true })} You may proceed in Developer-only mode, but your prompt must be detailed. No PM planning or QA approval will be available.`;
+  } else if (qa?.availability !== "online") {
+    state = "ready_with_warnings";
+    selectedRunMode = "normal_qa_unavailable";
+    message = `${buildUnavailableModelMessage(qa, { allowDeveloperOnly: false })} TriFix will continue with deterministic verification. Final status may require manual review.`;
+  } else {
+    state = "ready";
+    selectedRunMode = "normal";
+    message = "All required models are available. TriFix is ready to run.";
+  }
+
+  return {
+    state,
+    selectedRunMode,
+    activeModels,
+    unavailableModels,
+    warnings,
+    availability,
+    message
+  };
+}
+
+function buildUnavailableModelMessage(entry, options = {}) {
+  if (!entry) {
+    return "Model unavailable.";
+  }
+
+  const roleName = entry.name;
+  const modelName = entry.model || "unknown model";
+  const endpoint = entry.endpoint || "unknown endpoint";
+  const reason = String(entry.reason || "").trim();
+  const classification = String(entry.classification || entry.availability || "").trim().toLowerCase();
+  const suffix = reason ? ` ${reason}` : "";
+
+  if (entry.endpointReachable && !entry.modelResponded) {
+    if (entry.id === "architect") {
+      return `Endpoint reachable, but PM model ${modelName} did not respond. Check that this model is loaded or served in LM Studio.${suffix}`;
+    }
+    return `${roleName} endpoint is reachable, but model ${modelName} did not respond. Check that this model is loaded or served in LM Studio.${suffix}`;
+  }
+
+  if (classification === "endpoint_offline") {
+    return `${roleName} endpoint is offline at ${endpoint}. Start the model server and try again.${suffix}`;
+  }
+
+  if (classification === "model_timeout") {
+    return `${roleName} model ${modelName} timed out during the quick health check. Endpoint is reachable, but this model did not respond within the health timeout. Confirm the model is loaded or set TRIFIX_HEALTH_TIMEOUT_MS=10000 for slow VPN servers.${suffix}`;
+  }
+
+  if (classification === "model_unavailable") {
+    return `${roleName} model ${modelName} is not available on ${endpoint}. Confirm the exact model name is loaded or served in LM Studio.${suffix}`;
+  }
+
+  if (classification === "invalid_response") {
+    return `${roleName} endpoint responded, but the model health response was invalid. Check the served API response in LM Studio.${suffix}`;
+  }
+
+  return `${roleName} is unavailable. ${reason || "Check the model server and LM Studio configuration."}`;
+}
+
+function getSuggestedFix(entry) {
+  const classification = String(entry?.classification || entry?.availability || "").trim().toLowerCase();
+  if (entry?.endpointReachable && !entry?.modelResponded) {
+    return `Open LM Studio on the remote laptop. Confirm ${entry.model || "the model"} is loaded or served.`;
+  }
+  if (classification === "endpoint_offline") {
+    return "Start the endpoint host and confirm the server is reachable on the configured address.";
+  }
+  if (classification === "model_timeout") {
+    return `Confirm ${entry.model || "the model"} is loaded and responsive in LM Studio.`;
+  }
+  if (classification === "model_unavailable") {
+    return `Confirm the exact model name ${entry.model || ""} is available and served in LM Studio.`;
+  }
+  if (classification === "invalid_response") {
+    return "Inspect the server response format and confirm the chat endpoint is returning a valid success response.";
+  }
+  return "Recheck the model server, endpoint, and loaded model name.";
+}
+
+function formatAvailabilityBadge(entry) {
+  const classification = String(entry?.classification || entry?.availability || "").trim().toLowerCase();
+  if (classification === "online") return "Active";
+  if (classification === "endpoint_offline") return "Endpoint offline";
+  if (classification === "model_timeout") return "Model timeout";
+  if (classification === "model_unavailable") return "Model unavailable";
+  if (classification === "invalid_response") return "Invalid response";
+  if (entry?.endpointReachable && !entry?.modelResponded) return "Model unavailable";
+  return "Unavailable";
 }
 
 function isTerminalAutonomyStatus(status) {
@@ -4966,9 +5894,52 @@ function isTerminalAutonomyStatus(status) {
 }
 
 function formatAutonomyStatus(status) {
+  const normalized = String(status || "idle").trim().toLowerCase();
+  if (normalized === "waiting_for_decision") {
+    return "Ready for review";
+  }
+  if (normalized === "needs_review") {
+    return "Needs review";
+  }
+  if (normalized === "completed") {
+    return "Output ready";
+  }
+  if (normalized === "timed_out") {
+    return "Final decision unavailable";
+  }
   return String(status || "idle")
     .replace(/_/g, " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatRunModeLabel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "normal") return "Normal";
+  if (normalized === "normal_qa_unavailable") return "Normal with QA skipped";
+  if (normalized === "degraded_developer_only") return "Developer-only degraded mode";
+  if (normalized === "blocked") return "Blocked";
+  return normalized || "Unknown";
+}
+
+function formatHealthAttempts(entry) {
+  const attempts = Number(entry?.attempts || 0);
+  const elapsedMs = Number(entry?.elapsedMs || 0);
+  const perAttempt = Array.isArray(entry?.perAttemptElapsedMs) ? entry.perAttemptElapsedMs : [];
+  if (attempts <= 0 && elapsedMs <= 0) {
+    return "";
+  }
+
+  const parts = [];
+  if (attempts > 0) {
+    parts.push(`${attempts} attempt${attempts === 1 ? "" : "s"}`);
+  }
+  if (elapsedMs > 0) {
+    parts.push(`${elapsedMs}ms total`);
+  }
+  if (perAttempt.length > 1) {
+    parts.push(`per attempt: ${perAttempt.map((value) => `${value}ms`).join(", ")}`);
+  }
+  return parts.join(" - ");
 }
 
 function wait(ms) {
@@ -5005,12 +5976,17 @@ function toLandingStatusKey(status, decisionStatus) {
   const decision = String(decisionStatus || "").toLowerCase();
   const value = String(status || "").toLowerCase();
 
-  if (decision === "applied" || decision === "accepted" || value === "completed") {
+  if (
+    decision === "applied" ||
+    decision === "accepted" ||
+    decision === "acknowledged" ||
+    ["completed", "output ready", "ready for review"].includes(value)
+  ) {
     return "completed";
   }
 
-  if (value === "waiting for decision" || decision === "pending") {
-    return "waiting";
+  if (["needs review", "build unverified"].includes(value)) {
+    return "active";
   }
 
   if (value === "in progress" || value === "validation failed" || value === "blocked" || value === "timed_out" || decision === "denied" || decision === "manual_review_required") {
@@ -5025,13 +6001,14 @@ function toLandingStatusKey(status, decisionStatus) {
 }
 
 function toLandingStatusLabel(status, decisionStatus) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (["output ready", "ready for review", "needs review", "build unverified"].includes(normalized)) {
+    return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }
+
   const key = toLandingStatusKey(status, decisionStatus);
   if (key === "active") {
     return "In progress";
-  }
-
-  if (key === "waiting") {
-    return "Waiting for decision";
   }
 
   if (key === "completed") {
@@ -5050,6 +6027,10 @@ function mapTrackedStatusToStage(status, decisionStatus) {
     return "accepted";
   }
 
+  if (decisionStatus === "acknowledged") {
+    return "accepted";
+  }
+
   if (decisionStatus === "manual_review_required") {
     return "manual-review";
   }
@@ -5062,7 +6043,7 @@ function mapTrackedStatusToStage(status, decisionStatus) {
     return "correction-loop";
   }
 
-  if (String(status || "").toLowerCase() === "waiting for decision") {
+  if (["ready for review", "output ready", "needs review", "build unverified"].includes(String(status || "").toLowerCase())) {
     return "decision";
   }
 
@@ -5071,6 +6052,15 @@ function mapTrackedStatusToStage(status, decisionStatus) {
   }
 
   return "idle";
+}
+
+function isExplicitNewProjectRequest(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return /\b(create|start|make)\s+(a\s+)?new project\b/.test(normalized) || /^new project\b/.test(normalized);
 }
 
 function assessProjectFeasibility({ input, result, selectedFiles, hasContextDocuments }) {
@@ -5172,7 +6162,7 @@ function saveAgentNames(names) {
   window.localStorage.setItem(AGENT_NAME_STORAGE_KEY, JSON.stringify(names));
 }
 
-function shouldRunChatter({ isRunning, agents, activeMessage, isTyping, scene, messageQueue }) {
+function shouldRunChatter({ isRunning, agents, activeMessage, isTyping, scene, messageQueue, workflow }) {
   if (scene) {
     return false;
   }
@@ -5182,6 +6172,15 @@ function shouldRunChatter({ isRunning, agents, activeMessage, isTyping, scene, m
   }
 
   if ((messageQueue || []).some((message) => message.priority === "high")) {
+    return false;
+  }
+
+  const currentStage = String(workflow?.currentStage || "").trim().toLowerCase();
+  const decisionStatus = String(workflow?.decisionStatus || "").trim().toLowerCase();
+  if (["decision", "supervisor-final", "manual-review", "manual_review_required", "accepted", "applied"].includes(currentStage)) {
+    return false;
+  }
+  if (["manual_review_required", "acknowledged", "accepted", "applied"].includes(decisionStatus)) {
     return false;
   }
 

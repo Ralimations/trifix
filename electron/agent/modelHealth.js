@@ -16,11 +16,53 @@ const HEALTH_AGENTS = {
 export async function getModelHealth() {
   // Broad diagnostics for the UI. Runtime QA gating should use getAgentHealth("supervisor")
   // so PM/Junior health does not affect optional QA behavior.
-  const entries = await Promise.all(
-    Object.entries(HEALTH_AGENTS).map(async ([key, agent]) => [key, await checkEndpoint(agent)])
-  );
+  const endpointGroups = new Map();
+  for (const [key, agent] of Object.entries(HEALTH_AGENTS)) {
+    const endpoint = String(agent?.endpoint || "");
+    const group = endpointGroups.get(endpoint) || [];
+    group.push([key, agent]);
+    endpointGroups.set(endpoint, group);
+  }
 
-  return Object.fromEntries(entries);
+  const groupResults = await Promise.all(
+    Array.from(endpointGroups.values()).map(async (group) => {
+      const results = [];
+      for (const [key, agent] of group) {
+        results.push([key, await checkEndpoint(agent)]);
+      }
+      return results;
+    })
+  );
+  const entries = groupResults.flat();
+  const results = Object.fromEntries(entries);
+  const endpointReachability = new Map();
+
+  for (const entry of Object.values(results)) {
+    const endpoint = String(entry?.endpoint || "");
+    if (!endpoint) {
+      continue;
+    }
+    if (entry.endpointReachable || entry.online) {
+      endpointReachability.set(endpoint, true);
+    } else if (!endpointReachability.has(endpoint)) {
+      endpointReachability.set(endpoint, false);
+    }
+  }
+
+  for (const entry of Object.values(results)) {
+    const endpoint = String(entry?.endpoint || "");
+    if (!endpoint) {
+      continue;
+    }
+    if (endpointReachability.get(endpoint)) {
+      entry.endpointReachable = true;
+      if (!entry.online && entry.classification === "endpoint_offline") {
+        entry.classification = entry.modelResponded ? "online" : classifyModelFailure(entry.error);
+      }
+    }
+  }
+
+  return results;
 }
 
 export async function getAgentHealth(agentId) {
@@ -40,27 +82,68 @@ async function checkEndpoint(agent) {
   if (!endpoint) {
     return {
       online: false,
+      endpointReachable: false,
+      modelResponded: false,
       endpoint,
       model,
-      error: "Missing endpoint."
+      error: "Missing endpoint.",
+      elapsedMs: 0,
+      classification: "endpoint_offline"
     };
   }
 
-  try {
-    await probeEndpoint(endpoint, model, DEFAULT_TIMEOUT_MS);
-    return {
-      online: true,
-      endpoint,
-      model
-    };
-  } catch (error) {
-    return {
-      online: false,
-      endpoint,
-      model,
-      error: error?.message || "Endpoint check failed."
-    };
+  const startedAt = Date.now();
+  const perAttemptElapsedMs = [];
+  let attempts = 0;
+  let lastError = null;
+  let lastDetail = {
+    endpointReachable: false,
+    classification: "unknown_error",
+    statusCode: 0
+  };
+
+  while (attempts < 2) {
+    attempts += 1;
+    const attemptStartedAt = Date.now();
+    try {
+      const response = await probeEndpoint(endpoint, model, DEFAULT_TIMEOUT_MS);
+      perAttemptElapsedMs.push(Date.now() - attemptStartedAt);
+      return {
+        online: true,
+        endpointReachable: true,
+        modelResponded: true,
+        endpoint,
+        model,
+        attempts,
+        elapsedMs: Date.now() - startedAt,
+        perAttemptElapsedMs,
+        classification: "online",
+        statusCode: response.statusCode || 0
+      };
+    } catch (error) {
+      perAttemptElapsedMs.push(Date.now() - attemptStartedAt);
+      lastError = error;
+      lastDetail = classifyProbeError(error);
+      const shouldRetry = attempts < 2 && lastDetail.endpointReachable && lastDetail.classification === "model_timeout";
+      if (!shouldRetry) {
+        break;
+      }
+    }
   }
+
+  return {
+    online: false,
+    endpointReachable: lastDetail.endpointReachable,
+    modelResponded: false,
+    endpoint,
+    model,
+    error: lastError?.message || "Endpoint check failed.",
+    attempts,
+    elapsedMs: Date.now() - startedAt,
+    perAttemptElapsedMs,
+    classification: lastDetail.classification,
+    statusCode: lastDetail.statusCode || 0
+  };
 }
 
 function probeEndpoint(endpoint, model, timeoutMs) {
@@ -92,12 +175,16 @@ function probeEndpoint(endpoint, model, timeoutMs) {
         response.on("end", () => {
           if (response.statusCode >= 200 && response.statusCode < 300) {
             resolve({
-              statusCode: response.statusCode || 0
+              statusCode: response.statusCode || 0,
+              body: chunks.join("")
             });
             return;
           }
 
-          reject(new Error(`Health check failed with HTTP ${response.statusCode || 0}.`));
+          const error = new Error(`Health check failed with HTTP ${response.statusCode || 0}.`);
+          error.statusCode = response.statusCode || 0;
+          error.responseBody = chunks.join("");
+          reject(error);
         });
       }
     );
@@ -109,4 +196,62 @@ function probeEndpoint(endpoint, model, timeoutMs) {
     request.write(payload);
     request.end();
   });
+}
+
+function classifyProbeError(error) {
+  const message = String(error?.message || "").trim();
+  const code = String(error?.code || "").trim().toUpperCase();
+  const statusCode = Number(error?.statusCode || 0);
+
+  if (/timed out after/i.test(message)) {
+    return {
+      endpointReachable: true,
+      classification: "model_timeout",
+      statusCode
+    };
+  }
+
+  if (statusCode > 0) {
+    if ([400, 404, 422].includes(statusCode)) {
+      return {
+        endpointReachable: true,
+        classification: "model_unavailable",
+        statusCode
+      };
+    }
+
+    return {
+      endpointReachable: true,
+      classification: "invalid_response",
+      statusCode
+    };
+  }
+
+  if (["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT", "ECONNRESET", "EPIPE"].includes(code)) {
+    return {
+      endpointReachable: false,
+      classification: "endpoint_offline",
+      statusCode: 0
+    };
+  }
+
+  return {
+    endpointReachable: false,
+    classification: "unknown_error",
+    statusCode
+  };
+}
+
+function classifyModelFailure(error) {
+  const message = String(error || "");
+  if (/timed out after/i.test(message)) {
+    return "model_timeout";
+  }
+  if (/HTTP 400|HTTP 404|HTTP 422/i.test(message)) {
+    return "model_unavailable";
+  }
+  if (/HTTP/i.test(message)) {
+    return "invalid_response";
+  }
+  return "unknown_error";
 }

@@ -33,6 +33,8 @@ contextBridge.exposeInMainWorld("trifix", {
   discardOutput: (payload) => ipcRenderer.invoke("decision:discard-output", payload),
   previewApply: (payload) => ipcRenderer.invoke("decision:preview-apply", payload),
   applyDecision: (payload) => ipcRenderer.invoke("decision:apply", payload),
+  exportReviewData: (payload) => ipcRenderer.invoke("review:export-data", payload),
+  finishReview: (payload) => ipcRenderer.invoke("review:finish", payload),
   onPipelineProgress: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("pipeline:progress", listener);
