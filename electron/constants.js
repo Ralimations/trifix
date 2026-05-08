@@ -30,7 +30,8 @@ export const DEV_MODEL =
   AGENT_CONFIGS.junior.model;
 export const QA_MODEL =
   process.env.TRIFIX_QA_MODEL || AGENT_CONFIGS.supervisor.model;
-export const REQUEST_TIMEOUT_MS = Number(process.env.TRIFIX_REQUEST_TIMEOUT_MS || AGENT_CONFIGS.junior.timeoutMs || 1800000);
+export const REQUEST_TIMEOUT_MS = Number(process.env.TRIFIX_REQUEST_TIMEOUT_MS || 0);
+const resolveTimeout = (specificTimeout) => REQUEST_TIMEOUT_MS > 0 ? REQUEST_TIMEOUT_MS : specificTimeout;
 
 export const AGENTS = {
   ...AGENT_CONFIGS,
@@ -38,19 +39,19 @@ export const AGENTS = {
     ...AGENT_CONFIGS.junior,
     model: DEV_MODEL,
     endpoint: DEV_ENDPOINT,
-    timeoutMs: REQUEST_TIMEOUT_MS
+    timeoutMs: resolveTimeout(AGENT_CONFIGS.junior.timeoutMs)
   },
   supervisor: {
     ...AGENT_CONFIGS.supervisor,
     model: QA_MODEL,
     endpoint: process.env.TRIFIX_SUPERVISOR_ENDPOINT || AI_ENDPOINT,
-    timeoutMs: REQUEST_TIMEOUT_MS
+    timeoutMs: resolveTimeout(AGENT_CONFIGS.supervisor.timeoutMs)
   },
   architect: {
     ...AGENT_CONFIGS.architect,
     model: ARCHITECT_MODEL,
     endpoint: ARCHITECT_ENDPOINT,
-    timeoutMs: REQUEST_TIMEOUT_MS
+    timeoutMs: resolveTimeout(AGENT_CONFIGS.architect.timeoutMs)
   }
 };
 

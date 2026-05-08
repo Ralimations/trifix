@@ -23,7 +23,7 @@ import {
   trackProposedFiles,
   trackQaResult
 } from "./artifactLedger.js";
-import { getModelHealth } from "./modelHealth.js";
+import { getAgentHealth } from "./modelHealth.js";
 
 const REQUEST_TIMEOUT_MS = 1800000;
 const SPEAKING_DELAY_MS = 800;
@@ -243,7 +243,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const qaEndpointOnline = qaHealth.online;
   const qaUnavailableReason = qaEndpointOnline
     ? ""
-    : `Senior Dev parallel review unavailable: ${qaHealth.error || "QA endpoint is offline."}`;
+    : `QA unavailable. Continuing with deterministic verification. ${qaHealth.error || "QA endpoint is offline."}`.trim();
   emitStage({
     agent: "supervisor",
     stage: "senior-parallel-review",
@@ -569,7 +569,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       addParallelLog("Senior Dev final review failed");
     }
   } else if (!qaEndpointOnline) {
-    seniorFinalReview = `FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- ${qaHealth.error || "QA endpoint is offline."}\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.`;
+    seniorFinalReview = `FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- QA unavailable. ${qaHealth.error || "QA endpoint is offline."}\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nContinue with deterministic verification and manual review before completion.`;
     addParallelLog("Senior Dev final review skipped because QA endpoint is offline");
   } else {
     seniorFinalReview = "FINAL REVIEW:\nUNAVAILABLE\n\nISSUES:\n- Senior Dev review unavailable.\n\nREQUIRED FIXES:\n- none\n\nNOTE:\nSupervisor must decide from Junior output and the checklist.";
@@ -597,41 +597,39 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
   emitStage({ agent: "architect", stage: "supervisor-final", status: "thinking", projectPlan });
   let pmDecision = "";
-  if (!qaEndpointOnline) {
-    pmDecision = "FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSenior Dev / QA was unavailable. Use deterministic verification results and manual review before completion.";
-    debugPipeline("final pm call skipped", { runId, reason: qaHealth.error || "QA endpoint is offline." });
-    addParallelLog("Final status resolved locally because QA is unavailable");
-  } else {
-    try {
-      debugPipeline("final pm call start", { runId });
-      pmDecision = await callAgent({
-        agent: AGENTS.architect,
-        systemPrompt: buildSupervisorFinalSystemPrompt(),
-        input: buildSupervisorFinalContext({
-          compactContext,
-          prd,
-          pmPlan,
-          qaInstructions: qaDevHandoff,
-          devOutput: finalDevOutput,
-          qaReview: seniorFinalReview,
-          qaReviewAvailable: seniorFinalReviewAvailable,
-          devLeadResult: finalLeadResult,
-          language,
-          feedback,
-          revisionBrief,
-          loopCount,
-          isExistingProjectRequest
-        }),
-        onRequestStatus: (requestStatus) =>
-          emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
-      });
-      debugPipeline("final pm call end", { runId });
-      addParallelLog("Final status finished");
-    } catch (error) {
-      debugPipeline("final pm call error", { runId, error: formatAgentFailure(error) });
-      pmDecision = `FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSupervisor final status failed: ${formatAgentFailure(error)}`;
-      addParallelLog("Final status failed");
-    }
+  try {
+    debugPipeline("final pm call start", {
+      runId,
+      qaAvailable: seniorFinalReviewAvailable,
+      qaEndpointOnline
+    });
+    pmDecision = await callAgent({
+      agent: AGENTS.architect,
+      systemPrompt: buildSupervisorFinalSystemPrompt(),
+      input: buildSupervisorFinalContext({
+        compactContext,
+        prd,
+        pmPlan,
+        qaInstructions: qaDevHandoff,
+        devOutput: finalDevOutput,
+        qaReview: seniorFinalReview,
+        qaReviewAvailable: seniorFinalReviewAvailable,
+        devLeadResult: finalLeadResult,
+        language,
+        feedback,
+        revisionBrief,
+        loopCount,
+        isExistingProjectRequest
+      }),
+      onRequestStatus: (requestStatus) =>
+        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-final", status: "thinking", requestStatus, loopCount, projectPlan })
+    });
+    debugPipeline("final pm call end", { runId });
+    addParallelLog("Final status finished");
+  } catch (error) {
+    debugPipeline("final pm call error", { runId, error: formatAgentFailure(error) });
+    pmDecision = `FINAL STATUS:\nNEEDS PATCH\n\nREASON:\nSupervisor final status failed: ${formatAgentFailure(error)}`;
+    addParallelLog("Final status failed");
   }
 
   const pmDecisionResult = buildPmResult(pmDecision, finalLeadResult.summary);
@@ -1407,7 +1405,7 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
   const expectedPaths = normalizeExpectedFilePaths(filesAnalyzed, expectedArchitecture);
   const patches = [
     ...extractPatches(output),
-    ...extractPathLabeledCodeBlocks(output),
+    ...extractPathLabeledCodeBlocks(output, expectedPaths),
     ...extractInlineFileBlocks(output)
   ];
   const fallbackCodeFence = output.match(/```[\w+-]*\n([\s\S]*?)```/);
@@ -1504,7 +1502,7 @@ function buildSingleFileHtmlFallback(output, expectedPaths = []) {
   return {
     action: "write",
     path: expectedPath,
-    content: candidate
+    content: normalizeGeneratedFileContent(expectedPath, candidate)
   };
 }
 
@@ -1751,20 +1749,25 @@ function isModernReactAppIntent(intent) {
 
 function defaultFileArchitectureForIntent(intent) {
   if (isModernReactAppIntent(intent)) {
-    return [
+    const minimalReactFiles = [
       { path: "package.json", purpose: "Vite React app dependencies and scripts" },
       { path: "index.html", purpose: "Vite HTML shell" },
-      { path: "vite.config.js", purpose: "Vite config" },
-      { path: "jsconfig.json", purpose: "Path alias support for src imports" },
       { path: "src/main.jsx", purpose: "React entry point" },
-      { path: "src/App.jsx", purpose: "Dashboard shell and CRUD flow" },
-      { path: "src/index.css", purpose: "Global styles and tokens" },
+      { path: "src/App.jsx", purpose: intent?.wantsDashboard ? "React dashboard UI" : "React app shell" },
+      { path: "src/styles.css", purpose: "App styles" }
+    ];
+
+    if (!intent?.wantsShadcn) {
+      return minimalReactFiles;
+    }
+
+    return [
+      ...minimalReactFiles,
       { path: "src/lib/utils.js", purpose: "shadcn utility helpers" },
       { path: "components.json", purpose: "shadcn/ui component registry config" },
       { path: "src/components/ui/button.jsx", purpose: "shadcn button component" },
       { path: "src/components/ui/card.jsx", purpose: "shadcn card component" },
-      { path: "src/components/ui/input.jsx", purpose: "shadcn input component" },
-      { path: "src/components/ui/dialog.jsx", purpose: "shadcn dialog component for CRUD editing" }
+      { path: "src/components/ui/input.jsx", purpose: "shadcn input component" }
     ];
   }
 
@@ -1777,14 +1780,15 @@ function defaultImplementationPlanForIntent(intent, fileArchitecture) {
       "Create a real Vite + React project structure with package.json and src entry files.",
       intent?.wantsShadcn
         ? "Implement reusable shadcn/ui-style components and utilities instead of raw HTML controls."
-        : "Implement reusable React UI components for the requested feature set.",
+        : "Implement a minimal React UI with local state and plain CSS unless more is requested.",
       intent?.wantsCrud || intent?.wantsTodo
         ? "Build client-side CRUD flows for todo items with create, update, delete, and status changes."
-        : "Build the requested interactive application flows.",
+        : "Build only the requested interactive application flows.",
       intent?.wantsDashboard
         ? "Compose the UI as a dashboard layout with data panels and action surfaces."
         : "Compose the UI as a structured app layout.",
-      "Run install and build checks so the output is runnable."
+      "Do not add Tailwind, routing, testing libraries, or extra dependencies unless the user explicitly requested them.",
+      "Include only the files required for a runnable result."
     ];
     return uniqueStrings(plan);
   }
@@ -1803,7 +1807,7 @@ function defaultSetupCommandsForIntent(intent, fileArchitecture) {
 
 function defaultQaInstructionForIntent(intent) {
   if (isModernReactAppIntent(intent)) {
-    return "Verify the Vite React app installs, builds, and uses reusable component structure instead of a single-file fallback.";
+    return "Verify the required Vite React files exist, install/build checks are listed when needed, and the result stays within the requested scope.";
   }
 
   return "Verify required files and FSD alignment.";
@@ -1838,7 +1842,19 @@ function normalizeFileOperations(fileOperations) {
           operation?.name ||
           ""
         ),
-        content: typeof content === "string" ? content : String(content || "")
+        content: normalizeGeneratedFileContent(
+          toProjectPath(
+            operation?.path ||
+            operation?.file ||
+            operation?.filePath ||
+            operation?.filepath ||
+            operation?.filename ||
+            operation?.target ||
+            operation?.name ||
+            ""
+          ),
+          typeof content === "string" ? content : String(content || "")
+        )
       };
     })
     .filter((operation) => operation.action === "write" && operation.path);
@@ -1858,7 +1874,7 @@ function fileOperationsFromPatches(patches) {
     .map((patch) => ({
       action: "write",
       path: toProjectPath(patch.path),
-      content: String(patch.content || "")
+      content: normalizeGeneratedFileContent(toProjectPath(patch.path), String(patch.content || ""))
     }))
     .filter((operation) => operation.path);
 }
@@ -1872,9 +1888,12 @@ function fileOperationsFromObjectMap(value) {
     .map(([filePath, content]) => ({
       action: "write",
       path: toProjectPath(filePath),
-      content: typeof content === "string"
-        ? content
-        : String(content?.content || content?.fullContent || content?.fileContent || content?.code || content?.source || "")
+      content: normalizeGeneratedFileContent(
+        toProjectPath(filePath),
+        typeof content === "string"
+          ? content
+          : String(content?.content || content?.fullContent || content?.fileContent || content?.code || content?.source || "")
+      )
     }))
     .filter((operation) => operation.path);
 }
@@ -2166,6 +2185,8 @@ function buildSupervisorSpecSystemPrompt() {
     "Create a concise implementation spec for the dev pipeline.",
     "Do not write code. Do not over-explain.",
     "Name expected files and folders. Define acceptance tests.",
+    "Do not inject Tailwind, routing, Jest, React Testing Library, CRUD, or extra dependencies unless the user explicitly requested them.",
+    "For Vite/React requests, prefer the smallest runnable file plan.",
     "If project setup commands are required, include only safe local commands such as npm install or npm run build.",
     "Keep output under 300 tokens.",
     "Output format:",
@@ -2181,17 +2202,22 @@ function buildSupervisorSpecSystemPrompt() {
 function buildJuniorInitialSystemPrompt() {
   return [
     "You are Junior Dev and local patch applier.",
+    "You are not an advisor. You are the file generator.",
     "Implement the Supervisor spec.",
     "Edit only listed/relevant files.",
     "Do not create extra folders. Do not rename files unless required.",
     "Do not redesign the app.",
-    "Return ONLY parseable JSON.",
+    "Do not explain how to create the project. Create it.",
+    "Do not apologize.",
+    "Do not refuse.",
+    "Do not give general suggestions or tutorial text.",
+    "Do not mention Tailwind, routing, Jest, or React Testing Library unless the user explicitly requested them.",
+    "Return fileOperations JSON or path-tagged code blocks only.",
     "Do not think aloud.",
     "Do not output 'Thinking Process'.",
     "Do not output reasoning.",
     "Return final answer only.",
     "Do not return partial JSON.",
-    "Return machine-readable fileOperations when creating or editing files.",
     "For new-project or FSD-only tasks, output the full file content needed for each write operation."
   ].join("\n");
 }
@@ -2302,9 +2328,9 @@ function formatAgentFailure(error) {
 
 async function getQaHealthSnapshot() {
   try {
-    const health = await getModelHealth();
-    const supervisor = health?.supervisor || {};
+    const supervisor = await getAgentHealth("supervisor");
     return {
+      ...supervisor,
       online: Boolean(supervisor.online),
       error: String(supervisor.error || "").trim()
     };
@@ -2477,17 +2503,17 @@ function buildJuniorInitialContext({
       isModernReactAppIntent(intent)
         ? "For Vite/React requests, create a real package.json + src/ React app structure. Do not fall back to a static single-file page."
         : "Use the simplest valid project structure for the request.",
+      isModernReactAppIntent(intent)
+        ? `Expected file list:\n${(pmArchitecture?.requiredFiles || []).slice(0, 12).map((filePath) => `- ${filePath}`).join("\n")}`
+        : "",
       intent.wantsShadcn
         ? "For shadcn/ui requests, implement reusable shadcn-style component files, utility helpers, and the dependency manifest needed for them."
         : "Create reusable components only if they materially help the request.",
-      "Return ONLY valid parseable JSON.",
-      "Do not include Thinking Process.",
-      "Do not include markdown explanation.",
-      "Do not include code fences.",
-      "Do not include hidden reasoning.",
-      "Do not include partial JSON.",
+      "Primary output format: valid parseable JSON only.",
       "Use the exact top-level keys summary, fileOperations, and commandRequests.",
       "For a single-file HTML task, write the full HTML document into index.html.",
+      "If JSON is difficult, use only path-tagged code blocks such as ```file: package.json, ```jsx src/App.jsx, or ```css src/styles.css.",
+      "No apology. No general suggestions. No tutorial text.",
       "Return this exact shape:",
       "{",
       '  "summary": "Created the requested files.",',
@@ -2544,6 +2570,7 @@ function buildJuniorPatchContext({
       "Apply only necessary fixes from Senior Dev notes.",
       "If no fixes are needed, return an empty fileOperations array.",
       "When changing a file, return full replacement content for that file.",
+      "If index.html starts with <doctype html>, replace it with <!doctype html>.",
       "Return JSON only with summary, fileOperations, commands, recommendation."
     ].join("\n")
   ].filter(Boolean).join("\n\n");
@@ -2893,6 +2920,16 @@ function cleanCode(value) {
     .trim();
 }
 
+function normalizeGeneratedFileContent(filePath, content) {
+  const normalizedPath = toProjectPath(filePath);
+  const text = String(content || "");
+  if (!normalizedPath || !/\.html?$/i.test(normalizedPath)) {
+    return text;
+  }
+
+  return text.replace(/^\s*<doctype html>/i, "<!doctype html>");
+}
+
 function summarizePlan(pmPlan, input) {
   const firstLine = String(pmPlan || input || "")
     .split(/\r?\n/)
@@ -3041,13 +3078,21 @@ function extractInlineFileBlocks(output) {
   return blocks;
 }
 
-function extractPathLabeledCodeBlocks(output) {
+function extractPathLabeledCodeBlocks(output, expectedPaths = []) {
   const text = String(output || "");
+  return extractStructuredCodeBlocks(text, expectedPaths);
+}
+
+function extractStructuredCodeBlocks(text, expectedPaths = []) {
   const blocks = [];
-  const codeBlockPattern = /```(?!json\b)[\w+-]*\n([\s\S]*?)```/gi;
+  const codeBlockPattern = /```([^\n`]*)\n([\s\S]*?)```/gi;
   let match;
+  let orderedExpectedIndex = 0;
 
   while ((match = codeBlockPattern.exec(text))) {
+    const fenceLabel = String(match[1] || "").trim();
+    const content = cleanCode(match[2]);
+    const directPath = extractPathFromFenceLabel(fenceLabel);
     const preceding = text.slice(Math.max(0, match.index - 240), match.index);
     const labelLine = preceding
       .split(/\r?\n/)
@@ -3055,7 +3100,12 @@ function extractPathLabeledCodeBlocks(output) {
       .filter(Boolean)
       .at(-1) || "";
     const pathMatch = labelLine.match(/`?([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)`?\s*:?$/);
-    const filePath = toProjectPath(pathMatch?.[1] || "");
+    let filePath = toProjectPath(directPath || pathMatch?.[1] || "");
+
+    if (!filePath && shouldMapFenceByOrder(fenceLabel, content, expectedPaths, orderedExpectedIndex)) {
+      filePath = toProjectPath(expectedPaths[orderedExpectedIndex] || "");
+      orderedExpectedIndex += filePath ? 1 : 0;
+    }
 
     if (!filePath || blocks.some((block) => block.path.toLowerCase() === filePath.toLowerCase())) {
       continue;
@@ -3063,11 +3113,62 @@ function extractPathLabeledCodeBlocks(output) {
 
     blocks.push({
       path: filePath,
-      content: cleanCode(match[1])
+      content
     });
   }
 
   return blocks;
+}
+
+function extractPathFromFenceLabel(label) {
+  const normalized = String(label || "").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  const tagged = normalized.match(/^(?:file|path|filename)\s*:\s*(.+)$/i);
+  if (tagged?.[1]) {
+    return toProjectPath(tagged[1]);
+  }
+
+  const typedWithPath = normalized.match(/^(?:json|jsx|tsx|js|ts|css|html|md|txt)\s+(.+)$/i);
+  if (typedWithPath?.[1]) {
+    return toProjectPath(typedWithPath[1]);
+  }
+
+  return "";
+}
+
+function shouldMapFenceByOrder(label, content, expectedPaths, orderedExpectedIndex) {
+  if (!Array.isArray(expectedPaths) || expectedPaths.length === 0 || orderedExpectedIndex >= expectedPaths.length) {
+    return false;
+  }
+
+  const normalizedLabel = String(label || "").trim().toLowerCase();
+  if (!normalizedLabel) {
+    return false;
+  }
+
+  if (!/^(json|jsx|tsx|js|ts|css|html|md|txt)$/i.test(normalizedLabel)) {
+    return false;
+  }
+
+  const expectedPath = String(expectedPaths[orderedExpectedIndex] || "").toLowerCase();
+  if (!expectedPath) {
+    return false;
+  }
+
+  if (normalizedLabel === "json" && expectedPath.endsWith(".json")) return true;
+  if (normalizedLabel === "jsx" && expectedPath.endsWith(".jsx")) return true;
+  if (normalizedLabel === "tsx" && expectedPath.endsWith(".tsx")) return true;
+  if (normalizedLabel === "js" && expectedPath.endsWith(".js")) return true;
+  if (normalizedLabel === "ts" && expectedPath.endsWith(".ts")) return true;
+  if (normalizedLabel === "css" && expectedPath.endsWith(".css")) return true;
+  if (normalizedLabel === "html" && expectedPath.endsWith(".html")) return true;
+  if (normalizedLabel === "md" && expectedPath.endsWith(".md")) return true;
+  if (normalizedLabel === "txt" && expectedPath.endsWith(".txt")) return true;
+
+  return false;
 }
 
 function toPublicRationale(value) {

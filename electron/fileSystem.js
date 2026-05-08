@@ -253,7 +253,7 @@ export async function applyFileOperations(parentPath, projectSpec = {}, operatio
 
   const fileOperations = Array.isArray(operations) ? operations : [];
   if (fileOperations.length === 0) {
-    throw new Error("DEV produced no valid fileOperations.");
+    throw new Error("DEV produced no valid fileOperations or path-tagged code blocks.");
   }
 
   const tasksRoot = path.join(parentPath, DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks");
@@ -307,7 +307,7 @@ export async function applyFileOperations(parentPath, projectSpec = {}, operatio
       await fs.rm(root, { recursive: true, force: true });
     }
 
-    throw new Error("DEV produced no valid fileOperations.");
+    throw new Error("DEV produced no valid fileOperations or path-tagged code blocks.");
   }
 
   const verification = await verifyWrittenOperations(root, applied);

@@ -200,9 +200,11 @@ export function App() {
   const [decisionReason, setDecisionReason] = useState("");
   const [decisionPreview, setDecisionPreview] = useState([]);
   const [decisionMessage, setDecisionMessage] = useState("");
+  const [modelAvailability, setModelAvailability] = useState(null);
   const [isDecisionBusy, setIsDecisionBusy] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const currentRunRef = useRef(null);
+  const modelAvailabilityRef = useRef(null);
   const stageMessageKeysRef = useRef(new Set());
   const messageSequenceRef = useRef(0);
   const reactionCursorRef = useRef(0);
@@ -225,6 +227,10 @@ export function App() {
   useEffect(() => {
     agentStatusRef.current = Object.fromEntries((agents || []).map((agent) => [agent.id, agent.status]));
   }, [agents]);
+
+  useEffect(() => {
+    modelAvailabilityRef.current = modelAvailability;
+  }, [modelAvailability]);
 
   useEffect(() => {
     const bridge = window.trifix;
@@ -274,10 +280,11 @@ export function App() {
         queueStageMessages(progress);
       }
 
+      const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
       setAgents((currentAgents) =>
         currentAgents.map((agent) =>
           agent.id === progress.agent
-            ? { ...agent, status: mapProgressStatus(progress.agent, progress.status) }
+            ? { ...agent, status: mapProgressStatus(progress.agent, progress.status, { qaUnavailable }) }
             : agent
         )
       );
@@ -316,10 +323,11 @@ export function App() {
       }));
 
       if (progress.agent) {
+        const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
         setAgents((currentAgents) =>
           currentAgents.map((agent) =>
             agent.id === progress.agent
-              ? { ...agent, status: mapProgressStatus(progress.agent, progress.status) }
+              ? { ...agent, status: mapProgressStatus(progress.agent, progress.status, { qaUnavailable }) }
               : agent
           )
         );
@@ -328,10 +336,16 @@ export function App() {
       if (["autonomy-complete", "autonomy-error"].includes(progress.stage)) {
         setIsRunning(false);
         setIsAutonomyRunning(false);
+        const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
         setAgents((currentAgents) =>
           currentAgents.map((agent) => ({
             ...agent,
-            status: progress.stage === "autonomy-error" ? "error" : "idle"
+            status:
+              progress.stage === "autonomy-error"
+                ? agent.id === "supervisor" && qaUnavailable
+                  ? "idle"
+                  : "error"
+                : "idle"
           }))
         );
         const outputFiles = getResultOutputFiles(progress.partialResult);
@@ -380,6 +394,40 @@ export function App() {
         : nextAgents
     );
   }, [agentNames, settings]);
+
+  useEffect(() => {
+    const runId = String(autonomyRun?.runId || currentRunRef.current || "").trim();
+    if (!runId || !isAutonomyRunning) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer = null;
+
+    const poll = async () => {
+      try {
+        const snapshot = await syncAutonomyRunStatus(runId, { silent: true });
+        if (cancelled || isTerminalAutonomyStatus(snapshot?.status)) {
+          return;
+        }
+      } catch {}
+
+      if (cancelled) {
+        return;
+      }
+
+      timer = setTimeout(poll, 3000);
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [autonomyRun?.runId, isAutonomyRunning]);
 
   useEffect(() => {
     const targetProject = resultProject || project || normalizeGeneratedProject(result, null);
@@ -975,6 +1023,78 @@ export function App() {
     }
   }
 
+  async function syncAutonomyRunStatus(runId, options = {}) {
+    const targetRunId = String(runId || currentRunRef.current || "").trim();
+    if (!targetRunId || !window.trifix?.getAutonomyStatus) {
+      return null;
+    }
+
+    const snapshot = await window.trifix.getAutonomyStatus(targetRunId);
+    if (!snapshot || snapshot.runId !== targetRunId) {
+      return snapshot;
+    }
+
+    const latestProgress = Array.isArray(snapshot.progress) && snapshot.progress.length > 0
+      ? snapshot.progress[snapshot.progress.length - 1]
+      : null;
+    const terminal = isTerminalAutonomyStatus(snapshot.status);
+
+    setAutonomyRun((current) => ({
+      ...(current || {}),
+      runId: snapshot.runId,
+      status: snapshot.status || current?.status || "queued",
+      deadlineAt: snapshot.deadlineAt || current?.deadlineAt || "",
+      maxRuntimeMs: snapshot.maxRuntimeMs || current?.maxRuntimeMs || 0,
+      lastStage: latestProgress?.stage || current?.lastStage || "",
+      lastStatus: latestProgress?.status || current?.lastStatus || "",
+      message: snapshot.error || current?.message || latestProgress?.stage || "",
+      updatedAt: snapshot.finishedAt || snapshot.startedAt || snapshot.queuedAt || new Date().toISOString(),
+      error: snapshot.error || current?.error || ""
+    }));
+
+    if (snapshot.result) {
+      setResult(snapshot.result);
+      setWorkflow((current) => ({
+        ...current,
+        ...(snapshot.result.workflow || {}),
+        currentStage: snapshot.result.workflow?.currentStage || latestProgress?.stage || current.currentStage,
+        contextReady: true
+      }));
+      const generatedProject = normalizeGeneratedProject(snapshot.result, project);
+      if (generatedProject?.rootPath) {
+        const outputFiles = getResultOutputFiles(snapshot.result);
+        setProject(generatedProject);
+        setResultProject(generatedProject);
+        setSelectedFiles(outputFiles.length > 0 ? outputFiles : (generatedProject.defaultSelectedFiles || []));
+        setCommandLog(generatedProject.commandHistory || []);
+        setProjectProcesses(generatedProject.processes || []);
+      }
+    }
+
+    if (terminal) {
+      setIsRunning(false);
+      setIsAutonomyRunning(false);
+      const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
+      setAgents((currentAgents) =>
+        currentAgents.map((agent) => ({
+          ...agent,
+          status:
+            snapshot.status === "failed"
+              ? agent.id === "supervisor" && qaUnavailable
+                ? "idle"
+                : "error"
+              : "idle"
+        }))
+      );
+      if (!options.silent) {
+        setActiveTab("decision");
+        setActiveView("office");
+      }
+    }
+
+    return snapshot;
+  }
+
   async function restartProjectProcess(processId) {
     const targetProject = resultProject || project;
     if (!targetProject?.rootPath || !processId) {
@@ -1104,15 +1224,19 @@ export function App() {
     const commands = uniqueStrings([
       ...(result?.pm?.commandRequests || []),
       ...(result?.dev?.commandRequests || [])
-    ]);
+    ]).filter((command) => isUsableCommandRequest(command));
 
     setIsCommandRunning(true);
     setWorkflow((current) => ({
       ...current,
       commandStatus: "running",
-      projectStatus: "Running automatic checks"
+      projectStatus: commands.length > 0 ? "Running automatic checks" : "Running validation"
     }));
-    setDecisionMessage("Automatic checks started. The app is running setup and validation inside the sandbox.");
+    setDecisionMessage(
+      commands.length > 0
+        ? "Automatic checks started. The app is running setup and validation inside the sandbox."
+        : "No automatic setup commands were requested. Running validation inside the sandbox."
+    );
     enqueueAgentMessage({
       from: "architect",
       to: "team",
@@ -1439,6 +1563,29 @@ export function App() {
     }
 
     setError("");
+    let availability = null;
+    try {
+      const nextHealth = await window.trifix.getModelHealth();
+      availability = classifyModelAvailability(nextHealth);
+      setModelAvailability(availability);
+    } catch (healthError) {
+      const message = healthError?.message || "Could not check model availability.";
+      setError(message);
+      setDecisionMessage(message);
+      return;
+    }
+
+    if (!availability?.canRun) {
+      const requiredOffline = [...(availability?.required || [])].find((entry) => entry.availability === "offline");
+      const message = requiredOffline
+        ? `Required model unavailable: ${requiredOffline.name} (${requiredOffline.model || "unknown model"}). Please start the model server and try again.`
+        : "Required model unavailable. Please start the model server and try again.";
+      setError(message);
+      setDecisionMessage("");
+      return;
+    }
+
+    setDecisionMessage(buildAvailabilityMessage(availability));
     setIsRunning(true);
     setIsAutonomyRunning(true);
     stageMessageKeysRef.current = new Set();
@@ -1474,7 +1621,12 @@ export function App() {
     setActiveMessage(null);
     setVisibleBubble(null);
     setIsTyping(false);
-    setAgents(agentCatalog.map((agent) => ({ ...agent, status: "idle" })));
+    setAgents(
+      agentCatalog.map((agent) => ({
+        ...agent,
+        status: "idle"
+      }))
+    );
     setWorkflow((current) => ({
       ...current,
       contextReady: true,
@@ -1518,6 +1670,7 @@ export function App() {
         ...(queuedRun || {}),
         message: runStartMessage
       }));
+      void syncAutonomyRunStatus(runId, { silent: true });
     } catch (runError) {
       setIsRunning(false);
       setIsAutonomyRunning(false);
@@ -1872,6 +2025,7 @@ export function App() {
       setProjectProcesses(reopened.processes || []);
       setProcessLogView(null);
       const persistedAutonomy = reopened.autonomyState || entry.autonomyState || null;
+      currentRunRef.current = persistedAutonomy?.runId || "";
       setAutonomyRun(persistedAutonomy ? {
         runId: persistedAutonomy.runId,
         status: persistedAutonomy.status,
@@ -1881,6 +2035,8 @@ export function App() {
         message: persistedAutonomy.currentTask || persistedAutonomy.nextAction || "Persisted autonomy state loaded.",
         updatedAt: persistedAutonomy.finishedAt || persistedAutonomy.startedAt || persistedAutonomy.queuedAt
       } : null);
+      setIsAutonomyRunning(Boolean(persistedAutonomy?.runId) && !isTerminalAutonomyStatus(persistedAutonomy?.status));
+      setIsRunning(Boolean(persistedAutonomy?.runId) && !isTerminalAutonomyStatus(persistedAutonomy?.status));
       setWorkflow((current) => ({
         ...current,
         folderLoaded: true,
@@ -2215,8 +2371,7 @@ export function App() {
             onToggleFile={toggleFile}
             onCodeInput={setCodeInput}
             onLanguage={setLanguage}
-            onRun={() => runOffice(workflow.loopCount, "")}
-            onAutonomousRun={startAutonomousRun}
+            onRun={startAutonomousRun}
             onStopAutonomy={stopAutonomousRun}
             onRunProject={() => runProjectControl("run")}
             onOpenProcessUrl={openProcessUrl}
@@ -2338,7 +2493,6 @@ function OfficeView({
   onCodeInput,
   onLanguage,
   onRun,
-  onAutonomousRun,
   onStopAutonomy,
   onRunProject,
   onOpenProcessUrl,
@@ -2431,8 +2585,8 @@ function OfficeView({
           <h1>{project?.name || taskTitle || "Start the next build"}</h1>
           <p className="workspace-subtitle">
             {project?.rootPath
-              ? "Continue the current project with explicit files and context."
-              : "Name the task, describe the work, and let the team create the project sandbox when it is ready."}
+              ? "Autonomous run: stops when human review is needed."
+              : "Runs until output is produced or review is required."}
           </p>
         </div>
         <div className="button-row">
@@ -2445,15 +2599,10 @@ function OfficeView({
               <XCircle size={18} />
               Stop Auto
             </button>
-          ) : (
-            <button className="secondary-button" type="button" onClick={onAutonomousRun} disabled={!canRun}>
-              <Sparkles size={18} />
-              Autonomous Run
-            </button>
-          )}
+          ) : null}
           <button className="primary-button" type="button" onClick={onRun} disabled={!canRun}>
             {isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
-            Run Team
+            Run
           </button>
         </div>
       </header>
@@ -2998,11 +3147,11 @@ function DecisionPanel({
 
       <div className="decision-summary">
         <h3>Summary</h3>
-        <p>{decision?.summary || "No decision summary yet."}</p>
+        <p>{formatDecisionSummary(decision?.summary) || "No decision summary yet."}</p>
         {decision?.verdict ? (
           <>
             <h3>PM verdict</h3>
-            <p>{decision.verdict}</p>
+            <p>{formatDecisionSummary(decision.verdict)}</p>
           </>
         ) : null}
         {result?.project?.rootPath ? (
@@ -3130,7 +3279,7 @@ function CycleReviewCard({ result, workflow, isBusy, onAdvanceCycle, onFinishCyc
       <div className="cycle-review-header">
         <div>
           <p className="eyebrow">Cycle Review</p>
-          <h2>{result?.decision?.summary || "Cycle finished and is ready for review."}</h2>
+          <h2>{formatDecisionHeadline(result?.decision?.summary) || "Cycle finished and is ready for review."}</h2>
         </div>
         <div className="cycle-review-header-actions">
           <span className="cycle-review-badge">{workflow.currentPhase || result?.project?.phases?.[0]?.name || "Phase 1"}</span>
@@ -4478,6 +4627,36 @@ function uniqueStrings(items = []) {
   return unique;
 }
 
+function isUsableCommandRequest(command) {
+  const normalized = String(command || "").trim();
+  return normalized.length > 0 && !/^(none|n\/a|na|no command|no commands|nothing)$/i.test(normalized);
+}
+
+function formatDecisionSummary(value) {
+  return sanitizeDecisionText(value).replace(/\s+/g, " ").trim();
+}
+
+function formatDecisionHeadline(value) {
+  const normalized = formatDecisionSummary(value);
+  if (!normalized) {
+    return "";
+  }
+
+  const firstSentence = normalized.match(/^(.{1,220}?[.!?])(\s|$)/)?.[1] || normalized.slice(0, 220);
+  return firstSentence.trim();
+}
+
+function sanitizeDecisionText(value) {
+  return String(value || "")
+    .replace(/<!\[CDATA\[(.*?)\]\]>/gis, "$1")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^[#>\-\s]+/gm, "")
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function transitionProjectPlan(phases = [], tasks = [], mode = "finish") {
   const nextPhases = (phases || []).map((phase) => ({ ...phase }));
   const nextTasks = (tasks || []).map((task) => ({ ...task }));
@@ -4656,7 +4835,11 @@ function mapStatusToSpriteStatus(status) {
   return status;
 }
 
-function mapProgressStatus(agentId, status) {
+function mapProgressStatus(agentId, status, options = {}) {
+  if (agentId === "supervisor" && options.qaUnavailable) {
+    return "idle";
+  }
+
   if (status === "coding" && agentId === "architect") {
     return "thinking";
   }
@@ -4674,6 +4857,112 @@ function mapProgressStatus(agentId, status) {
   }
 
   return "thinking";
+}
+
+function classifyModelAvailability(health) {
+  const roles = [
+    { id: "architect", name: "Project Manager", required: true },
+    { id: "junior", name: "Junior Dev", required: true },
+    { id: "supervisor", name: "Senior Dev / QA", required: false }
+  ];
+  const required = [];
+  const optional = [];
+
+  roles.forEach((role) => {
+    const match = health?.[role.id] || {};
+    const availability = classifyAvailabilityState(role, match);
+    const entry = {
+      id: role.id,
+      name: role.name,
+      model: match.model || "",
+      online: availability === "online",
+      availability,
+      endpoint: match.endpoint || "",
+      required: role.required,
+      reason: match.error || ""
+    };
+
+    if (role.required) {
+      required.push(entry);
+      return;
+    }
+
+    optional.push(entry);
+  });
+
+  const requiredOffline = required.filter((entry) => entry.availability === "offline");
+  const requiredUnknown = required.filter((entry) => entry.availability === "unknown");
+  const optionalOffline = optional.filter((entry) => entry.availability !== "online");
+  const warnings = [];
+  if (optionalOffline.length > 0) {
+    warnings.push("Senior Dev / QA is unavailable. The run will continue with deterministic verification and may end as needs_review.");
+  }
+  if (requiredUnknown.length > 0) {
+    warnings.push(`${requiredUnknown.map((entry) => entry.name).join(" and ")} did not answer the quick availability check. Proceeding with the run attempt.`);
+  }
+
+  return {
+    canRun: requiredOffline.length === 0,
+    canRunWithWarnings: requiredOffline.length === 0 && (optionalOffline.length > 0 || requiredUnknown.length > 0),
+    cannotRun: requiredOffline.length > 0,
+    required,
+    optional,
+    warnings
+  };
+}
+
+function classifyAvailabilityState(role, match) {
+  if (match?.online) {
+    return "online";
+  }
+
+  const reason = String(match?.error || "");
+  if (role.required && /timed out after/i.test(reason)) {
+    return "unknown";
+  }
+
+  return "offline";
+}
+
+function findAvailabilityEntry(availability, agentId) {
+  return [...(availability?.required || []), ...(availability?.optional || [])].find((entry) => entry.id === agentId) || null;
+}
+
+function isSupervisorUnavailable(availability) {
+  const supervisor = findAvailabilityEntry(availability, "supervisor");
+  return Boolean(supervisor) && supervisor.required === false && supervisor.availability !== "online";
+}
+
+function buildAvailabilityMessage(availability) {
+  const activeModels = [...availability.required, ...availability.optional]
+    .filter((entry) => entry.availability === "online")
+    .map((entry) => `${entry.name}: ${entry.model}`);
+  const unavailableOptional = availability.optional
+    .filter((entry) => entry.availability !== "online")
+    .map((entry) => `${entry.name}: ${entry.model}`);
+  const uncertainRequired = availability.required
+    .filter((entry) => entry.availability === "unknown")
+    .map((entry) => `${entry.name}: ${entry.model}`);
+
+  const parts = [];
+  if (activeModels.length > 0) {
+    parts.push(`Active models: ${activeModels.join("; ")}.`);
+  }
+  if (unavailableOptional.length > 0) {
+    parts.push(`Inactive optional models: ${unavailableOptional.join("; ")}.`);
+  }
+  if (uncertainRequired.length > 0) {
+    parts.push(`Required model availability check timed out: ${uncertainRequired.join("; ")}. Proceeding with the run attempt.`);
+  }
+  if (availability.warnings.length > 0) {
+    parts.push(availability.warnings.join(" "));
+  }
+
+  return parts.join(" ");
+}
+
+function isTerminalAutonomyStatus(status) {
+  return ["completed", "needs_review", "failed", "stopped", "timed_out"].includes(String(status || "").trim().toLowerCase());
 }
 
 function formatAutonomyStatus(status) {

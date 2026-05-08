@@ -527,7 +527,7 @@ function registerIpc() {
     } else {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
       if (fileOperations.length === 0) {
-        throw new Error("DEV produced no valid fileOperations.");
+        throw new Error("DEV produced no valid fileOperations or path-tagged code blocks.");
       }
 
       const plannedRunPath = buildGeneratedTaskRoot(sandboxParentPath, result?.project?.projectSlug);
@@ -899,7 +899,7 @@ async function executeAutonomyTask(task) {
     } else {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
       if (fileOperations.length === 0) {
-        throw new Error("DEV produced no valid fileOperations.");
+        throw new Error("DEV produced no valid fileOperations or path-tagged code blocks.");
       }
       const generatedProject = await backend.applyFileOperations(
         app.getPath("documents"),
@@ -2112,7 +2112,7 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     if (repairOperations.length === 0) {
       result = attachAutoRepairResult(result, {
         status: "needs_review",
-        summary: "DEV produced no valid fileOperations.",
+        summary: "DEV produced no valid fileOperations or path-tagged code blocks.",
         repairResult,
         validation: latestValidation
       });
@@ -2120,7 +2120,7 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
         attempt,
         status: "failed",
         currentStage: "patch",
-        lastError: "DEV produced no valid fileOperations."
+        lastError: "DEV produced no valid fileOperations or path-tagged code blocks."
       });
       return { result, activeTrackedEntry };
     }
@@ -2847,12 +2847,18 @@ function normalizeSuggestedCommand(command) {
     value = value.command || value.value || value.text || value.label || "";
   }
 
-  return String(value || "")
+  const normalized = String(value || "")
     .replace(/^[\s`*-]+/, "")
     .replace(/[`]+/g, "")
     .replace(/\r?\n+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+
+  if (/^(none|n\/a|na|no command|no commands|nothing)$/i.test(normalized)) {
+    return "";
+  }
+
+  return normalized;
 }
 
 function summarizeContextDocuments(documents) {

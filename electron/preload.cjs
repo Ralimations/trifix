@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("trifix", {
   testAgent: (payload) => ipcRenderer.invoke("pipeline:test-agent", payload),
   getLastResult: () => ipcRenderer.invoke("pipeline:last"),
   getSettings: () => ipcRenderer.invoke("app:settings"),
+  getModelHealth: () => ipcRenderer.invoke("app:model-health"),
   saveDialogue: (dialogue) => ipcRenderer.invoke("app:dialogue:save", dialogue),
   listProjects: () => ipcRenderer.invoke("projects:list"),
   removeProject: (id) => ipcRenderer.invoke("projects:remove", id),

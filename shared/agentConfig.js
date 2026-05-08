@@ -7,13 +7,8 @@ const envNumber = (value, fallback) => {
 };
 
 const PM_TIMEOUT_MS = envNumber(ENV.TRIFIX_PM_TIMEOUT_MS, 180000);
-const DEV_TIMEOUT_MS = envNumber(ENV.TRIFIX_DEV_TIMEOUT_MS, 600000);
+const DEV_TIMEOUT_MS = envNumber(ENV.TRIFIX_DEV_TIMEOUT_MS, 3600000);
 const QA_TIMEOUT_MS = envNumber(ENV.TRIFIX_QA_TIMEOUT_MS, 180000);
-
-// Additional models available via 10.8.0.3 endpoint (VPN only):
-// google/gemma-4-e2b (Available for future fallback/cosmetic chatter support)
-// ENV.TRIFIX_CHATTER_MODEL || "google/gemma-4-e2b"
-// ENV.TRIFIX_CHATTER_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat"
 
 export const AGENT_CONFIGS = {
   junior: {
@@ -22,16 +17,16 @@ export const AGENT_CONFIGS = {
     name: "Junior Dev",
     title: "Junior Dev",
     roleLabel: "junior dev / local patch applier",
-    summary: "uses DeepSeek Coder 6.7B Instruct to implement scoped code changes and apply patches",
+    summary: "implements the PM plan, generates project files, and requests safe project commands when needed",
     endpoint: ENV.TRIFIX_DEV_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
-    model: ENV.TRIFIX_DEV_MODEL || "deepseek-coder-6.7b-instruct",
+    model: ENV.TRIFIX_DEV_MODEL || "qwen/qwen3.5-9b",
     timeoutMs: DEV_TIMEOUT_MS,
     color: "blue",
     prompts: {
       system:
-        "You are Junior Dev and local patch applier. Implement the Supervisor spec, edit only listed or relevant files, avoid redesigns, and return concise code-focused output.",
+        "You are Junior Dev and implementation worker. Implement the PM task plan, generate actual project files, request safe commands only through structured commandRequests, avoid redesigns, and do not return advice instead of files.",
       output:
-        "Return changed files, fileOperations when creating or editing files, command requests if needed, and a short summary. Do not manage scope, review QA, make PRD decisions, or include hidden reasoning."
+        "Return changed files, fileOperations or path-tagged code blocks, safe command requests if needed, and a short summary. Do not manage scope, review QA, make PRD decisions, or include hidden reasoning."
     },
     speech: {
       prefix: "",
@@ -71,7 +66,7 @@ export const AGENT_CONFIGS = {
     color: "red",
     prompts: {
       system:
-        "You are Senior Dev / QA in an AI software team. Work read-only, review Supervisor specs, predict bugs and edge cases, suggest targeted fixes, and verify final output.",
+        "You are Senior Dev / QA in an AI software team. Work read-only, review PM plans and Junior output, tighten weak instructions when needed, predict bugs and edge cases, and verify final output without expanding scope unnecessarily.",
       output:
         "Return concise review notes with risks, edge cases, files to check, patch suggestions, tests, and final PASS/NEEDS PATCH status. Do not write implementation code or edit files."
     },
@@ -106,16 +101,16 @@ export const AGENT_CONFIGS = {
     name: "Supervisor / PM",
     title: "Supervisor / PM",
     roleLabel: "supervisor / planning + task routing",
-    summary: "routes work, creates concise specs, owns FSD/PRD alignment, and makes final decisions",
-    endpoint: ENV.TRIFIX_PM_ENDPOINT || "http://127.0.0.1:3010/api/v1/chat",
-    model: ENV.TRIFIX_PM_MODEL || "google/gemma-4-e4b",
+    summary: "interprets requests, reduces ambiguity, defines safe file scope, and makes final planning decisions",
+    endpoint: ENV.TRIFIX_PM_ENDPOINT || "http://10.8.0.3:3011/api/v1/chat",
+    model: ENV.TRIFIX_PM_MODEL || "google/gemma-4-e2b",
     timeoutMs: PM_TIMEOUT_MS,
     color: "green",
     prompts: {
       system:
-        "You are the Supervisor/PM in an AI software team. Read FSD and document context, create concise implementation specs, route work, maintain PRD alignment, and make final scope decisions. Do not output raw implementation code.",
+        "You are the Supervisor/PM in an AI software team. Interpret the request, reduce ambiguity, define compact implementation-safe scope, required files, constraints, and acceptance criteria. Avoid overengineering and do not invent dependencies unless explicitly requested.",
       output:
-        "Return concise task specs, expected files, constraints, acceptance checks, and final decision summaries. No raw code."
+        "Return concise task specs, required files, constraints, acceptance checks, notes for Junior, and final decision summaries. No raw implementation code."
     },
     speech: {
       prefix: "",

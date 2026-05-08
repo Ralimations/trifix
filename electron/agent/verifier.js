@@ -64,10 +64,31 @@ export async function verifyHtmlProject(rootPath) {
 
   try {
     const content = await fs.readFile(htmlPath, "utf8");
-    const hasHtmlStructure = /<!doctype html>/i.test(content) && /<html[\s>]/i.test(content) && /<body[\s>]/i.test(content);
-    pushCheck(checks, "index.html-structure", hasHtmlStructure, hasHtmlStructure
-      ? "index.html contains basic HTML structure."
-      : "index.html is missing basic HTML structure.");
+    const expectsFullDocument = /<html[\s>]/i.test(content) || /<body[\s>]/i.test(content) || /<head[\s>]/i.test(content);
+    const hasValidHtml5Doctype = /^\s*<!doctype html>/i.test(content);
+    const hasHtmlTag = /<html[\s>]/i.test(content);
+    const hasHeadTag = /<head[\s>]/i.test(content);
+    const hasBodyTag = /<body[\s>]/i.test(content);
+
+    if (expectsFullDocument) {
+      pushCheck(
+        checks,
+        "index.html-doctype",
+        hasValidHtml5Doctype,
+        hasValidHtml5Doctype ? "index.html contains a valid HTML5 doctype." : "Invalid or missing HTML5 doctype."
+      );
+      pushCheck(checks, "index.html-html-tag", hasHtmlTag, hasHtmlTag
+        ? "index.html contains an html tag."
+        : "index.html is missing an html tag.");
+      pushCheck(checks, "index.html-head-tag", hasHeadTag, hasHeadTag
+        ? "index.html contains a head tag."
+        : "index.html is missing a head tag.");
+      pushCheck(checks, "index.html-body-tag", hasBodyTag, hasBodyTag
+        ? "index.html contains a body tag."
+        : "index.html is missing a body tag.");
+    } else {
+      warnings.push("index.html appears to be an HTML fragment; skipping full-document doctype validation.");
+    }
   } catch (error) {
     if (error?.code !== "ENOENT") {
       warnings.push(`Could not inspect index.html: ${error.message}`);
@@ -103,9 +124,15 @@ export async function verifyPackageProject(rootPath) {
 }
 
 export function buildVerificationReport(result) {
+  const failedChecks = Array.isArray(result?.checks)
+    ? result.checks.filter((check) => check?.status === "failed" && check?.message)
+    : [];
   const lines = [
     `Verification status: ${result?.status || "failed"}`,
     result?.summary || "",
+    failedChecks.length
+      ? `Issues:\n${failedChecks.map((check) => `- ${check.message}`).join("\n")}`
+      : "",
     Array.isArray(result?.missingFiles) && result.missingFiles.length
       ? `Missing files:\n${result.missingFiles.map((filePath) => `- ${filePath}`).join("\n")}`
       : "",
