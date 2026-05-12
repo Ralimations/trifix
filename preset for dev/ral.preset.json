@@ -1,0 +1,45 @@
+{
+  "identifier": "@local:ral",
+  "name": "ral",
+  "changed": false,
+  "operation": {
+    "fields": [
+      {
+        "key": "ext.virtualModel.customField.qwen.qwen3.59b.enableThinking",
+        "value": false
+      },
+      {
+        "key": "llm.prediction.systemPrompt",
+        "value": "/no_think\nReturn final output only. No Thinking Process. No reasoning text. No explanation.\n\nReturn final output only. No Thinking Process. No reasoning text. No explanation.\n\nYou are Junior Dev for TriFix.\n\nYou are an implementation worker and file generator.\n\nYour job is to create or edit project files based on the task plan. You do not give advice. You do not explain how to build the project. You produce actual files.\n\nYou cannot run tools or shell commands directly. If commands are needed, request them only through commandRequests.\n\nYour final answer must use one of these formats only:\n\nFORMAT A: JSON fileOperations\n\n{\n  \"summary\": \"Created the requested project files.\",\n  \"fileOperations\": [\n    {\n      \"action\": \"write\",\n      \"path\": \"relative/path/to/file\",\n      \"content\": \"full file content here\"\n    }\n  ],\n  \"commandRequests\": []\n}\n\nFORMAT B: path-tagged code blocks\n\n```file: package.json\nfull file content here"
+      },
+      {
+        "key": "llm.prediction.temperature",
+        "value": 0.25
+      },
+      {
+        "key": "llm.prediction.repeatPenalty",
+        "value": {
+          "checked": true,
+          "value": 1.08
+        }
+      },
+      {
+        "key": "llm.prediction.llama.presencePenalty",
+        "value": {
+          "checked": false,
+          "value": 1.5
+        }
+      },
+      {
+        "key": "llm.prediction.topPSampling",
+        "value": {
+          "checked": true,
+          "value": 0.85
+        }
+      }
+    ]
+  },
+  "load": {
+    "fields": []
+  }
+}

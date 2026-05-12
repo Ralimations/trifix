@@ -29,6 +29,15 @@ const PROCESS_DIR_NAME = "processes";
 const PROCESS_REGISTRY_FILE = "processes.json";
 const DEFAULT_AUTONOMY_RUNTIME_MS = 8 * 60 * 60 * 1000;
 const MAX_AUTONOMY_RUNTIME_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_GUI_QA_SETTINGS = Object.freeze({
+  enabled: false,
+  mode: "headless",
+  browser: "chromium",
+  slowMoMs: 0,
+  autoRunAfterBuild: false,
+  stopDevServerAfterQa: true,
+  maxAttempts: 1
+});
 
 function logRunLock(event, payload = {}) {
   logStartupError(event, JSON.stringify(payload));
@@ -337,6 +346,9 @@ function registerIpc() {
     });
     return attachTrackedProjectWithGraph(project, tracked);
   });
+  ipcMain.handle("project:review-data", async (_event, payload = {}) =>
+    readProjectReviewData(payload?.projectRoot || payload?.path || "")
+  );
 
   ipcMain.handle("project:open-folder", async (_event, folderPath) => {
     if (!folderPath) {
@@ -397,15 +409,7 @@ function registerIpc() {
   ipcMain.handle("projects:remove", async (_event, id) => removeTrackedProject(id));
   ipcMain.handle("projects:update", async (_event, payload) => updateTrackedProject(payload?.id, payload));
 
-  ipcMain.handle("app:settings", async () => ({
-    endpoint: backend.AI_ENDPOINT,
-    endpoints: {
-      dev: backend.DEV_ENDPOINT,
-      qa: backend.AI_ENDPOINT,
-      pm: backend.ARCHITECT_ENDPOINT
-    },
-    agents: await getMergedAgents()
-  }));
+  ipcMain.handle("app:settings", async () => buildAppSettings());
   ipcMain.handle("app:model-health", async () => backend.getModelHealth());
 
   ipcMain.handle("app:dialogue:save", async (_event, dialoguePatch) => {
@@ -416,16 +420,17 @@ function registerIpc() {
     };
     await writeSettings(current);
 
-    return {
-      endpoint: backend.AI_ENDPOINT,
-      endpoints: {
-        dev: backend.DEV_ENDPOINT,
-        qa: backend.AI_ENDPOINT,
-        pm: backend.ARCHITECT_ENDPOINT
-      },
-      agents: await getMergedAgents()
-    };
+    return buildAppSettings();
   });
+  ipcMain.handle("app:gui-qa:save", async (_event, payload = {}) => {
+    const current = await readSettings();
+    current.guiQa = normalizeGuiQaSettings(payload);
+    await writeSettings(current);
+    return buildAppSettings();
+  });
+  ipcMain.handle("app:playwright:capability", async (_event, payload = {}) =>
+    detectPlaywrightCapability(payload)
+  );
 
   ipcMain.handle("pipeline:run", async (event, payload) => {
     const runId = payload?.runId || `run-${Date.now()}`;
@@ -3103,27 +3108,48 @@ async function discardGeneratedOutput(payload = {}) {
 }
 
 async function exportReviewData(payload = {}) {
+  console.log("download-review-data clicked");
+  logStartupError("review:export-data clicked", JSON.stringify({
+    runId: payload?.runId || payload?.autonomyRun?.runId || "",
+    projectRoot: payload?.projectRoot || payload?.result?.project?.rootPath || ""
+  }));
   const projectRoot = String(payload?.projectRoot || payload?.result?.project?.rootPath || "").trim();
-  if (!projectRoot) {
-    throw new Error("No project root is available for review export.");
+  const fallbackDir = app.getPath("documents");
+  let exportRoot = "";
+  let ledgerDir = "";
+
+  if (projectRoot) {
+    try {
+      exportRoot = await normalizeExistingProjectRoot(projectRoot);
+      ledgerDir = await initializeAutonomyLedger(exportRoot);
+    } catch (error) {
+      logStartupError("review:export-data", error);
+    }
   }
 
-  const dir = await initializeAutonomyLedger(projectRoot);
   const runId = String(payload?.runId || payload?.autonomyRun?.runId || payload?.result?.preflight?.runId || "").trim();
   const [artifacts, runState, finalReport, runLogRaw, agents] = await Promise.all([
-    readJsonFile(path.join(dir, ARTIFACTS_FILE), null),
-    readJsonFile(path.join(dir, RUN_STATE_FILE), null),
-    fs.readFile(path.join(dir, "final-report.md"), "utf8").catch(() => ""),
-    fs.readFile(path.join(dir, RUN_LOG_FILE), "utf8").catch(() => ""),
+    ledgerDir ? readJsonFile(path.join(ledgerDir, ARTIFACTS_FILE), null) : Promise.resolve(null),
+    ledgerDir ? readJsonFile(path.join(ledgerDir, RUN_STATE_FILE), null) : Promise.resolve(null),
+    ledgerDir ? fs.readFile(path.join(ledgerDir, "final-report.md"), "utf8").catch(() => "") : Promise.resolve(""),
+    ledgerDir ? fs.readFile(path.join(ledgerDir, RUN_LOG_FILE), "utf8").catch(() => "") : Promise.resolve(""),
     getMergedAgents().catch(() => [])
   ]);
+  const normalizedAgents = normalizeAgents(agents);
+  const exportBaseName = sanitizeGeneratedSlug(
+    runId
+    || payload?.projectName
+    || payload?.result?.project?.projectName
+    || (exportRoot ? path.basename(exportRoot) : "run")
+    || "run"
+  ) || "run";
 
   const exportPayload = sanitizeReviewExport({
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
     runId: runId || runState?.runId || "",
-    projectName: payload?.result?.project?.projectName || payload?.projectName || path.basename(projectRoot),
-    projectRoot,
+    projectName: payload?.result?.project?.projectName || payload?.projectName || (exportRoot ? path.basename(exportRoot) : null),
+    projectRoot: exportRoot || projectRoot || null,
     userPrompt: payload?.input || runState?.taskInput || "",
     selectedRunMode: payload?.result?.preflight?.runMode || payload?.preflight?.runMode || "",
     preflight: payload?.preflight || payload?.result?.preflight || null,
@@ -3131,7 +3157,7 @@ async function exportReviewData(payload = {}) {
     activeModels: payload?.preflight?.activeModels || null,
     unavailableModels: payload?.preflight?.unavailableModels || null,
     timeoutPolicy: backend.TIMEOUT_POLICY || null,
-    modelConfig: (agents || []).map((agent) => ({
+    modelConfig: normalizedAgents.map((agent) => ({
       id: agent.id,
       name: agent.name,
       model: agent.model,
@@ -3150,9 +3176,10 @@ async function exportReviewData(payload = {}) {
     }
   });
 
+  const defaultDirectory = exportRoot || fallbackDir;
   const defaultPath = path.join(
-    dir,
-    `trifix-review-data-${sanitizeGeneratedSlug(runId || path.basename(projectRoot) || "run") || "run"}.json`
+    defaultDirectory,
+    `trifix-review-data-${exportBaseName}.json`
   );
   const saveDialog = await dialog.showSaveDialog(mainWindow, {
     title: "Download All Review Data",
@@ -3170,15 +3197,54 @@ async function exportReviewData(payload = {}) {
   };
 }
 
+function normalizeAgents(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry) => entry && typeof entry === "object")
+      .map((entry) => ({
+        id: String(entry.id || entry.role || entry.name || "").trim(),
+        role: String(entry.role || entry.id || entry.name || "").trim(),
+        name: String(entry.name || entry.role || entry.id || "").trim(),
+        model: String(entry.model || "").trim(),
+        endpoint: String(entry.endpoint || "").trim(),
+        timeoutMs: Number(entry.timeoutMs || 0) || 0,
+        status: String(entry.status || "").trim()
+      }));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.entries(value)
+      .filter(([, entry]) => entry && typeof entry === "object")
+      .map(([key, entry]) => ({
+        id: String(entry.id || key || "").trim(),
+        role: String(entry.role || key || "").trim(),
+        name: String(entry.name || entry.role || key || "").trim(),
+        model: String(entry.model || "").trim(),
+        endpoint: String(entry.endpoint || "").trim(),
+        timeoutMs: Number(entry.timeoutMs || 0) || 0,
+        status: String(entry.status || "").trim()
+      }));
+  }
+
+  return [];
+}
+
 async function finishReview(payload = {}) {
   const projectRoot = String(payload?.projectRoot || payload?.result?.project?.rootPath || "").trim();
   const projectId = String(payload?.projectId || "").trim();
   const validationStatus = getEffectiveValidationStatus(payload?.result || {});
-  const status = validationStatus === "failed"
-    ? "Review finished - follow-up prompt recommended"
+  const projectType = String(payload?.result?.autoRepair?.finalValidation?.projectType || payload?.result?.validation?.projectType || "").trim().toLowerCase();
+  const decisionStatus = String(payload?.result?.decision?.decisionStatus || "").trim().toLowerCase();
+  const finalPmStatus = String(payload?.result?.finalization?.pmStatus || "").trim().toLowerCase();
+  const status = validationStatus === "failed" || decisionStatus === "needs_patch"
+    ? "Review finished - patch recommended"
     : validationStatus === "needs_review"
-      ? "Review finished - build still unverified"
-      : "Ready for next prompt";
+      ? projectType === "vite-react"
+        ? "Review finished - build still unverified"
+        : "Review finished - follow-up prompt recommended"
+      : finalPmStatus === "timed_out"
+        ? "Review finished - follow-up prompt recommended"
+        : "Ready for next prompt";
 
   if (projectId) {
     await updateTrackedProject(projectId, {
@@ -3206,6 +3272,163 @@ async function finishReview(payload = {}) {
     decisionStatus: "acknowledged",
     status
   };
+}
+
+async function buildAppSettings() {
+  const current = await readSettings();
+  return {
+    endpoint: backend.AI_ENDPOINT,
+    endpoints: {
+      dev: backend.DEV_ENDPOINT,
+      qa: backend.AI_ENDPOINT,
+      pm: backend.ARCHITECT_ENDPOINT
+    },
+    agents: await getMergedAgents(),
+    guiQa: normalizeGuiQaSettings(current.guiQa)
+  };
+}
+
+async function readProjectReviewData(rootPath) {
+  const projectRoot = String(rootPath || "").trim();
+  if (!projectRoot) {
+    return {
+      projectRoot: "",
+      finalReport: "",
+      artifacts: null,
+      runState: null,
+      runLogExcerpts: [],
+      reportAvailable: false
+    };
+  }
+
+  let normalizedRoot = "";
+  let ledgerDir = "";
+  try {
+    normalizedRoot = await normalizeExistingProjectRoot(projectRoot);
+    ledgerDir = await initializeAutonomyLedger(normalizedRoot);
+  } catch {
+    return {
+      projectRoot,
+      finalReport: "",
+      artifacts: null,
+      runState: null,
+      runLogExcerpts: [],
+      reportAvailable: false
+    };
+  }
+
+  const [artifacts, runState, finalReport, runLogRaw] = await Promise.all([
+    readJsonFile(path.join(ledgerDir, ARTIFACTS_FILE), null).catch(() => null),
+    readJsonFile(path.join(ledgerDir, RUN_STATE_FILE), null).catch(() => null),
+    fs.readFile(path.join(ledgerDir, "final-report.md"), "utf8").catch(() => ""),
+    fs.readFile(path.join(ledgerDir, RUN_LOG_FILE), "utf8").catch(() => "")
+  ]);
+
+  return {
+    projectRoot: normalizedRoot,
+    finalReport: typeof finalReport === "string" ? finalReport : "",
+    artifacts: artifacts && typeof artifacts === "object" ? artifacts : null,
+    runState: runState && typeof runState === "object" ? runState : null,
+    runLogExcerpts: collectReviewLogEntries(runLogRaw, String(runState?.runId || "")).slice(-80),
+    reportAvailable: Boolean(String(finalReport || "").trim())
+  };
+}
+
+function normalizeGuiQaSettings(value = {}) {
+  const candidate = value && typeof value === "object" ? value : {};
+  const mode = String(candidate.mode || DEFAULT_GUI_QA_SETTINGS.mode).trim().toLowerCase();
+  const browser = String(candidate.browser || DEFAULT_GUI_QA_SETTINGS.browser).trim().toLowerCase();
+  const slowMoMs = Number(candidate.slowMoMs);
+  const maxAttempts = Number(candidate.maxAttempts);
+  return {
+    enabled: Boolean(candidate.enabled),
+    mode: ["headless", "live"].includes(mode) ? mode : DEFAULT_GUI_QA_SETTINGS.mode,
+    browser: browser === "chromium" ? browser : DEFAULT_GUI_QA_SETTINGS.browser,
+    slowMoMs: Number.isFinite(slowMoMs) ? Math.max(0, Math.round(slowMoMs)) : DEFAULT_GUI_QA_SETTINGS.slowMoMs,
+    autoRunAfterBuild: Boolean(candidate.autoRunAfterBuild),
+    stopDevServerAfterQa: candidate.stopDevServerAfterQa !== false,
+    maxAttempts: Number.isFinite(maxAttempts) ? Math.max(1, Math.round(maxAttempts)) : DEFAULT_GUI_QA_SETTINGS.maxAttempts
+  };
+}
+
+async function detectPlaywrightCapability(payload = {}) {
+  let targetRoot = String(payload?.projectRoot || "").trim();
+  if (targetRoot) {
+    try {
+      targetRoot = await normalizeExistingProjectRoot(targetRoot);
+    } catch {
+      targetRoot = "";
+    }
+  }
+  if (!targetRoot) {
+    targetRoot = process.cwd();
+  }
+
+  const resolvedTestPackage = resolveOptionalPackage("@playwright/test", targetRoot);
+  if (!resolvedTestPackage) {
+    return {
+      status: "package_missing",
+      packageStatus: "missing",
+      browsersStatus: "not_checked",
+      browser: "chromium",
+      checkedAt: new Date().toISOString(),
+      targetRoot,
+      details: "@playwright/test is not installed for this workspace."
+    };
+  }
+
+  const browserPackageName = resolveOptionalPackage("playwright", targetRoot)
+    ? "playwright"
+    : (resolveOptionalPackage("playwright-core", targetRoot) ? "playwright-core" : "");
+  if (!browserPackageName) {
+    return {
+      status: "browsers_missing",
+      packageStatus: "available",
+      browsersStatus: "missing",
+      browser: "chromium",
+      checkedAt: new Date().toISOString(),
+      targetRoot,
+      details: "@playwright/test is installed, but the Playwright browser runtime package was not found."
+    };
+  }
+
+  try {
+    const playwright = require(browserPackageName);
+    const executablePath = typeof playwright?.chromium?.executablePath === "function"
+      ? playwright.chromium.executablePath()
+      : "";
+    const browserInstalled = Boolean(executablePath) && await fileExists(executablePath);
+    return {
+      status: browserInstalled ? "available" : "browsers_missing",
+      packageStatus: "available",
+      browsersStatus: browserInstalled ? "available" : "missing",
+      browser: "chromium",
+      checkedAt: new Date().toISOString(),
+      targetRoot,
+      executablePath: browserInstalled ? executablePath : "",
+      details: browserInstalled
+        ? `Chromium is available at ${executablePath}.`
+        : "Playwright is installed, but Chromium browser binaries were not found."
+    };
+  } catch (error) {
+    return {
+      status: "browsers_missing",
+      packageStatus: "available",
+      browsersStatus: "missing",
+      browser: "chromium",
+      checkedAt: new Date().toISOString(),
+      targetRoot,
+      details: error?.message || "Playwright package was found, but Chromium could not be resolved."
+    };
+  }
+}
+
+function resolveOptionalPackage(packageName, rootPath) {
+  try {
+    return require.resolve(`${packageName}/package.json`, { paths: [rootPath] });
+  } catch {
+    return "";
+  }
 }
 
 function collectReviewLogEntries(raw, runId = "") {

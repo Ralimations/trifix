@@ -197,6 +197,7 @@ export function App() {
   const [decisionReason, setDecisionReason] = useState("");
   const [decisionPreview, setDecisionPreview] = useState([]);
   const [decisionMessage, setDecisionMessage] = useState("");
+  const [decisionError, setDecisionError] = useState("");
   const [modelAvailability, setModelAvailability] = useState(null);
   const [runPreflight, setRunPreflight] = useState(null);
   const [isDecisionBusy, setIsDecisionBusy] = useState(false);
@@ -207,6 +208,7 @@ export function App() {
   const ignoredRunIdsRef = useRef(new Set());
   const runStartPendingRef = useRef(false);
   const userSelectedReviewTabRef = useRef(false);
+  const suppressAutoTabSwitchRef = useRef(false);
   const modelAvailabilityRef = useRef(null);
   const stageMessageKeysRef = useRef(new Set());
   const messageSequenceRef = useRef(0);
@@ -239,11 +241,12 @@ export function App() {
   function updateActiveTab(nextTab, { userInitiated = false, force = false } = {}) {
     if (userInitiated) {
       userSelectedReviewTabRef.current = true;
+      suppressAutoTabSwitchRef.current = true;
       setActiveTab(nextTab);
       return;
     }
 
-    if (force || !userSelectedReviewTabRef.current) {
+    if (force || (!userSelectedReviewTabRef.current && !suppressAutoTabSwitchRef.current)) {
       setActiveTab(nextTab);
     }
   }
@@ -1460,8 +1463,10 @@ export function App() {
           : "Run request started. The team will create output files inside a new sandbox.";
 
       setDecisionMessage(runStartMessage);
+      setDecisionError("");
       setDecisionPreview([]);
       userSelectedReviewTabRef.current = false;
+      suppressAutoTabSwitchRef.current = false;
       setReviewFinishedState(null);
       updateActiveTab("architect", { force: true });
       setResult(null);
@@ -1660,8 +1665,10 @@ export function App() {
       preflight
     });
     setDecisionMessage(runStartMessage);
+    setDecisionError("");
     setDecisionPreview([]);
     userSelectedReviewTabRef.current = false;
+    suppressAutoTabSwitchRef.current = false;
     setReviewFinishedState(null);
     updateActiveTab("architect", { force: true });
     setResult(null);
@@ -2126,28 +2133,30 @@ export function App() {
 
   async function downloadAllReviewData() {
     const outputProject = resultProject || project || normalizeGeneratedProject(result, null);
-    if (!outputProject?.rootPath) {
-      setDecisionMessage("No review data is available until a project output exists.");
-      return;
-    }
+    console.log("download-review-data clicked");
 
     setIsDecisionBusy(true);
+    setDecisionError("");
     try {
+      if (!window.trifix?.exportReviewData) {
+        throw new Error("Review export API is unavailable.");
+      }
       const exported = await window.trifix.exportReviewData({
         runId: autonomyRun?.runId || currentRunRef.current,
-        projectId: outputProject.projectId,
-        projectName: outputProject.projectName || outputProject.name,
-        projectRoot: outputProject.rootPath,
+        projectId: outputProject?.projectId || result?.project?.projectId || "",
+        projectName: outputProject?.projectName || outputProject?.name || result?.project?.projectName || result?.project?.name || "",
+        projectRoot: outputProject?.rootPath || result?.project?.rootPath || "",
         input: codeInput,
         result,
         workflow,
         preflight: runPreflight || result?.preflight || autonomyRun?.preflight || null,
         autonomyRun
       });
-      if (exported?.cancelled) {
+      if (exported?.cancelled || exported?.canceled) {
         setDecisionMessage("Review data export cancelled.");
         return;
       }
+      setDecisionError("");
       setDecisionMessage(`Review data exported to ${exported.path}.`);
       pushNotification({
         type: "success",
@@ -2155,7 +2164,14 @@ export function App() {
         message: exported.path
       });
     } catch (exportError) {
-      setDecisionMessage(exportError?.message || "Could not export review data.");
+      const message = exportError?.message || "Could not export review data.";
+      setDecisionMessage(message);
+      setDecisionError(message);
+      pushNotification({
+        type: "error",
+        title: "Review export failed",
+        message
+      });
     } finally {
       setIsDecisionBusy(false);
     }
@@ -2163,35 +2179,46 @@ export function App() {
 
   async function finishReviewState() {
     const outputProject = resultProject || project || normalizeGeneratedProject(result, null);
-    if (!outputProject?.rootPath) {
-      return;
-    }
 
     setIsDecisionBusy(true);
+    setDecisionError("");
     try {
       const finished = await window.trifix.finishReview({
-        projectId: outputProject.projectId,
-        projectRoot: outputProject.rootPath,
+        projectId: outputProject?.projectId || result?.project?.projectId || "",
+        projectRoot: outputProject?.rootPath || result?.project?.rootPath || "",
         result
       });
+      const nextTask =
+        finished?.decisionStatus === "acknowledged" && getResultValidationStatus(result) === "failed"
+          ? "Patch recommended"
+          : finished?.decisionStatus === "acknowledged" && getResultValidationStatus(result) === "needs_review"
+            ? "Manual review follow-up recommended"
+            : "Ready for next prompt";
       setReviewFinishedState(finished);
       setWorkflow((current) => ({
         ...current,
         decisionStatus: finished?.decisionStatus || "acknowledged",
-        currentStage: "decision",
+        currentStage: "phase-ready",
         projectStatus: finished?.status || current.projectStatus,
-        currentTask: "Ready for next prompt"
+        currentTask: nextTask
       }));
       setResult((current) => current ? ({
         ...current,
         workflow: {
           ...(current.workflow || {}),
           decisionStatus: finished?.decisionStatus || "acknowledged",
-          currentStage: "decision",
+          currentStage: "phase-ready",
           projectStatus: finished?.status || current.workflow?.projectStatus || "Ready for next prompt",
-          currentTask: "Ready for next prompt"
+          currentTask: nextTask
         }
       }) : current);
+      setAutonomyRun((current) => current ? ({
+        ...current,
+        status: "review_finished",
+        message: finished?.status || current.message || "Review finished.",
+        updatedAt: new Date().toISOString()
+      }) : current);
+      setDecisionError("");
       setDecisionMessage(finished?.status || "Review finished.");
       pushNotification({
         type: "success",
@@ -2200,7 +2227,14 @@ export function App() {
       });
       await refreshTrackedProjects();
     } catch (finishError) {
-      setDecisionMessage(finishError?.message || "Could not finish review.");
+      const message = finishError?.message || "Could not finish review.";
+      setDecisionMessage(message);
+      setDecisionError(message);
+      pushNotification({
+        type: "error",
+        title: "Finish review failed",
+        message
+      });
     } finally {
       setIsDecisionBusy(false);
     }
@@ -2229,6 +2263,9 @@ export function App() {
       const reopened = entry.type === "sandbox-task"
         ? await window.trifix.openSandboxProject(entry)
         : await window.trifix.openTrackedProject(entry);
+      const reviewData = await window.trifix.getProjectReviewData({
+        projectRoot: reopened?.rootPath || entry?.path || ""
+      });
       setProject(reopened);
       setResultProject(null);
       setSelectedFiles(reopened.defaultSelectedFiles || []);
@@ -2264,6 +2301,12 @@ export function App() {
         currentStage: mapTrackedStatusToStage(entry?.status, entry?.decisionStatus),
         loopCount: Number(entry?.loopCount || 0),
         decisionStatus: entry?.decisionStatus || "pending"
+      }));
+      setResult(buildTrackedProjectResult({
+        project: reopened,
+        entry,
+        autonomyState: persistedAutonomy,
+        reviewData
       }));
       setTaskTitle(reopened.projectSlug || reopened.name || "");
       setActiveView("office");
@@ -2390,6 +2433,7 @@ export function App() {
     setCodeInput("");
     setReviewFinishedState(null);
     userSelectedReviewTabRef.current = false;
+    suppressAutoTabSwitchRef.current = false;
     setAgents(agentCatalog.map((agent) => ({ ...agent, status: "idle" })));
     setWorkflow({
       folderLoaded: Boolean(project?.rootPath),
@@ -2626,7 +2670,18 @@ export function App() {
           </WorkspaceErrorBoundary>
         ) : null}
 
-        {activeView === "reports" ? <ReportsView result={result} testerResult={testerResult} /> : null}
+        {activeView === "reports" ? (
+          <WorkspaceErrorBoundary resetKey={`${activeView}:${project?.rootPath || "none"}:${autonomyRun?.runId || "idle"}:${workflow?.decisionStatus || "pending"}`}>
+            <ReportsView
+              result={result}
+              project={project}
+              workflow={workflow}
+              autonomyRun={autonomyRun}
+              testerResult={testerResult}
+              onExportReviewData={downloadAllReviewData}
+            />
+          </WorkspaceErrorBoundary>
+        ) : null}
         {activeView === "settings" ? (
           <SettingsView
             settings={settings}
@@ -2712,6 +2767,43 @@ class WorkspaceErrorBoundary extends Component {
           </div>
           <div className="decision-summary">
             <p>{this.state.error?.message || "Unknown renderer error."}</p>
+            <p>Try switching tabs or export raw review data instead.</p>
+          </div>
+        </section>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+class ReviewPaneErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidUpdate(prevProps) {
+    if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <section className="output-panel tone-red workspace-error-boundary" role="alert">
+          <div className="output-panel-header">
+            <span className="output-tab">Review Error</span>
+            <h2>{this.props.title || "This review panel could not be rendered."}</h2>
+          </div>
+          <div className="decision-summary">
+            <p>{this.state.error?.message || "Unknown renderer error."}</p>
+            <p>{this.props.message || "Switch to another tab or export raw review data instead."}</p>
           </div>
         </section>
       );
@@ -2885,7 +2977,15 @@ function OfficeView({
 
       <CompactWorkflowStepper workflow={workflow} result={result} progress={workflowProgress} preflight={runPreflight} autonomyRun={autonomyRun} />
 
-      {runPreflight ? (
+      {shouldShowCompactPreflightSummary(runPreflight, result, autonomyRun) ? (
+        <CompactPreflightSummary
+          preflight={runPreflight || result?.preflight || autonomyRun?.preflight || null}
+          onRecheck={onRecheckPreflight}
+          isBusy={isRunning}
+        />
+      ) : null}
+
+      {shouldShowExpandedPreflightPanel(runPreflight) ? (
         <PreflightPanel
           preflight={runPreflight}
           isBusy={isRunning}
@@ -3293,6 +3393,7 @@ function OutputBin({
   decisionPreview,
   decisionReason,
   decisionMessage,
+  decisionError,
   isDecisionBusy,
   onTabChange,
   onDecisionReason,
@@ -3309,7 +3410,8 @@ function OutputBin({
   onRestartProcess,
   onViewProcessLog
 }) {
-  const workflowProgress = buildWorkflowProgress({ workflow, result });
+  const safeWorkflow = workflow || { currentStage: "idle", loopCount: 0, decisionStatus: "pending" };
+  const workflowProgress = buildWorkflowProgress({ workflow: safeWorkflow, result });
   return (
     <section className="output-section" aria-label="Output Bin">
       <div className="output-section-header">
@@ -3318,12 +3420,12 @@ function OutputBin({
           <h2>Review cycle</h2>
         </div>
         <div className="workflow-meta">
-          <span>Stage: {workflow.currentStage}</span>
-          <span>Loop: {workflow.loopCount}</span>
+          <span>Stage: {safeWorkflow.currentStage}</span>
+          <span>Loop: {safeWorkflow.loopCount}</span>
           <span>Run: {workflowProgress.summary}</span>
-          {workflow.currentTask ? <span>Task: {workflow.currentTask}</span> : null}
-          {workflow.commandStatus ? <span>Command: {workflow.commandStatus}</span> : null}
-          <span>Decision: {workflow.decisionStatus}</span>
+          {safeWorkflow.currentTask ? <span>Task: {safeWorkflow.currentTask}</span> : null}
+          {safeWorkflow.commandStatus ? <span>Command: {safeWorkflow.commandStatus}</span> : null}
+          <span>Decision: {safeWorkflow.decisionStatus}</span>
         </div>
       </div>
 
@@ -3340,7 +3442,8 @@ function OutputBin({
         ))}
       </div>
 
-      <div className="output-grid single">
+      <ReviewPaneErrorBoundary resetKey={`${activeTab}:${safeWorkflow.currentStage || "idle"}:${safeWorkflow.decisionStatus || "pending"}:${result?.project?.rootPath || "none"}`}>
+        <div className="output-grid single">
         {activeTab === "junior" ? (
           <OutputPanel
             title="Junior Dev"
@@ -3394,10 +3497,11 @@ function OutputBin({
         {activeTab === "decision" ? (
           <DecisionPanel
             result={result}
-            workflow={workflow}
+            workflow={safeWorkflow}
             decisionPreview={decisionPreview}
             decisionReason={decisionReason}
             decisionMessage={decisionMessage}
+            decisionError={decisionError}
             isDecisionBusy={isDecisionBusy}
             onDecisionReason={onDecisionReason}
             onAccept={onAccept}
@@ -3410,7 +3514,8 @@ function OutputBin({
             reviewFinishedState={reviewFinishedState}
           />
         ) : null}
-      </div>
+        </div>
+      </ReviewPaneErrorBoundary>
     </section>
   );
 }
@@ -3421,6 +3526,7 @@ function DecisionPanel({
   decisionPreview,
   decisionReason,
   decisionMessage,
+  decisionError,
   isDecisionBusy,
   onDecisionReason,
   onAccept,
@@ -3432,18 +3538,19 @@ function DecisionPanel({
   onFinishReview,
   reviewFinishedState
 }) {
-  const decision = result?.decision;
+  const decision = result?.decision && typeof result.decision === "object" ? result.decision : {};
+  const affectedFiles = Array.isArray(decision?.affectedFiles) ? decision.affectedFiles : [];
+  const proposedChanges = Array.isArray(decision?.proposedChanges) ? decision.proposedChanges : [];
   const needsPatch = String(workflow?.decisionStatus || decision?.decisionStatus || "").toLowerCase() === "needs_patch";
   const requiresManualReview = String(workflow?.decisionStatus || "").toLowerCase() === "manual_review_required";
   const reviewAcknowledged = String(workflow?.decisionStatus || "").toLowerCase() === "acknowledged";
   const canDiscard = canDiscardGeneratedOutput(result?.project, result);
-  const validationStatus = getResultValidationStatus(result);
+  const reviewLifecycleState = getReviewLifecycleState(workflow, result);
   const terminalReviewState =
     reviewAcknowledged
+    || ["output_ready", "ready_for_review", "needs_review", "build_unverified", "validation_failed", "needs_patch", "completed"].includes(reviewLifecycleState)
     || requiresManualReview
-    || needsPatch
-    || ["passed", "needs_review", "failed"].includes(validationStatus)
-    || String(result?.finalization?.pmStatus || "").trim().toLowerCase() === "timed_out";
+    || needsPatch;
   const canFinishReview = terminalReviewState && hasUsefulOutput(result) && !reviewAcknowledged;
   const override = result?.finalization?.deterministicOverride;
 
@@ -3485,7 +3592,7 @@ function DecisionPanel({
         <div>
           <h3>Affected Files</h3>
           <ul className="affected-files">
-            {(decision?.affectedFiles || []).map((file) => (
+            {affectedFiles.map((file) => (
               <li key={file}>
                 <FileCode2 size={16} />
                 <span>{file}</span>
@@ -3496,7 +3603,7 @@ function DecisionPanel({
         <div>
           <h3>Proposed Changes</h3>
           <ul className="decision-list">
-            {(decision?.proposedChanges || []).map((item, index) => (
+            {proposedChanges.map((item, index) => (
               <li key={`${item}-${index}`}>{item}</li>
             ))}
           </ul>
@@ -3571,8 +3678,20 @@ function DecisionPanel({
           <span>Manual review required.</span>
         </div>
       ) : null}
+      {decisionError ? (
+        <div className="error-banner" role="alert">
+          <TriangleAlert size={18} />
+          <span>{decisionError}</span>
+        </div>
+      ) : null}
       <div className="decision-actions">
-        <button className="secondary-button" type="button" onClick={onExportReviewData} disabled={isDecisionBusy}>
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={onExportReviewData}
+          disabled={isDecisionBusy}
+          data-testid="download-review-data-button"
+        >
           <FilePlus2 size={16} />
           Download All Review Data
         </button>
@@ -3641,6 +3760,38 @@ function CompactWorkflowStepper({ workflow, result, progress, preflight, autonom
   );
 }
 
+function CompactPreflightSummary({ preflight, onRecheck, isBusy = false }) {
+  if (!preflight) {
+    return null;
+  }
+
+  const activeNames = (preflight.activeModels || []).map((entry) => entry.name);
+  const compactMessage = preflight.state === "checking"
+    ? "Initializing TriFix..."
+    : activeNames.length > 0
+      ? `Preflight passed: ${activeNames.join(", ")} available`
+      : preflight.message;
+
+  return (
+    <section className="output-panel tone-green preflight-compact-panel" aria-label="Preflight summary">
+      <div className="output-panel-header">
+        <span className="output-tab">Preflight</span>
+        <h2>Initialization summary</h2>
+      </div>
+      <div className="preflight-compact-copy">
+        <p>{compactMessage}</p>
+        <small>{preflight.message}</small>
+      </div>
+      <div className="decision-actions">
+        <button className="secondary-button" type="button" onClick={onRecheck} disabled={isBusy}>
+          <RefreshCw size={16} />
+          Recheck Models
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function PreflightPanel({ preflight, isBusy, onStartRun, onProceedAnyway, onRecheck, onBack }) {
   if (!preflight) {
     return null;
@@ -3650,6 +3801,7 @@ function PreflightPanel({ preflight, isBusy, onStartRun, onProceedAnyway, onRech
   const showProceedAnyway = preflight.state === "degraded_available";
   const showRecheck = preflight.state !== "checking";
   const showBack = preflight.state !== "checking";
+  const showOfflineHelp = ["blocked", "degraded_available", "ready_with_warnings"].includes(preflight.state);
 
   return (
     <section className="output-panel tone-green preflight-panel" aria-label="TriFix initialization">
@@ -3709,6 +3861,12 @@ function PreflightPanel({ preflight, isBusy, onStartRun, onProceedAnyway, onRech
         <strong>Recommended mode</strong>
         <span>{formatRunModeLabel(preflight.selectedRunMode)}</span>
       </div>
+      {showOfflineHelp ? (
+        <div className="context-banner preflight-help-banner">
+          <strong>Available while some agents are unavailable:</strong>
+          <span> Inspect old projects, view reports if available, export review data, and check settings. Developer-only degraded mode is allowed only when Developer is online.</span>
+        </div>
+      ) : null}
       <div className="decision-actions">
         {showStart ? (
           <button className="primary-button" type="button" onClick={onStartRun} disabled={isBusy}>
@@ -4174,11 +4332,21 @@ function TreeNode({ node, selectedFileSet, onToggleFile }) {
   );
 }
 
-function ReportsView({ result, testerResult }) {
+function ReportsView({ result, project, workflow, autonomyRun, testerResult, onExportReviewData }) {
+  const reviewData = result?.reviewData || {};
+  const finalReport = String(reviewData?.finalReport || "").trim();
+  const runState = reviewData?.runState && typeof reviewData.runState === "object" ? reviewData.runState : null;
+  const artifacts = reviewData?.artifacts && typeof reviewData.artifacts === "object" ? reviewData.artifacts : null;
+  const runLogExcerpts = Array.isArray(reviewData?.runLogExcerpts) ? reviewData.runLogExcerpts : [];
+  const safeWorkflow = workflow || result?.workflow || { currentStage: "idle", loopCount: 0, decisionStatus: "pending" };
+  const effectiveProject = project || normalizeGeneratedProject(result, null);
+  const reportStatus = finalReport
+    ? "Final report available"
+    : "No final report is available for this run yet.";
   return (
     <section className="simple-view">
       <p className="eyebrow">Reports</p>
-      <h1>Last pipeline result</h1>
+      <h1>Run report</h1>
       {testerResult ? (
         <div className="output-panel tone-blue">
           <div className="output-panel-header">
@@ -4188,25 +4356,71 @@ function ReportsView({ result, testerResult }) {
           <pre>{testerResult.output}</pre>
         </div>
       ) : null}
-      <OutputBin
-        result={result}
-        activeTab="decision"
-        workflow={result?.workflow || { currentStage: "idle", loopCount: 0, decisionStatus: "pending" }}
-        decisionPreview={[]}
-        decisionReason=""
-        decisionMessage=""
-        isDecisionBusy={false}
-        onTabChange={() => { }}
-        onDecisionReason={() => { }}
-        onAccept={() => { }}
-        onAcceptAndApply={() => { }}
-        onAdvanceCycle={() => { }}
-        onNeedsPatch={() => { }}
-        onDiscardOutput={() => { }}
-        onExportReviewData={() => { }}
-        onFinishReview={() => { }}
-        reviewFinishedState={null}
-      />
+      <div className="output-panel tone-blue">
+        <div className="output-panel-header">
+          <span className="output-tab">Status</span>
+          <h2>{reportStatus}</h2>
+        </div>
+        <div className="decision-columns">
+          <div>
+            <h3>Project</h3>
+            <ul className="decision-list">
+              <li>{effectiveProject?.projectName || effectiveProject?.name || result?.project?.projectName || "Unknown project"}</li>
+              <li>{effectiveProject?.rootPath || reviewData?.projectRoot || "Project path unavailable"}</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Run state</h3>
+            <ul className="decision-list">
+              <li>Status: {runState?.status || autonomyRun?.status || "unknown"}</li>
+              <li>Stage: {runState?.stage || runState?.currentStage || safeWorkflow.currentStage || "unknown"}</li>
+              <li>Decision: {safeWorkflow.decisionStatus || result?.decision?.decisionStatus || "pending"}</li>
+            </ul>
+          </div>
+        </div>
+        <div className="decision-actions">
+          <button className="secondary-button" type="button" onClick={onExportReviewData}>
+            <FilePlus2 size={16} />
+            Download All Review Data
+          </button>
+        </div>
+      </div>
+      <ReviewPaneErrorBoundary
+        resetKey={`${effectiveProject?.rootPath || "none"}:${runState?.runId || autonomyRun?.runId || "idle"}:${Boolean(finalReport)}`}
+        title="Report data could not be rendered."
+        message="Report data could not be rendered. Export raw review data instead."
+      >
+        <div className="output-panel tone-green">
+          <div className="output-panel-header">
+            <span className="output-tab">Final Report</span>
+            <h2>Review summary</h2>
+          </div>
+          {finalReport ? (
+            <pre className="report-output">{finalReport}</pre>
+          ) : (
+            <p>No final report is available for this run yet.</p>
+          )}
+        </div>
+      </ReviewPaneErrorBoundary>
+      <div className="output-panel tone-blue">
+        <div className="output-panel-header">
+          <span className="output-tab">Artifacts</span>
+          <h2>Captured review data</h2>
+        </div>
+        <div className="decision-columns">
+          <div>
+            <h3>Artifacts</h3>
+            <p>{artifacts ? `${Array.isArray(artifacts?.records) ? artifacts.records.length : 0} record(s) tracked.` : "No artifacts ledger was found for this run."}</p>
+          </div>
+          <div>
+            <h3>Run logs</h3>
+            <p>{runLogExcerpts.length > 0 ? `${runLogExcerpts.length} review log entr${runLogExcerpts.length === 1 ? "y" : "ies"} available.` : "No run logs were found for this run."}</p>
+          </div>
+        </div>
+        {!finalReport && !artifacts && !runState ? (
+          <p>Report data could not be rendered. Export raw review data instead.</p>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -4588,18 +4802,61 @@ function SceneOverlay({ scene }) {
   );
 }
 
+function createDefaultGuiQaSettings() {
+  return {
+    enabled: false,
+    mode: "headless",
+    browser: "chromium",
+    slowMoMs: 0,
+    autoRunAfterBuild: false,
+    stopDevServerAfterQa: true,
+    maxAttempts: 1
+  };
+}
+
+function normalizeGuiQaDraft(value) {
+  const next = { ...createDefaultGuiQaSettings(), ...(value || {}) };
+  next.mode = next.mode === "live" ? "live" : "headless";
+  next.browser = "chromium";
+  next.slowMoMs = Math.max(0, Number(next.slowMoMs) || 0);
+  next.maxAttempts = Math.max(1, Number(next.maxAttempts) || 1);
+  next.enabled = Boolean(next.enabled);
+  next.autoRunAfterBuild = Boolean(next.autoRunAfterBuild);
+  next.stopDevServerAfterQa = next.stopDevServerAfterQa !== false;
+  return next;
+}
+
+function formatPlaywrightCapabilityStatus(capability) {
+  const status = String(capability?.status || "not_checked").trim().toLowerCase();
+  if (status === "available") return "available";
+  if (status === "package_missing") return "package missing";
+  if (status === "browsers_missing") return "browsers missing";
+  return "not checked";
+}
+
 function SettingsView({ settings, project, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
   const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
+  const [guiQaDraft, setGuiQaDraft] = useState(() => normalizeGuiQaDraft(settings?.guiQa));
   const [nameDraft, setNameDraft] = useState(() => ({
     juniorName: agentNames.junior || "",
     supervisorName: agentNames.supervisor || "",
     architectName: agentNames.architect || ""
   }));
+  const [playwrightCapability, setPlaywrightCapability] = useState(() => ({
+    status: "not_checked",
+    packageStatus: "not_checked",
+    browsersStatus: "not_checked",
+    details: "Capability not checked yet."
+  }));
   const [saveState, setSaveState] = useState("idle");
   const [saveError, setSaveError] = useState("");
+  const [guiQaSaveState, setGuiQaSaveState] = useState("idle");
+  const [guiQaError, setGuiQaError] = useState("");
+  const [isCapabilityChecking, setIsCapabilityChecking] = useState(false);
 
   useEffect(() => {
     setDialogueDraft(buildDialogueDraft(settings?.agents));
+    setGuiQaDraft(normalizeGuiQaDraft(settings?.guiQa));
   }, [settings]);
 
   useEffect(() => {
@@ -4631,6 +4888,45 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
       architect: nameDraft.architectName.trim()
     });
     setSaveState("saved");
+  }
+
+  async function saveGuiQaSettings() {
+    setGuiQaSaveState("saving");
+    setGuiQaError("");
+    try {
+      const nextSettings = await window.trifix.saveGuiQaSettings(normalizeGuiQaDraft(guiQaDraft));
+      onSettingsChange(nextSettings);
+      setGuiQaSaveState("saved");
+    } catch (error) {
+      setGuiQaSaveState("error");
+      setGuiQaError(error?.message || "Failed to save GUI QA settings.");
+    }
+  }
+
+  async function checkPlaywrightCapability() {
+    setIsCapabilityChecking(true);
+    setGuiQaError("");
+    try {
+      const capability = await window.trifix.checkPlaywrightCapability({
+        projectRoot: project?.rootPath || ""
+      });
+      setPlaywrightCapability(capability || {
+        status: "not_checked",
+        packageStatus: "not_checked",
+        browsersStatus: "not_checked",
+        details: "Capability not checked yet."
+      });
+    } catch (error) {
+      setGuiQaError(error?.message || "Could not check Playwright capability.");
+      setPlaywrightCapability({
+        status: "not_checked",
+        packageStatus: "not_checked",
+        browsersStatus: "not_checked",
+        details: "Capability check failed."
+      });
+    } finally {
+      setIsCapabilityChecking(false);
+    }
   }
 
   return (
@@ -4679,6 +4975,116 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
           </button>
         </div>
         {testerResult ? <pre className="tester-output">{testerResult.output}</pre> : <p className="muted">Run a quick capability test from here.</p>}
+      </div>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">GUI QA</p>
+            <h2>Playwright foundation</h2>
+          </div>
+          <button className="primary-button" type="button" onClick={saveGuiQaSettings} disabled={guiQaSaveState === "saving"}>
+            {guiQaSaveState === "saving" ? <Loader2 size={18} className="spin" /> : null}
+            Save GUI QA Settings
+          </button>
+        </div>
+        <div className="settings-grid">
+          <label className="settings-row checkbox-row">
+            <span>Enable GUI QA</span>
+            <input
+              type="checkbox"
+              checked={guiQaDraft.enabled}
+              onChange={(event) => setGuiQaDraft((current) => ({ ...current, enabled: event.target.checked }))}
+            />
+          </label>
+          <label className="settings-row">
+            <span>Mode</span>
+            <select
+              value={guiQaDraft.mode}
+              onChange={(event) => setGuiQaDraft((current) => ({ ...current, mode: event.target.value }))}
+            >
+              <option value="headless">Headless</option>
+              <option value="live">Live</option>
+            </select>
+          </label>
+          <label className="settings-row">
+            <span>Browser</span>
+            <select value="chromium" disabled>
+              <option value="chromium">Chromium</option>
+            </select>
+          </label>
+          <label className="settings-row">
+            <span>Slow motion / demo delay (ms)</span>
+            <input
+              type="number"
+              min="0"
+              step="50"
+              value={guiQaDraft.slowMoMs}
+              onChange={(event) => setGuiQaDraft((current) => ({ ...current, slowMoMs: Math.max(0, Number(event.target.value) || 0) }))}
+            />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Auto-run GUI QA after build</span>
+            <input
+              type="checkbox"
+              checked={guiQaDraft.autoRunAfterBuild}
+              onChange={(event) => setGuiQaDraft((current) => ({ ...current, autoRunAfterBuild: event.target.checked }))}
+            />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Stop dev server after GUI QA</span>
+            <input
+              type="checkbox"
+              checked={guiQaDraft.stopDevServerAfterQa}
+              onChange={(event) => setGuiQaDraft((current) => ({ ...current, stopDevServerAfterQa: event.target.checked }))}
+            />
+          </label>
+          <label className="settings-row">
+            <span>Max GUI QA attempts</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={guiQaDraft.maxAttempts}
+              onChange={(event) => setGuiQaDraft((current) => ({ ...current, maxAttempts: Math.max(1, Number(event.target.value) || 1) }))}
+            />
+          </label>
+        </div>
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Capability</p>
+            <h2>Playwright availability</h2>
+          </div>
+          <button className="secondary-button" type="button" onClick={checkPlaywrightCapability} disabled={isCapabilityChecking}>
+            {isCapabilityChecking ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
+            Check Playwright
+          </button>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Status</span>
+            <code>{formatPlaywrightCapabilityStatus(playwrightCapability)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Package</span>
+            <code>{String(playwrightCapability?.packageStatus || "not_checked").replace(/_/g, " ")}</code>
+          </div>
+          <div className="settings-row">
+            <span>Browsers</span>
+            <code>{String(playwrightCapability?.browsersStatus || "not_checked").replace(/_/g, " ")}</code>
+          </div>
+          <div className="settings-row">
+            <span>Target root</span>
+            <code>{playwrightCapability?.targetRoot || project?.rootPath || "Not checked"}</code>
+          </div>
+        </div>
+        <p className="muted">{playwrightCapability?.details || "Capability not checked yet."}</p>
+        {guiQaSaveState === "saved" ? <div className="save-note">GUI QA settings saved.</div> : null}
+        {guiQaError ? (
+          <div className="error-banner" role="alert">
+            <TriangleAlert size={18} />
+            <span>{guiQaError}</span>
+          </div>
+        ) : null}
       </div>
       <div className="dialogue-editor">
         <div className="panel-heading">
@@ -5053,6 +5459,55 @@ function mergePipelineResult(current, partial) {
   return next;
 }
 
+function buildTrackedProjectResult({ project, entry, autonomyState, reviewData }) {
+  const safeProject = project || {};
+  const safeEntry = entry || {};
+  const safeAutonomyState = autonomyState || {};
+  const safeReviewData = reviewData && typeof reviewData === "object" ? reviewData : {};
+  const runState = safeReviewData.runState && typeof safeReviewData.runState === "object" ? safeReviewData.runState : {};
+  const finalReport = String(safeReviewData.finalReport || "").trim();
+  const validationStatus = normalizeTrackedValidationStatus(runState.lastValidationStatus);
+  const projectStatus = String(
+    safeEntry.status
+    || runState.status
+    || (finalReport ? "Review available" : "Project loaded")
+  ).trim();
+  const decisionStatus = String(safeEntry.decisionStatus || "").trim().toLowerCase() || "pending";
+
+  return {
+    project: {
+      ...safeProject,
+      rootPath: safeProject.rootPath || safeEntry.path || safeReviewData.projectRoot || "",
+      projectId: safeProject.projectId || safeEntry.id || "",
+      projectName: safeProject.projectName || safeProject.name || safeEntry.name || "",
+      commandHistory: safeProject.commandHistory || [],
+      processes: safeProject.processes || []
+    },
+    workflow: {
+      currentStage: mapTrackedStatusToStage(projectStatus, decisionStatus),
+      loopCount: Number(safeEntry.loopCount || 0),
+      decisionStatus,
+      currentTask: String(runState.currentTask || safeAutonomyState.currentTask || "").trim(),
+      projectStatus,
+      commandStatus: validationStatus || "idle"
+    },
+    decision: {
+      decisionStatus,
+      summary: finalReport ? extractTrackedReportSummary(finalReport) : "",
+      verdict: ""
+    },
+    validation: validationStatus ? { status: validationStatus } : null,
+    finalization: {},
+    reviewData: {
+      projectRoot: safeReviewData.projectRoot || safeProject.rootPath || safeEntry.path || "",
+      finalReport,
+      artifacts: safeReviewData.artifacts || null,
+      runState: Object.keys(runState).length > 0 ? runState : null,
+      runLogExcerpts: Array.isArray(safeReviewData.runLogExcerpts) ? safeReviewData.runLogExcerpts : []
+    }
+  };
+}
+
 function normalizeGeneratedProject(result, fallbackProject) {
   const resultProject = result?.project || {};
   if (!resultProject.rootPath) {
@@ -5087,6 +5542,29 @@ function hasUsefulOutput(result) {
   return getResultOutputFiles(result).length > 0;
 }
 
+function normalizeTrackedValidationStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["passed", "failed", "needs_review"].includes(normalized)) {
+    return normalized;
+  }
+  if (normalized === "build_unverified") {
+    return "needs_review";
+  }
+  if (normalized === "validation_failed" || normalized === "needs_patch") {
+    return "failed";
+  }
+  return "";
+}
+
+function extractTrackedReportSummary(finalReport) {
+  const lines = String(finalReport || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^#/.test(line));
+  return lines[0] || "Tracked review data loaded.";
+}
+
 const WORKFLOW_STEP_LABELS = {
   planning: "Planning",
   qa: "QA Check",
@@ -5104,6 +5582,7 @@ function buildWorkflowProgress({ workflow, result, preflight = null, autonomyRun
   const finalPmStatus = String(result?.finalization?.pmStatus || "").trim().toLowerCase();
   const runMode = String(result?.preflight?.runMode || workflow?.runMode || preflight?.selectedRunMode || preflight?.runMode || "").trim().toLowerCase();
   const hasOutput = hasUsefulOutput(result);
+  const reviewLifecycleState = getReviewLifecycleState(workflow, result, autonomyRun);
   const activeKey = mapStageToWorkflowStep(currentStage, workflow, result);
   const order = ["planning", "qa", "development", "verification", "finalReview", "decision"];
   const activeIndex = currentStage === "autonomy-queued" || preflight?.state === "checking"
@@ -5146,13 +5625,17 @@ function buildWorkflowProgress({ workflow, result, preflight = null, autonomyRun
     setWorkflowStepState(steps, "verification", "failed", "verifier or build failed");
   }
 
-  if (finalPmStatus === "timed_out") {
+  if (decisionStatus === "acknowledged") {
+    setWorkflowStepState(steps, "decision", "complete");
+  } else if (finalPmStatus === "timed_out") {
     setWorkflowStepState(steps, "finalReview", "needs_review", "final PM timeout");
     setWorkflowStepState(steps, "decision", "needs_review", "manual review required");
-  } else if (["accepted", "acknowledged"].includes(decisionStatus) || String(workflow?.projectStatus || "").toLowerCase().includes("cycle finished")) {
+  } else if (["accepted", "acknowledged"].includes(decisionStatus) || ["completed", "output_ready", "ready_for_review"].includes(reviewLifecycleState) || String(workflow?.projectStatus || "").toLowerCase().includes("cycle finished")) {
     setWorkflowStepState(steps, "decision", "complete");
-  } else if (decisionStatus === "needs_patch" || decisionStatus === "manual_review_required") {
-    setWorkflowStepState(steps, "decision", "needs_review");
+  } else if (decisionStatus === "needs_patch" || reviewLifecycleState === "validation_failed") {
+    setWorkflowStepState(steps, "decision", "failed", "patch required");
+  } else if (decisionStatus === "manual_review_required" || ["needs_review", "build_unverified"].includes(reviewLifecycleState)) {
+    setWorkflowStepState(steps, "decision", "needs_review", reviewLifecycleState === "build_unverified" ? "build unverified" : "manual review required");
   } else if (validationStatus === "failed" && !hasOutput) {
     setWorkflowStepState(steps, "decision", "failed");
   } else if (hasOutput && (validationStatus === "needs_review" || qaStatus === "skipped" || finalPmStatus === "timed_out")) {
@@ -5170,7 +5653,8 @@ function buildWorkflowProgress({ workflow, result, preflight = null, autonomyRun
       preflight,
       runMode,
       autonomyRun,
-      decisionStatus
+      decisionStatus,
+      reviewLifecycleState
     }),
     verificationNote: validationStatus === "needs_review" ? "Verification pending manual build confirmation." : "",
     finalizationNote: finalPmStatus === "timed_out" ? "Final PM decision timed out after output was generated." : ""
@@ -5186,7 +5670,7 @@ function setWorkflowStepState(steps, key, state, note = "") {
   step.note = note;
 }
 
-function buildWorkflowSummary({ steps, validationStatus, qaStatus, finalPmStatus, hasOutput, preflight, runMode, autonomyRun, decisionStatus = "" }) {
+function buildWorkflowSummary({ steps, validationStatus, qaStatus, finalPmStatus, hasOutput, preflight, runMode, autonomyRun, decisionStatus = "", reviewLifecycleState = "" }) {
   if (preflight?.state === "checking") {
     return "Initializing TriFix";
   }
@@ -5208,11 +5692,22 @@ function buildWorkflowSummary({ steps, validationStatus, qaStatus, finalPmStatus
   if (finalPmStatus === "timed_out") {
     return "Needs review - final decision unavailable";
   }
+  if (reviewLifecycleState === "needs_patch" || reviewLifecycleState === "validation_failed") {
+    return "Validation failed - patch required";
+  }
+  if (reviewLifecycleState === "build_unverified") {
+    return "Needs review - build unverified";
+  }
+  if (reviewLifecycleState === "needs_review") {
+    return "Needs review - follow-up prompt recommended";
+  }
   if (decisionStatus === "acknowledged" && validationStatus === "failed") {
-    return "Review finished - follow-up prompt recommended";
+    return "Review finished - patch recommended";
   }
   if (decisionStatus === "acknowledged" && validationStatus === "needs_review") {
-    return "Review finished - build still unverified";
+    return reviewLifecycleState === "build_unverified"
+      ? "Review finished - build still unverified"
+      : "Review finished - follow-up prompt recommended";
   }
   if (steps.find((step) => step.key === "decision")?.state === "complete" && hasOutput) {
     return "Ready for next prompt";
@@ -5259,6 +5754,42 @@ function mapStageToWorkflowStep(stage, workflow, result) {
     return "finalReview";
   }
   return "planning";
+}
+
+function getReviewLifecycleState(workflow, result, autonomyRun = null) {
+  const decisionStatus = String(workflow?.decisionStatus || result?.decision?.decisionStatus || "").trim().toLowerCase();
+  const validationStatus = getResultValidationStatus(result);
+  const finalPmStatus = String(result?.finalization?.pmStatus || "").trim().toLowerCase();
+  const projectType = String(result?.autoRepair?.finalValidation?.projectType || result?.validation?.projectType || "").trim().toLowerCase();
+  const currentStage = String(workflow?.currentStage || result?.workflow?.currentStage || "").trim().toLowerCase();
+  const runStatus = String(autonomyRun?.status || "").trim().toLowerCase();
+  const hasOutput = hasUsefulOutput(result);
+
+  if (decisionStatus === "acknowledged") {
+    return "acknowledged";
+  }
+  if (decisionStatus === "needs_patch") {
+    return "needs_patch";
+  }
+  if (validationStatus === "failed") {
+    return "validation_failed";
+  }
+  if (finalPmStatus === "timed_out") {
+    return "needs_review";
+  }
+  if (validationStatus === "needs_review") {
+    return projectType === "vite-react" ? "build_unverified" : "needs_review";
+  }
+  if (decisionStatus === "manual_review_required") {
+    return "needs_review";
+  }
+  if (hasOutput && (decisionStatus === "acknowledged" || runStatus === "completed" || ["supervisor-final", "final", "decision", "accepted", "phase-ready", "autonomy-complete"].includes(currentStage))) {
+    return "completed";
+  }
+  if (hasOutput && validationStatus === "passed") {
+    return "output_ready";
+  }
+  return "";
 }
 
 function getResultValidationStatus(result) {
@@ -5919,6 +6450,19 @@ function formatRunModeLabel(value) {
   if (normalized === "degraded_developer_only") return "Developer-only degraded mode";
   if (normalized === "blocked") return "Blocked";
   return normalized || "Unknown";
+}
+
+function shouldShowExpandedPreflightPanel(preflight) {
+  const state = String(preflight?.state || "").trim().toLowerCase();
+  return ["checking", "blocked", "degraded_available", "ready", "ready_with_warnings"].includes(state);
+}
+
+function shouldShowCompactPreflightSummary(runPreflight, result, autonomyRun) {
+  if (shouldShowExpandedPreflightPanel(runPreflight)) {
+    return false;
+  }
+  const preflight = runPreflight || result?.preflight || autonomyRun?.preflight;
+  return Boolean(preflight);
 }
 
 function formatHealthAttempts(entry) {

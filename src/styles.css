@@ -1346,7 +1346,8 @@ select:focus {
 }
 
 .workflow-hero-panel,
-.preflight-panel {
+.preflight-panel,
+.preflight-compact-panel {
   margin-bottom: 18px;
 }
 
@@ -1355,6 +1356,21 @@ select:focus {
   display: grid;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.preflight-compact-copy {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.preflight-compact-copy p,
+.preflight-compact-copy small {
+  margin: 0;
+}
+
+.preflight-compact-copy small {
+  color: #9ca9bc;
 }
 
 .workflow-stepper-shell {
@@ -2682,6 +2698,38 @@ select:focus {
 .settings-row span {
   color: #9da9bc;
   font-size: 13px;
+}
+
+.settings-row code,
+.settings-row input,
+.settings-row select {
+  min-width: 0;
+}
+
+.settings-row input[type="number"],
+.settings-row select {
+  height: 40px;
+  padding: 0 12px;
+  color: #e9eef8;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  outline: none;
+  background: #0c1118;
+}
+
+.settings-row input[type="number"]:focus,
+.settings-row select:focus {
+  border-color: rgba(116, 185, 255, 0.72);
+  box-shadow: 0 0 0 3px rgba(116, 185, 255, 0.12);
+}
+
+.settings-row.checkbox-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.settings-row.checkbox-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
 }
 
 .spin {
