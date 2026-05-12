@@ -223,6 +223,10 @@ export function App() {
   const chatScrollRef = useRef(null);
   const autoRequiredStepsKeyRef = useRef("");
   const selectedFileSet = useMemo(() => new Set(selectedFiles), [selectedFiles]);
+  const activeProjectProcess = useMemo(
+    () => projectProcesses.find((process) => ["running", "starting"].includes(process.status)) || projectProcesses[0] || null,
+    [projectProcesses]
+  );
   const canRun =
     !isRunning &&
     !isRunStarting &&
@@ -2686,6 +2690,7 @@ export function App() {
           <SettingsView
             settings={settings}
             project={project}
+            activeProcess={activeProjectProcess}
             testerResult={testerResult}
             isTesterRunning={isTesterRunning}
             agentNames={agentNames}
@@ -4838,7 +4843,17 @@ function formatPlaywrightCapabilityStatus(capability) {
   return "not checked";
 }
 
-function SettingsView({ settings, project, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
+function formatGuiQaRunStatus(result) {
+  const status = String(result?.status || "not_checked").trim().toLowerCase();
+  if (status === "passed") return "passed";
+  if (status === "failed") return "failed";
+  if (status === "skipped_missing_playwright") return "skipped: missing playwright";
+  if (status === "skipped_missing_health_url") return "skipped: waiting for dev server";
+  if (status === "error") return "error";
+  return "not run";
+}
+
+function SettingsView({ settings, project, activeProcess, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
   const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
   const [guiQaDraft, setGuiQaDraft] = useState(() => normalizeGuiQaDraft(settings?.guiQa));
   const [nameDraft, setNameDraft] = useState(() => ({
@@ -4857,6 +4872,10 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
   const [guiQaSaveState, setGuiQaSaveState] = useState("idle");
   const [guiQaError, setGuiQaError] = useState("");
   const [isCapabilityChecking, setIsCapabilityChecking] = useState(false);
+  const [isGuiQaRunning, setIsGuiQaRunning] = useState(false);
+  const [guiQaResult, setGuiQaResult] = useState(null);
+  const detectedTargetUrl = activeProcess?.healthUrl || "";
+  const canRunGuiQa = guiQaDraft.enabled && playwrightCapability?.status === "available" && Boolean(detectedTargetUrl);
 
   useEffect(() => {
     setDialogueDraft(buildDialogueDraft(settings?.agents));
@@ -4870,6 +4889,17 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
       architectName: agentNames.architect || ""
     });
   }, [agentNames]);
+
+  useEffect(() => {
+    setGuiQaError("");
+    setGuiQaResult(null);
+    setPlaywrightCapability({
+      status: "not_checked",
+      packageStatus: "not_checked",
+      browsersStatus: "not_checked",
+      details: "Capability not checked yet."
+    });
+  }, [project?.rootPath]);
 
   async function saveDialogue() {
     setSaveState("saving");
@@ -4911,7 +4941,7 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
     setIsCapabilityChecking(true);
     setGuiQaError("");
     try {
-      const capability = await window.trifix.checkPlaywrightCapability({
+      const capability = await (window.trifix.checkGuiQaCapability || window.trifix.checkPlaywrightCapability)({
         projectRoot: project?.rootPath || ""
       });
       setPlaywrightCapability(capability || {
@@ -4930,6 +4960,34 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
       });
     } finally {
       setIsCapabilityChecking(false);
+    }
+  }
+
+  async function runGuiSmokeTest() {
+    setIsGuiQaRunning(true);
+    setGuiQaError("");
+    try {
+      const nextResult = await window.trifix.runGuiSmokeTest({
+        projectRoot: project?.rootPath || "",
+        processId: activeProcess?.id || "",
+        healthUrl: detectedTargetUrl,
+        guiQa: normalizeGuiQaDraft(guiQaDraft)
+      });
+      setGuiQaResult(nextResult || null);
+      if (nextResult?.message && nextResult?.status !== "passed") {
+        setGuiQaError(nextResult.message);
+      }
+    } catch (error) {
+      setGuiQaError(error?.message || "GUI smoke test failed.");
+      setGuiQaResult({
+        status: "error",
+        checkedAt: new Date().toISOString(),
+        message: error?.message || "GUI smoke test failed.",
+        consoleErrors: [],
+        pageErrors: []
+      });
+    } finally {
+      setIsGuiQaRunning(false);
     }
   }
 
@@ -5082,6 +5140,51 @@ function SettingsView({ settings, project, testerResult, isTesterRunning, agentN
           </div>
         </div>
         <p className="muted">{playwrightCapability?.details || "Capability not checked yet."}</p>
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Manual Smoke Test</p>
+            <h2>Run against the active dev server</h2>
+          </div>
+          <button className="primary-button" type="button" onClick={runGuiSmokeTest} disabled={!canRunGuiQa || isGuiQaRunning}>
+            {isGuiQaRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+            Run GUI Smoke Test
+          </button>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Selected mode</span>
+            <code>{guiQaDraft.mode}</code>
+          </div>
+          <div className="settings-row">
+            <span>Detected target URL</span>
+            <code>{detectedTargetUrl || "Start the project first. Waiting for dev server URL."}</code>
+          </div>
+          <div className="settings-row">
+            <span>Last result status</span>
+            <code>{formatGuiQaRunStatus(guiQaResult)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Timestamp</span>
+            <code>{guiQaResult?.checkedAt || "Not run"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Result JSON path</span>
+            <code>{guiQaResult?.resultPath || "Not run"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Screenshot path</span>
+            <code>{guiQaResult?.screenshotPath || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Console errors</span>
+            <code>{(guiQaResult?.consoleErrors || []).length ? guiQaResult.consoleErrors.join(" | ") : "None"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Page errors</span>
+            <code>{(guiQaResult?.pageErrors || []).length ? guiQaResult.pageErrors.join(" | ") : "None"}</code>
+          </div>
+        </div>
+        {guiQaResult?.message ? <p className="muted">{guiQaResult.message}</p> : null}
         {guiQaSaveState === "saved" ? <div className="save-note">GUI QA settings saved.</div> : null}
         {guiQaError ? (
           <div className="error-banner" role="alert">

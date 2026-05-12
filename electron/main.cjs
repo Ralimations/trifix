@@ -1,6 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
+const { createRequire } = require("node:module");
 const path = require("node:path");
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
@@ -27,6 +28,9 @@ const GRAPH_DIR_NAME = "graph";
 const GRAPH_STATUS_FILE = "index-status.json";
 const PROCESS_DIR_NAME = "processes";
 const PROCESS_REGISTRY_FILE = "processes.json";
+const GUI_QA_DIR_NAME = "gui-qa";
+const GUI_QA_RESULT_FILE = "latest-result.json";
+const GUI_QA_SCREENSHOT_FILE = "latest-screenshot.png";
 const DEFAULT_AUTONOMY_RUNTIME_MS = 8 * 60 * 60 * 1000;
 const MAX_AUTONOMY_RUNTIME_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_GUI_QA_SETTINGS = Object.freeze({
@@ -428,6 +432,12 @@ function registerIpc() {
     await writeSettings(current);
     return buildAppSettings();
   });
+  ipcMain.handle("guiQa:check-capability", async (_event, payload = {}) =>
+    detectPlaywrightCapability(payload)
+  );
+  ipcMain.handle("guiQa:run-smoke-test", async (_event, payload = {}) =>
+    runGuiQaSmokeTest(payload)
+  );
   ipcMain.handle("app:playwright:capability", async (_event, payload = {}) =>
     detectPlaywrightCapability(payload)
   );
@@ -3484,7 +3494,7 @@ async function detectPlaywrightCapability(payload = {}) {
   if (!resolvedTestPackage) {
     return {
       status: "package_missing",
-      packageStatus: "missing",
+      packageStatus: "package_missing",
       browsersStatus: "not_checked",
       browser: "chromium",
       checkedAt: new Date().toISOString(),
@@ -3493,14 +3503,13 @@ async function detectPlaywrightCapability(payload = {}) {
     };
   }
 
-  const browserPackageName = resolveOptionalPackage("playwright", targetRoot)
-    ? "playwright"
-    : (resolveOptionalPackage("playwright-core", targetRoot) ? "playwright-core" : "");
-  if (!browserPackageName) {
+  const resolvedBrowserPackage = resolveOptionalPackage("playwright", targetRoot)
+    || resolveOptionalPackage("playwright-core", targetRoot);
+  if (!resolvedBrowserPackage) {
     return {
       status: "browsers_missing",
       packageStatus: "available",
-      browsersStatus: "missing",
+      browsersStatus: "browsers_missing",
       browser: "chromium",
       checkedAt: new Date().toISOString(),
       targetRoot,
@@ -3509,7 +3518,7 @@ async function detectPlaywrightCapability(payload = {}) {
   }
 
   try {
-    const playwright = require(browserPackageName);
+    const playwright = loadOptionalPackage(resolvedBrowserPackage);
     const executablePath = typeof playwright?.chromium?.executablePath === "function"
       ? playwright.chromium.executablePath()
       : "";
@@ -3517,7 +3526,7 @@ async function detectPlaywrightCapability(payload = {}) {
     return {
       status: browserInstalled ? "available" : "browsers_missing",
       packageStatus: "available",
-      browsersStatus: browserInstalled ? "available" : "missing",
+      browsersStatus: browserInstalled ? "available" : "browsers_missing",
       browser: "chromium",
       checkedAt: new Date().toISOString(),
       targetRoot,
@@ -3530,7 +3539,7 @@ async function detectPlaywrightCapability(payload = {}) {
     return {
       status: "browsers_missing",
       packageStatus: "available",
-      browsersStatus: "missing",
+      browsersStatus: "browsers_missing",
       browser: "chromium",
       checkedAt: new Date().toISOString(),
       targetRoot,
@@ -3545,6 +3554,249 @@ function resolveOptionalPackage(packageName, rootPath) {
   } catch {
     return "";
   }
+}
+
+function loadOptionalPackage(packageJsonPath) {
+  if (!packageJsonPath) {
+    return null;
+  }
+
+  const packageRequire = createRequire(packageJsonPath);
+  const packageJson = packageRequire(packageJsonPath);
+  return packageRequire(packageJson.name);
+}
+
+async function runGuiQaSmokeTest(payload = {}) {
+  const root = await normalizeCommandRoot(payload.projectRoot);
+  const current = await readSettings();
+  const guiQa = normalizeGuiQaSettings(payload.guiQa || current.guiQa);
+  const healthUrl = String(payload.healthUrl || "").trim();
+  const processId = String(payload.processId || "").trim();
+  const timestamp = new Date().toISOString();
+  const { dir: guiQaDir, resultPath, screenshotPath } = await getGuiQaArtifactPaths(root);
+  await fs.mkdir(guiQaDir, { recursive: true });
+
+  if (!healthUrl) {
+    const skippedResult = {
+      status: "skipped_missing_health_url",
+      baseURL: "",
+      finalUrl: "",
+      title: "",
+      bodyTextLength: 0,
+      consoleErrors: [],
+      pageErrors: [],
+      screenshotPath: "",
+      resultPath,
+      checkedAt: timestamp,
+      message: "Start the project first. Waiting for dev server URL."
+    };
+    await writeJsonFile(resultPath, skippedResult);
+    return skippedResult;
+  }
+
+  const validatedTarget = validateGuiQaTargetUrl(healthUrl);
+  if (!validatedTarget.ok) {
+    const errorResult = {
+      status: "error",
+      baseURL: healthUrl,
+      finalUrl: "",
+      title: "",
+      bodyTextLength: 0,
+      consoleErrors: [],
+      pageErrors: [],
+      screenshotPath: "",
+      resultPath,
+      checkedAt: timestamp,
+      message: validatedTarget.message
+    };
+    await writeJsonFile(resultPath, errorResult);
+    return errorResult;
+  }
+
+  const capability = await detectPlaywrightCapability({ projectRoot: root });
+  if (capability.status !== "available") {
+    const skippedResult = {
+      status: "skipped_missing_playwright",
+      baseURL: validatedTarget.url,
+      finalUrl: "",
+      title: "",
+      bodyTextLength: 0,
+      consoleErrors: [],
+      pageErrors: [],
+      screenshotPath: "",
+      resultPath,
+      checkedAt: timestamp,
+      capability,
+      message: capability.details || "Playwright is not available."
+    };
+    await writeJsonFile(resultPath, skippedResult);
+    return skippedResult;
+  }
+
+  const resolvedBrowserPackage = resolveOptionalPackage("playwright", root)
+    || resolveOptionalPackage("playwright-core", root);
+  const playwright = loadOptionalPackage(resolvedBrowserPackage);
+  const consoleErrors = [];
+  const pageErrors = [];
+  let browser;
+  let context;
+  let page;
+  let stopProcessError = "";
+
+  const result = {
+    status: "error",
+    baseURL: validatedTarget.url,
+    finalUrl: "",
+    title: "",
+    bodyTextLength: 0,
+    consoleErrors,
+    pageErrors,
+    screenshotPath: "",
+    resultPath,
+    checkedAt: timestamp,
+    mode: guiQa.mode,
+    browser: guiQa.browser,
+    slowMoMs: guiQa.slowMoMs,
+    capability
+  };
+
+  try {
+    browser = await playwright.chromium.launch({
+      headless: guiQa.mode !== "live",
+      slowMo: guiQa.slowMoMs > 0 ? guiQa.slowMoMs : undefined
+    });
+    context = await browser.newContext({
+      baseURL: validatedTarget.url
+    });
+    page = await context.newPage();
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text());
+      }
+    });
+    page.on("pageerror", (error) => {
+      pageErrors.push(error?.message || String(error));
+    });
+
+    const response = await page.goto(validatedTarget.url, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000
+    });
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForSelector("body", { timeout: 10000 });
+
+    const title = await page.title();
+    const bodyText = await page.locator("body").innerText({ timeout: 10000 });
+    await page.screenshot({
+      path: screenshotPath,
+      fullPage: true
+    });
+
+    result.finalUrl = page.url();
+    result.title = title;
+    result.bodyTextLength = bodyText.trim().length;
+    result.screenshotPath = screenshotPath;
+    result.httpStatus = response?.status?.() ?? null;
+    result.pageLoaded = true;
+    result.bodyExists = true;
+    result.genericChecks = {
+      pageLoads: true,
+      bodyExists: true,
+      bodyTextNotEmpty: result.bodyTextLength > 0,
+      noUncaughtPageError: pageErrors.length === 0
+    };
+    result.status = result.genericChecks.bodyTextNotEmpty && result.genericChecks.noUncaughtPageError
+      ? "passed"
+      : "failed";
+    result.message = result.status === "passed"
+      ? "GUI smoke test passed."
+      : "GUI smoke test failed one or more generic checks.";
+  } catch (error) {
+    result.status = "error";
+    result.message = error?.message || "GUI smoke test failed.";
+    if (page) {
+      try {
+        await page.screenshot({
+          path: screenshotPath,
+          fullPage: true
+        });
+        result.screenshotPath = screenshotPath;
+      } catch {
+        result.screenshotPath = "";
+      }
+      try {
+        result.finalUrl = page.url();
+      } catch {
+        result.finalUrl = "";
+      }
+      try {
+        result.title = await page.title();
+      } catch {
+        result.title = "";
+      }
+    }
+  } finally {
+    if (context) {
+      await context.close().catch(() => {});
+    }
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    if (guiQa.stopDevServerAfterQa && processId) {
+      try {
+        await stopManagedProjectProcess({
+          projectRoot: root,
+          processId
+        });
+      } catch (error) {
+        stopProcessError = error?.message || "Could not stop dev server after GUI QA.";
+      }
+    }
+  }
+
+  if (stopProcessError) {
+    result.stopDevServerError = stopProcessError;
+  }
+  await writeJsonFile(resultPath, result);
+  return result;
+}
+
+function validateGuiQaTargetUrl(value) {
+  try {
+    const candidate = new URL(String(value || "").trim());
+    const hostname = candidate.hostname.toLowerCase();
+    if (!["localhost", "127.0.0.1"].includes(hostname)) {
+      return {
+        ok: false,
+        message: "GUI QA MVP only supports local dev server URLs on localhost or 127.0.0.1."
+      };
+    }
+    if (!["http:", "https:"].includes(candidate.protocol)) {
+      return {
+        ok: false,
+        message: "GUI QA target URL must use http or https."
+      };
+    }
+    return {
+      ok: true,
+      url: candidate.toString()
+    };
+  } catch {
+    return {
+      ok: false,
+      message: "GUI QA target URL is invalid."
+    };
+  }
+}
+
+async function getGuiQaArtifactPaths(root) {
+  const ledgerDir = await initializeAutonomyLedger(root);
+  const dir = path.join(ledgerDir, GUI_QA_DIR_NAME);
+  return {
+    dir,
+    resultPath: path.join(dir, GUI_QA_RESULT_FILE),
+    screenshotPath: path.join(dir, GUI_QA_SCREENSHOT_FILE)
+  };
 }
 
 function collectReviewLogEntries(raw, runId = "") {

@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld("trifix", {
   getModelHealth: () => ipcRenderer.invoke("app:model-health"),
   saveDialogue: (dialogue) => ipcRenderer.invoke("app:dialogue:save", dialogue),
   saveGuiQaSettings: (payload) => ipcRenderer.invoke("app:gui-qa:save", payload),
+  checkGuiQaCapability: (payload) => ipcRenderer.invoke("guiQa:check-capability", payload),
+  runGuiSmokeTest: (payload) => ipcRenderer.invoke("guiQa:run-smoke-test", payload),
   checkPlaywrightCapability: (payload) => ipcRenderer.invoke("app:playwright:capability", payload),
   listProjects: () => ipcRenderer.invoke("projects:list"),
   removeProject: (id) => ipcRenderer.invoke("projects:remove", id),
