@@ -1703,17 +1703,26 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
     exitCode: null,
     outputPreview: ""
   };
+  logProcessEvent("process-spawn started", record);
 
   await fs.writeFile(stdoutPath, "", "utf8");
   await fs.writeFile(stderrPath, "", "utf8");
 
   let child;
   try {
-    child = spawn(spawnSpec.executable, spawnSpec.args, {
+    logProcessEvent("process-spawn resolved", record, {
+      originalCommand: command,
+      executable: spawnSpec.executable,
+      args: spawnSpec.args,
       cwd: root,
       shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    child = spawn(spawnSpec.executable, spawnSpec.args, {
+      cwd: root,
+      env: { ...process.env },
+      shell: false,
       windowsHide: true,
-      detached: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
   } catch (error) {
@@ -1721,6 +1730,7 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
     record.finishedAt = new Date().toISOString();
     record.outputPreview = `Could not start command "${command}": ${error?.message || error}`;
     await persistProcessRecord(root, record);
+    await syncActiveProcessState(root);
     return record;
   }
 
@@ -1729,10 +1739,12 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
   managedProcesses.set(id, {
     child,
     root,
-    record
+    record,
+    rollingOutput: ""
   });
 
   let resolveReady = null;
+  let persistScheduled = false;
   const markReady = () => {
     if (!resolveReady) {
       return;
@@ -1741,28 +1753,66 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
     resolveReady = null;
     resolve();
   };
+  const schedulePersist = () => {
+    if (persistScheduled) {
+      return;
+    }
+    persistScheduled = true;
+    setTimeout(() => {
+      persistScheduled = false;
+      void persistProcessRecord(root, record);
+      void syncActiveProcessState(root);
+    }, 150).unref?.();
+  };
   const appendOutput = (streamName, chunk) => {
     const text = chunk.toString();
+    logProcessEvent(`process-output ${streamName} chunk received`, record, {
+      size: text.length
+    });
     const logPath = streamName === "stdout" ? stdoutPath : stderrPath;
-    void fs.appendFile(logPath, text, "utf8");
-    record.outputPreview = trimText(`${record.outputPreview}${text}`, 1800);
-    const detected = detectProcessEndpoint(text);
-    if (detected && !record.healthUrl) {
+    void fs.appendFile(logPath, text, "utf8")
+      .then(() => logProcessEvent(`process-output wrote ${streamName} log`, record, {
+        logPath: toProjectRelativePath(root, logPath)
+      }))
+      .catch((error) => logProcessEvent(`process-output failed ${streamName} log`, record, {
+        error: error?.message || String(error || "")
+      }));
+    const managed = managedProcesses.get(id);
+    if (managed) {
+      managed.rollingOutput = trimText(`${managed.rollingOutput || ""}${text}`, 16000);
+      record.outputPreview = trimText(managed.rollingOutput, 8000);
+    } else {
+      record.outputPreview = trimText(`${record.outputPreview}${text}`, 8000);
+    }
+    logProcessEvent("process-url-detect scanning", record);
+    const detected = detectProcessEndpoint(managed?.rollingOutput || text);
+    if (detected && (!record.healthUrl || record.healthUrl !== detected.healthUrl || record.port !== detected.port)) {
       record.port = detected.port;
       record.healthUrl = detected.healthUrl;
-      void persistProcessRecord(root, record);
+      logProcessEvent("process-url-detect found", record, {
+        detectedUrl: detected.healthUrl,
+        detectedPort: detected.port
+      });
+    } else if (!detected) {
+      logProcessEvent("process-url-detect no match", record);
+    }
+    schedulePersist();
+    if (detected) {
       markReady();
     }
   };
 
   child.stdout?.on("data", (chunk) => appendOutput("stdout", chunk));
   child.stderr?.on("data", (chunk) => appendOutput("stderr", chunk));
+  logProcessEvent("process-stdout-listener-attached", record);
+  logProcessEvent("process-stderr-listener-attached", record);
   child.on("error", (error) => {
     record.status = "failed";
     record.finishedAt = new Date().toISOString();
-    record.outputPreview = trimText(`${record.outputPreview}\n${error.message}`, 1800);
+    record.outputPreview = trimText(`${record.outputPreview}\n${error.message}`, 8000);
     managedProcesses.delete(id);
     void persistProcessRecord(root, record);
+    void syncActiveProcessState(root);
     markReady();
   });
   child.on("close", (exitCode) => {
@@ -1771,10 +1821,12 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
     record.finishedAt = new Date().toISOString();
     managedProcesses.delete(id);
     void persistProcessRecord(root, record);
+    void syncActiveProcessState(root);
     markReady();
   });
 
   await persistProcessRecord(root, record);
+  await syncActiveProcessState(root);
   await new Promise((resolve) => {
     resolveReady = resolve;
     if (record.healthUrl || record.status !== "running") {
@@ -1784,6 +1836,7 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
     setTimeout(markReady, 8000).unref?.();
   });
   await persistProcessRecord(root, record);
+  await syncActiveProcessState(root);
   return { ...record };
 }
 
@@ -1816,10 +1869,9 @@ async function stopManagedProjectProcess(payload = {}) {
     finishedAt: new Date().toISOString()
   };
   await persistProcessRecord(root, stoppedRecord);
-  await updateAutonomyRunState(root, {
+  await syncActiveProcessState(root, {
     lastCommand: record.command,
     lastCommandStatus: "stopped",
-    activeProcess: null,
     nextAction: "process-stopped"
   });
   await appendAutonomyLog(root, {
@@ -1959,23 +2011,43 @@ async function openSafeProjectUrl(url) {
 }
 
 function buildSpawnSpec(command) {
-  const parts = splitCommand(command);
-  if (process.platform === "win32" && parts[0] === "npm") {
-    return {
-      executable: process.env.ComSpec || "cmd.exe",
-      args: ["/d", "/s", "/c", command]
-    };
+  const npmSpec = parseManagedCommand(command);
+  if (npmSpec) {
+    return npmSpec;
   }
 
+  const parts = splitCommand(command);
   return {
     executable: process.platform === "win32" && parts[0] === "python" ? "python.exe" : parts[0],
     args: parts.slice(1)
   };
 }
 
+function parseManagedCommand(commandText) {
+  const parts = splitCommand(commandText);
+  if (parts[0] !== "npm" || parts.length < 2) {
+    return null;
+  }
+
+  if (process.platform === "win32") {
+    const executable = process.env.ComSpec || "cmd.exe";
+    const commandLine = ["npm.cmd", ...parts.slice(1).map(quoteCmdArg)].join(" ");
+    return {
+      executable,
+      args: ["/d", "/s", "/c", commandLine]
+    };
+  }
+
+  const executable = "npm";
+  return {
+    executable,
+    args: parts.slice(1)
+  };
+}
+
 function detectProcessEndpoint(text) {
-  const value = String(text || "");
-  const urlMatch = value.match(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?[^\s"'<>)]*/i);
+  const value = stripAnsi(String(text || ""));
+  const urlMatch = value.match(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/[^\s"'<>)]*)?/i);
   if (urlMatch?.[0]) {
     const normalizedUrl = urlMatch[0].replace("0.0.0.0", "127.0.0.1").replace("[::1]", "127.0.0.1");
     const port = Number(new URL(normalizedUrl).port || 80);
@@ -2001,6 +2073,10 @@ function detectProcessEndpoint(text) {
   };
 }
 
+function stripAnsi(value) {
+  return String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
 async function persistProcessRecord(root, record) {
   const dir = await initializeAutonomyLedger(root);
   const registryPath = path.join(dir, PROCESS_DIR_NAME, PROCESS_REGISTRY_FILE);
@@ -2012,6 +2088,7 @@ async function persistProcessRecord(root, record) {
   ].slice(-20);
 
   await writeProcessRecords(root, nextRecords);
+  logProcessEvent("process-record persisted", record);
 }
 
 async function readProcessRecord(root, processId) {
@@ -2133,8 +2210,47 @@ function sanitizeProcessRecord(record) {
     startedAt: record.startedAt || "",
     finishedAt: record.finishedAt || "",
     exitCode: record.exitCode ?? null,
-    outputPreview: trimText(record.outputPreview || "", 1800)
+    outputPreview: trimText(record.outputPreview || "", 8000)
   };
+}
+
+async function syncActiveProcessState(root, patch = {}) {
+  const records = await refreshProcessRecords(root);
+  const activeProcess = records.find((record) => ["running", "starting"].includes(record.status)) || null;
+  const lastCommand = activeProcess?.command || patch.lastCommand || "";
+  const lastCommandStatus = activeProcess?.status || patch.lastCommandStatus || "idle";
+  const nextAction = activeProcess
+    ? (activeProcess.healthUrl ? "open-app-url" : "monitor-process")
+    : (patch.nextAction || (lastCommandStatus === "failed" ? "review-process-error" : "continue"));
+  await updateAutonomyRunState(root, {
+    ...patch,
+    lastCommand,
+    lastCommandStatus,
+    activeProcess,
+    nextAction
+  });
+  logProcessEvent("process-active-state updated", activeProcess || {
+    id: "",
+    command: lastCommand,
+    cwd: root,
+    pid: 0
+  }, {
+    activeProcessId: activeProcess?.id || "",
+    healthUrl: activeProcess?.healthUrl || "",
+    port: activeProcess?.port || 0
+  });
+}
+
+function logProcessEvent(event, record, extra = {}) {
+  logStartupError(event, JSON.stringify({
+    processId: record?.id || "",
+    command: record?.command || "",
+    cwd: record?.cwd || "",
+    pid: record?.pid || 0,
+    healthUrl: record?.healthUrl || "",
+    port: record?.port || 0,
+    ...extra
+  }));
 }
 
 function terminateProcessTree(pid) {

@@ -4141,7 +4141,11 @@ function ProcessManagerCard({ processes = [], onOpenProcessUrl, onStopProcess, o
           <span className="process-label">Project Process</span>
           <strong>{activeProcess.command || "Process"}</strong>
           <p>
-            {activeProcess.healthUrl || activeProcess.stdoutLog || "No app URL detected yet."}
+            {activeProcess.healthUrl
+              || (["running", "starting"].includes(activeProcess.status) ? "Process running, waiting for URL..." : "")
+              || activeProcess.outputPreview
+              || activeProcess.stdoutLog
+              || "No app URL detected yet."}
           </p>
         </div>
       </div>
