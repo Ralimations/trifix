@@ -84,6 +84,7 @@ export async function runGuiQaReview(payload = {}, onRequestStatus = null) {
   const normalized = normalizeGuiQaVerdict(parsed || {}, output);
   return {
     ...normalized,
+    toolRequests: normalizeToolRequests(parsed?.toolRequests),
     rawOutput: output,
     validFormat: isValidGuiQaVerdictShape(parsed)
   };
@@ -108,6 +109,7 @@ export async function runGuiQaDevPatch(payload = {}, onRequestStatus = null) {
     summary: parsed.summary || "",
     fileOperations: parsed.fileOperations || [],
     commandRequests: parsed.commandRequests || [],
+    toolRequests: parsed.toolRequests || [],
     affectedFiles: parsed.affectedFiles || [],
     validFormat: Array.isArray(parsed.fileOperations) && parsed.fileOperations.length > 0
   };
@@ -152,6 +154,7 @@ export async function runDesignQaReview(payload = {}, onRequestStatus = null) {
   return {
     rawOutput: output,
     parsed,
+    toolRequests: normalizeToolRequests(parsed?.toolRequests),
     validFormat: isValidDesignQaVerdictShape(parsed)
   };
 }
@@ -176,6 +179,7 @@ export async function runDesignDevPatch(payload = {}, onRequestStatus = null) {
     summary: parsed.summary || "",
     fileOperations: parsed.fileOperations || [],
     commandRequests: parsed.commandRequests || [],
+    toolRequests: parsed.toolRequests || [],
     affectedFiles: parsed.affectedFiles || [],
     validFormat: Array.isArray(parsed.fileOperations) && parsed.fileOperations.length > 0
   };
@@ -1770,11 +1774,57 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
         : fileOperations.map((operation) => `Write ${operation.path} from the DEV implementation.`),
     affectedFiles: normalizedAffectedFiles,
     commandRequests: jsonCommands.length > 0 ? jsonCommands : commandRequests,
+    toolRequests: mergeToolRequests(
+      normalizeToolRequests(parsedJson?.toolRequests),
+      normalizeToolRequests(nestedJson?.toolRequests)
+    ),
     patches: normalizedPatchesForApply,
     fileOperations,
     fixedCode: fileOperations[0]?.content || normalizedPatchesForApply[0]?.content || cleanCode(fallbackCodeFence?.[1] || output),
     recommendation: parsedJson?.recommendation || recommendation || output.trim()
   };
+}
+
+function normalizeToolRequests(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item, index) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return null;
+      }
+      const tool = String(item.tool || "").trim();
+      if (!tool) {
+        return null;
+      }
+      return {
+        id: String(item.id || `toolreq-${index + 1}`).trim(),
+        tool,
+        reason: String(item.reason || "").trim(),
+        expectedBenefit: String(item.expectedBenefit || "").trim(),
+        args: item.args && typeof item.args === "object" && !Array.isArray(item.args) ? item.args : {},
+        requiresApproval: item.requiresApproval === true
+      };
+    })
+    .filter(Boolean);
+}
+
+function mergeToolRequests(...groups) {
+  const merged = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const item of Array.isArray(group) ? group : []) {
+      const key = `${item.tool}::${JSON.stringify(item.args || {})}::${item.reason || ""}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(item);
+    }
+  }
+  return merged;
 }
 
 function buildSingleFileHtmlFallback(output, expectedPaths = []) {
@@ -1867,6 +1917,26 @@ function extractJsonObject(output) {
   }
 
   return null;
+}
+
+function buildToolRequestPrompt(role = "pm") {
+  const normalized = String(role || "pm").trim().toLowerCase();
+  const roleTools = normalized === "qa"
+    ? ["run_gui_qa", "run_ui_quality_check", "create_dependency_plan", "request_dev_patch"]
+    : normalized === "dev"
+      ? ["create_dependency_plan", "request_dependency_install", "run_build", "run_gui_qa", "run_ui_quality_check"]
+      : ["refresh_runbook", "run_gui_qa", "run_ui_quality_check", "create_ui_quality_contract", "generate_ui_stack_recommendation"];
+  return [
+    "AVAILABLE TRIFIX TOOLS:",
+    "You may request tool actions using strict JSON toolRequests.",
+    "Do not claim you ran tools yourself.",
+    "Do not request arbitrary shell commands.",
+    "Use safe evidence tools first.",
+    "Use dependency installs only when necessary.",
+    "If unsure, request manual review.",
+    `Role-relevant tools: ${roleTools.join(", ")}`,
+    'toolRequests item shape: {"id":"toolreq-001","tool":"run_ui_quality_check","reason":"...","expectedBenefit":"...","args":{},"requiresApproval":false}'
+  ].join("\n");
 }
 
 function normalizePmArchitecture(parsed, input, previous = null, rawOutput = "") {
@@ -2821,6 +2891,7 @@ function buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, l
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 7000 : 12000),
     uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1400)}` : "",
+    buildToolRequestPrompt("pm"),
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 900)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 500)}` : "",
     [
@@ -3264,6 +3335,7 @@ function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture
   return [
     trimForPrompt(compactContext, 7000),
     uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
+    buildToolRequestPrompt("qa"),
     `PM_PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_PLAN:\n${trimForPrompt(pmPlan, 1800)}`,
     `PM_FILE_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
@@ -3295,6 +3367,7 @@ function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitec
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 2800 : 4500),
     uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
+    buildToolRequestPrompt("dev"),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_DIRECTION:\n${trimForPrompt(pmPlan, isExistingProjectRequest ? 500 : 900)}`,
     ...(isExistingProjectRequest
@@ -3363,6 +3436,7 @@ function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, d
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 3600 : 6500),
     uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
+    buildToolRequestPrompt("pm"),
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_INITIAL_PLAN:\n${trimForPrompt(pmPlan, isExistingProjectRequest ? 700 : 1400)}`,
     `QA_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, isExistingProjectRequest ? 800 : 1400)}`,
@@ -3396,8 +3470,10 @@ function buildGuiQaReviewSystemPrompt() {
     '  "summary": "...",',
     '  "issues": [{"severity":"low|medium|high","source":"build|playwright|screenshot|console|acceptance","description":"...","suggestedFix":"..."}],',
     '  "requiredFixes": ["..."],',
-    '  "confidence": 0.0',
-    "}"
+    '  "confidence": 0.0,',
+    '  "toolRequests": []',
+    "}",
+    buildToolRequestPrompt("qa")
   ].join("\n");
 }
 
@@ -3467,7 +3543,8 @@ function buildGuiQaDevPatchSystemPrompt() {
     "Patch only necessary files.",
     "Do not output advice-only text.",
     "Do not include shell commands unless explicitly needed through commandRequests.",
-    "Return JSON only with top-level keys summary, fileOperations, and commandRequests."
+    "Return JSON only with top-level keys summary, fileOperations, commandRequests, and optional toolRequests.",
+    buildToolRequestPrompt("dev")
   ].join("\n");
 }
 
@@ -3520,8 +3597,10 @@ function buildDesignQaReviewSystemPrompt() {
     '  "scores": { "layout": 0, "spacing": 0, "hierarchy": 0, "typography": 0, "color": 0, "accessibility": 0, "interactivity": 0, "polish": 0 },',
     '  "designIssues": [{"severity":"low|medium|high","category":"layout|spacing|hierarchy|typography|color|accessibility|interactivity|polish","description":"...","suggestedFix":"..."}],',
     '  "requiredFixes": ["..."],',
-    '  "confidence": 0.0',
-    "}"
+    '  "confidence": 0.0,',
+    '  "toolRequests": []',
+    "}",
+    buildToolRequestPrompt("qa")
   ].join("\n");
 }
 
@@ -3549,7 +3628,8 @@ function buildDesignDevPatchSystemPrompt() {
     "Patch relevant UI files only: CSS, layout, component structure, mock data, interaction affordances, and selected UI library usage when already installed or clearly allowed.",
     "Do not redesign unrelated functionality.",
     "Do not add unnecessary dependencies.",
-    "Return JSON only with summary, fileOperations, and commandRequests."
+    "Return JSON only with summary, fileOperations, commandRequests, and optional toolRequests.",
+    buildToolRequestPrompt("dev")
   ].join("\n");
 }
 

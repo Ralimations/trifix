@@ -5195,6 +5195,42 @@ function normalizeGuiQaDraft(value) {
   return next;
 }
 
+function createDefaultAgentToolPolicy() {
+  return {
+    allowRunGuiQa: true,
+    allowRunUiQualityCheck: true,
+    allowCreateDependencyPlan: true,
+    allowRunBuild: true,
+    allowRunProject: true,
+    allowStopProject: true,
+    allowDesignPolishPass: true,
+    dependencyInstallMode: "ask",
+    terminalCommandMode: "never",
+    maxToolRequestsPerRound: 5,
+    maxDesignPolishRounds: 2,
+    requireApprovalBeforeDependencyInstall: true,
+    requireApprovalBeforeTerminalCommand: true
+  };
+}
+
+function normalizeAgentToolPolicyDraft(value) {
+  const next = { ...createDefaultAgentToolPolicy(), ...(value || {}) };
+  next.allowRunGuiQa = next.allowRunGuiQa !== false;
+  next.allowRunUiQualityCheck = next.allowRunUiQualityCheck !== false;
+  next.allowCreateDependencyPlan = next.allowCreateDependencyPlan !== false;
+  next.allowRunBuild = next.allowRunBuild !== false;
+  next.allowRunProject = next.allowRunProject !== false;
+  next.allowStopProject = next.allowStopProject !== false;
+  next.allowDesignPolishPass = next.allowDesignPolishPass !== false;
+  next.dependencyInstallMode = ["ask", "never", "allow_selected"].includes(String(next.dependencyInstallMode || "").toLowerCase()) ? String(next.dependencyInstallMode).toLowerCase() : "ask";
+  next.terminalCommandMode = ["ask", "never", "allow_whitelist"].includes(String(next.terminalCommandMode || "").toLowerCase()) ? String(next.terminalCommandMode).toLowerCase() : "never";
+  next.maxToolRequestsPerRound = Math.max(1, Number(next.maxToolRequestsPerRound) || 5);
+  next.maxDesignPolishRounds = Math.max(1, Number(next.maxDesignPolishRounds) || 2);
+  next.requireApprovalBeforeDependencyInstall = next.requireApprovalBeforeDependencyInstall !== false;
+  next.requireApprovalBeforeTerminalCommand = next.requireApprovalBeforeTerminalCommand !== false;
+  return next;
+}
+
 function formatPlaywrightCapabilityStatus(capability) {
   const status = String(capability?.status || "not_checked").trim().toLowerCase();
   if (status === "available") return "available";
@@ -5246,6 +5282,7 @@ function formatDesignScore(value) {
 function SettingsView({ settings, project, activeProcess, qualityLoopState, onQualityLoopStateChange, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
   const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
   const [guiQaDraft, setGuiQaDraft] = useState(() => normalizeGuiQaDraft(settings?.guiQa));
+  const [agentToolPolicyDraft, setAgentToolPolicyDraft] = useState(() => normalizeAgentToolPolicyDraft(settings?.agentToolPolicy));
   const [nameDraft, setNameDraft] = useState(() => ({
     juniorName: agentNames.junior || "",
     supervisorName: agentNames.supervisor || "",
@@ -5275,6 +5312,11 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   const [isUiQualityBusy, setIsUiQualityBusy] = useState(false);
   const [isUiQualityRefreshing, setIsUiQualityRefreshing] = useState(false);
   const [uiInstallCopyState, setUiInstallCopyState] = useState("idle");
+  const [agentToolState, setAgentToolState] = useState(null);
+  const [agentToolError, setAgentToolError] = useState("");
+  const [agentToolSaveState, setAgentToolSaveState] = useState("idle");
+  const [isAgentToolsBusy, setIsAgentToolsBusy] = useState(false);
+  const [selectedApprovalIds, setSelectedApprovalIds] = useState([]);
   const detectedTargetUrl = activeProcess?.healthUrl || "";
   const canRunGuiQa = guiQaDraft.enabled && playwrightCapability?.status === "available" && Boolean(detectedTargetUrl);
   const qualityLoopBusy = ["running", "gui_qa_pending", "gui_qa_running", "qa_reviewing_gui_evidence", "dev_patching_gui_issue"].includes(String(qualityLoopState?.status || "").toLowerCase());
@@ -5282,6 +5324,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   useEffect(() => {
     setDialogueDraft(buildDialogueDraft(settings?.agents));
     setGuiQaDraft(normalizeGuiQaDraft(settings?.guiQa));
+    setAgentToolPolicyDraft(normalizeAgentToolPolicyDraft(settings?.agentToolPolicy));
   }, [settings]);
 
   useEffect(() => {
@@ -5304,6 +5347,9 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     setUiQualityState(null);
     setUiQualityError("");
     setUiInstallCopyState("idle");
+    setAgentToolState(null);
+    setAgentToolError("");
+    setSelectedApprovalIds([]);
     setPlaywrightCapability({
       status: "not_checked",
       packageStatus: "not_checked",
@@ -5321,6 +5367,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     void refreshQualityLoopHealth();
     void refreshRunbook(project.rootPath, true);
     void refreshUiQuality(project.rootPath, true);
+    void refreshAgentTools(project.rootPath, true);
   }, [project?.rootPath]);
 
   useEffect(() => {
@@ -5385,6 +5432,29 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     }
   }
 
+  async function refreshAgentTools(projectRoot = project?.rootPath || "", silent = false) {
+    if (!projectRoot || !window.trifix?.getLatestAgentTools) {
+      setAgentToolState(null);
+      return;
+    }
+    if (!silent) {
+      setIsAgentToolsBusy(true);
+      setAgentToolError("");
+    }
+    try {
+      const latest = await window.trifix.getLatestAgentTools({ projectRoot });
+      setAgentToolState(latest || null);
+    } catch (error) {
+      if (!silent) {
+        setAgentToolError(error?.message || "Could not load agent tool state.");
+      }
+    } finally {
+      if (!silent) {
+        setIsAgentToolsBusy(false);
+      }
+    }
+  }
+
   async function saveDialogue() {
     setSaveState("saving");
     setSaveError("");
@@ -5418,6 +5488,20 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     } catch (error) {
       setGuiQaSaveState("error");
       setGuiQaError(error?.message || "Failed to save GUI QA settings.");
+    }
+  }
+
+  async function saveAgentToolPolicy() {
+    setAgentToolSaveState("saving");
+    setAgentToolError("");
+    try {
+      const nextSettings = await window.trifix.saveAgentToolPolicy(normalizeAgentToolPolicyDraft(agentToolPolicyDraft));
+      onSettingsChange(nextSettings);
+      setAgentToolSaveState("saved");
+      await refreshAgentTools(project?.rootPath || "", true);
+    } catch (error) {
+      setAgentToolSaveState("error");
+      setAgentToolError(error?.message || "Failed to save agent tool policy.");
     }
   }
 
@@ -5704,6 +5788,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
         projectRoot: project.rootPath
       });
       await refreshUiQuality(project.rootPath, true);
+      await refreshAgentTools(project.rootPath, true);
       await refreshRunbook(project.rootPath, true);
     } catch (error) {
       setUiQualityError(error?.message || "Could not create UI quality contract.");
@@ -5723,6 +5808,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
         projectRoot: project.rootPath
       });
       await refreshUiQuality(project.rootPath, true);
+      await refreshAgentTools(project.rootPath, true);
       await refreshRunbook(project.rootPath, true);
     } catch (error) {
       setUiQualityError(error?.message || "Could not generate UI stack recommendation.");
@@ -5742,6 +5828,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
         projectRoot: project.rootPath
       });
       await refreshUiQuality(project.rootPath, true);
+      await refreshAgentTools(project.rootPath, true);
       await refreshRunbook(project.rootPath, true);
     } catch (error) {
       setUiQualityError(error?.message || "Could not create dependency plan.");
@@ -5765,6 +5852,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
         guiQa: normalizeGuiQaDraft(guiQaDraft)
       });
       await refreshUiQuality(project.rootPath, true);
+      await refreshAgentTools(project.rootPath, true);
       await refreshGuiQaResult(project.rootPath);
       await refreshRunbook(project.rootPath, true);
     } catch (error) {
@@ -5789,6 +5877,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
         guiQa: normalizeGuiQaDraft(guiQaDraft)
       });
       await refreshUiQuality(project.rootPath, true);
+      await refreshAgentTools(project.rootPath, true);
       await refreshGuiQaResult(project.rootPath);
       await refreshRunbook(project.rootPath, true);
     } catch (error) {
@@ -5841,6 +5930,85 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     }
   }
 
+  async function approveSelectedToolRequests() {
+    if (!project?.rootPath || !selectedApprovalIds.length || !window.trifix?.approveAgentToolRequest) {
+      return;
+    }
+    setIsAgentToolsBusy(true);
+    setAgentToolError("");
+    try {
+      await window.trifix.approveAgentToolRequest({
+        projectRoot: project.rootPath,
+        approvalIds: selectedApprovalIds
+      });
+      setSelectedApprovalIds([]);
+      await refreshAgentTools(project.rootPath, true);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setAgentToolError(error?.message || "Could not approve tool requests.");
+    } finally {
+      setIsAgentToolsBusy(false);
+    }
+  }
+
+  async function denySelectedToolRequests() {
+    if (!project?.rootPath || !selectedApprovalIds.length || !window.trifix?.denyAgentToolRequest) {
+      return;
+    }
+    setIsAgentToolsBusy(true);
+    setAgentToolError("");
+    try {
+      await window.trifix.denyAgentToolRequest({
+        projectRoot: project.rootPath,
+        approvalIds: selectedApprovalIds
+      });
+      setSelectedApprovalIds([]);
+      await refreshAgentTools(project.rootPath, true);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setAgentToolError(error?.message || "Could not deny tool requests.");
+    } finally {
+      setIsAgentToolsBusy(false);
+    }
+  }
+
+  async function executeApprovedToolRequestsAction() {
+    if (!project?.rootPath || !window.trifix?.executeApprovedAgentToolRequests) {
+      return;
+    }
+    setIsAgentToolsBusy(true);
+    setAgentToolError("");
+    try {
+      await window.trifix.executeApprovedAgentToolRequests({
+        projectRoot: project.rootPath,
+        approvalIds: selectedApprovalIds
+      });
+      setSelectedApprovalIds([]);
+      await refreshAgentTools(project.rootPath, true);
+      await refreshRunbook(project.rootPath, true);
+      await refreshGuiQaResult(project.rootPath);
+      await refreshUiQuality(project.rootPath, true);
+    } catch (error) {
+      setAgentToolError(error?.message || "Could not execute approved tool requests.");
+    } finally {
+      setIsAgentToolsBusy(false);
+    }
+  }
+
+  async function openCurrentAgentToolFolder() {
+    if (!project?.rootPath || !window.trifix?.openAgentToolFolder) {
+      return;
+    }
+    try {
+      await window.trifix.openAgentToolFolder({
+        projectRoot: project.rootPath,
+        runId: agentToolState?.latestRunbook?.runId || ""
+      });
+    } catch (error) {
+      setAgentToolError(error?.message || "Could not open agent tool folder.");
+    }
+  }
+
   const uiContract = uiQualityState?.contract || null;
   const uiStack = uiQualityState?.stackRecommendation || null;
   const dependencyPlan = uiQualityState?.dependencyPlan || null;
@@ -5849,6 +6017,9 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   const polishState = uiQualityState?.polishState || null;
   const installCommands = Array.isArray(uiQualityState?.installCommands) ? uiQualityState.installCommands.filter(Boolean) : [];
   const designIssues = Array.isArray(designReview?.issues) ? designReview.issues : [];
+  const pendingApprovals = Array.isArray(agentToolState?.pendingApprovals) ? agentToolState.pendingApprovals : [];
+  const pendingToolApprovals = pendingApprovals.filter((item) => String(item?.status || "").toLowerCase() === "pending");
+  const toolActionEntries = Array.isArray(agentToolState?.toolActionsIndex) ? agentToolState.toolActionsIndex : [];
   const designWarnings = [
     !project?.rootPath ? "Select a project first." : "",
     !detectedTargetUrl ? "Run Project first. UI quality checks require an active healthUrl." : "",
@@ -6390,6 +6561,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
         {(uiContract?.avoid || []).length ? <p className="muted">Avoid: {uiContract.avoid.slice(0, 4).join(" | ")}</p> : null}
         {(uiStack?.reasoning || []).length ? <p className="muted">Stack reasoning: {uiStack.reasoning.join(" | ")}</p> : null}
         {(dependencyPlan?.warnings || []).length ? <p className="muted">Dependency warnings: {dependencyPlan.warnings.join(" | ")}</p> : null}
+        <p className="muted">Agent tool automation: safe evidence tools can run automatically; dependency installs require approval. Pending approvals: {agentToolState?.pendingApprovalCount || 0}</p>
         {uiInstallCopyState === "copied" ? <div className="save-note">Install commands copied.</div> : null}
         {uiInstallCopyState === "empty" ? <p className="muted">No install commands are available yet.</p> : null}
         <div className="panel-heading">
@@ -6523,6 +6695,167 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
           <div className="error-banner" role="alert">
             <TriangleAlert size={18} />
             <span>{uiQualityError}</span>
+          </div>
+        ) : null}
+      </div>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Agent Tools</p>
+            <h2>Automation policy and approvals</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={() => refreshAgentTools()} disabled={!project?.rootPath || isAgentToolsBusy}>
+              {isAgentToolsBusy ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
+              Refresh Tool Requests
+            </button>
+            <button className="secondary-button" type="button" onClick={openCurrentAgentToolFolder} disabled={!project?.rootPath}>
+              <FolderOpen size={18} />
+              Open Tool Action Folder
+            </button>
+            <button className="primary-button" type="button" onClick={saveAgentToolPolicy} disabled={agentToolSaveState === "saving"}>
+              {agentToolSaveState === "saving" ? <Loader2 size={18} className="spin" /> : null}
+              Save Agent Tool Policy
+            </button>
+          </div>
+        </div>
+        <div className="settings-grid">
+          <label className="settings-row checkbox-row">
+            <span>Allow agents to run GUI QA</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowRunGuiQa} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowRunGuiQa: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Allow agents to run UI Quality Check</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowRunUiQualityCheck} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowRunUiQualityCheck: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Allow agents to create dependency plans</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowCreateDependencyPlan} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowCreateDependencyPlan: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Allow agents to run build</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowRunBuild} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowRunBuild: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Allow agents to start project</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowRunProject} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowRunProject: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Allow agents to stop project</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowStopProject} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowStopProject: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Allow design polish pass</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.allowDesignPolishPass} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, allowDesignPolishPass: event.target.checked }))} />
+          </label>
+          <label className="settings-row">
+            <span>Dependency installs</span>
+            <select value={agentToolPolicyDraft.dependencyInstallMode} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, dependencyInstallMode: event.target.value }))}>
+              <option value="never">Never</option>
+              <option value="ask">Ask</option>
+              <option value="allow_selected">Allow selected</option>
+            </select>
+          </label>
+          <label className="settings-row">
+            <span>Terminal commands</span>
+            <select value={agentToolPolicyDraft.terminalCommandMode} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, terminalCommandMode: event.target.value }))}>
+              <option value="never">Never</option>
+              <option value="ask">Ask</option>
+              <option value="allow_whitelist">Whitelist</option>
+            </select>
+          </label>
+          <label className="settings-row">
+            <span>Max tool requests per round</span>
+            <input type="number" min="1" step="1" value={agentToolPolicyDraft.maxToolRequestsPerRound} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, maxToolRequestsPerRound: Math.max(1, Number(event.target.value) || 1) }))} />
+          </label>
+          <label className="settings-row">
+            <span>Max design polish rounds</span>
+            <input type="number" min="1" step="1" value={agentToolPolicyDraft.maxDesignPolishRounds} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, maxDesignPolishRounds: Math.max(1, Number(event.target.value) || 1) }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Require approval before dependency install</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.requireApprovalBeforeDependencyInstall} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, requireApprovalBeforeDependencyInstall: event.target.checked }))} />
+          </label>
+          <label className="settings-row checkbox-row">
+            <span>Require approval before terminal command</span>
+            <input type="checkbox" checked={agentToolPolicyDraft.requireApprovalBeforeTerminalCommand} onChange={(event) => setAgentToolPolicyDraft((current) => ({ ...current, requireApprovalBeforeTerminalCommand: event.target.checked }))} />
+          </label>
+          <div className="settings-row">
+            <span>Pending approvals</span>
+            <code>{agentToolState?.pendingApprovalCount || 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest tool action folder</span>
+            <code>{agentToolState?.toolActionsDir || "Not available"}</code>
+          </div>
+        </div>
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Pending Approvals</p>
+            <h2>Dependency installs and risky commands</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={approveSelectedToolRequests} disabled={!selectedApprovalIds.length || isAgentToolsBusy}>
+              Approve Selected
+            </button>
+            <button className="secondary-button" type="button" onClick={denySelectedToolRequests} disabled={!selectedApprovalIds.length || isAgentToolsBusy}>
+              Deny Selected
+            </button>
+            <button className="primary-button" type="button" onClick={executeApprovedToolRequestsAction} disabled={isAgentToolsBusy || (!selectedApprovalIds.length && !pendingApprovals.length)}>
+              Execute Approved
+            </button>
+          </div>
+        </div>
+        {pendingApprovals.length ? (
+          <div className="settings-grid">
+            {pendingApprovals.map((approval) => {
+              const approvalId = approval?.approvalId || "";
+              const checked = selectedApprovalIds.includes(approvalId);
+              return (
+                <label className="settings-row checkbox-row" key={approvalId}>
+                  <span>{`${approval?.role || "agent"} | ${approval?.tool || "tool"} | ${approval?.riskLevel || "risk"} | ${approval?.status || "pending"}`}</span>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(event) => {
+                      setSelectedApprovalIds((current) =>
+                        event.target.checked
+                          ? [...current, approvalId]
+                          : current.filter((item) => item !== approvalId)
+                      );
+                    }}
+                  />
+                </label>
+              );
+            })}
+          </div>
+        ) : <p className="muted">No pending tool approvals.</p>}
+        {pendingApprovals.map((approval) => (
+          <p className="muted" key={`${approval?.approvalId || "approval"}-detail`}>
+            {`${approval?.tool || "tool"}: ${approval?.reason || "No reason provided."}${approval?.commands?.length ? ` Commands: ${approval.commands.join(" | ")}` : ""}`}
+          </p>
+        ))}
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Recent Tool Results</p>
+            <h2>Executed and denied agent actions</h2>
+          </div>
+        </div>
+        {toolActionEntries.length ? (
+          <div className="settings-grid">
+            {toolActionEntries.slice(-8).reverse().map((entry) => (
+              <div className="settings-row" key={`${entry?.id || "tool"}-${entry?.savedAt || ""}`}>
+                <span>{`${entry?.tool || "tool"} | ${entry?.status || "status"}`}</span>
+                <code>{entry?.message || entry?.filePath || "No details"}</code>
+              </div>
+            ))}
+          </div>
+        ) : <p className="muted">No tool actions recorded yet.</p>}
+        {agentToolSaveState === "saved" ? <div className="save-note">Agent tool policy saved.</div> : null}
+        {agentToolError ? (
+          <div className="error-banner" role="alert">
+            <TriangleAlert size={18} />
+            <span>{agentToolError}</span>
           </div>
         ) : null}
       </div>

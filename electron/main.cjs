@@ -49,6 +49,9 @@ const DESIGN_POLISH_STATE_FILE = "design-polish-state.json";
 const DESIGN_SCREENSHOTS_DIR = "screenshots";
 const DESIGN_DESKTOP_SCREENSHOT_FILE = "latest-desktop.png";
 const DESIGN_MOBILE_SCREENSHOT_FILE = "latest-mobile.png";
+const AGENT_TOOL_ACTIONS_DIR_NAME = "tool-actions";
+const TOOL_ACTIONS_INDEX_FILE = "index.json";
+const PENDING_TOOL_APPROVALS_FILE = "pending-tool-approvals.json";
 const AUTONOMY_RUNBOOK_DIR_NAME = "autonomy";
 const AUTONOMY_RUNS_DIR_NAME = "runs";
 const AUTONOMY_LATEST_RUN_FILE = "latest-run.json";
@@ -70,6 +73,21 @@ const DEFAULT_GUI_QA_SETTINGS = Object.freeze({
   autoRunAfterBuild: false,
   stopDevServerAfterQa: true,
   maxAttempts: 1
+});
+const DEFAULT_AGENT_TOOL_POLICY = Object.freeze({
+  allowRunGuiQa: true,
+  allowRunUiQualityCheck: true,
+  allowCreateDependencyPlan: true,
+  allowRunBuild: true,
+  allowRunProject: true,
+  allowStopProject: true,
+  allowDesignPolishPass: true,
+  dependencyInstallMode: "ask",
+  terminalCommandMode: "never",
+  maxToolRequestsPerRound: 5,
+  maxDesignPolishRounds: 2,
+  requireApprovalBeforeDependencyInstall: true,
+  requireApprovalBeforeTerminalCommand: true
 });
 
 function logRunLock(event, payload = {}) {
@@ -482,6 +500,12 @@ function registerIpc() {
     await writeSettings(current);
     return buildAppSettings();
   });
+  ipcMain.handle("app:agent-tools:save", async (_event, payload = {}) => {
+    const current = await readSettings();
+    current.agentToolPolicy = normalizeAgentToolPolicy(payload);
+    await writeSettings(current);
+    return buildAppSettings();
+  });
   ipcMain.handle("guiQa:check-capability", async (_event, payload = {}) =>
     detectPlaywrightCapability(payload)
   );
@@ -511,6 +535,24 @@ function registerIpc() {
   );
   ipcMain.handle("designQuality:create-dependency-plan", async (_event, payload = {}) =>
     createDependencyPlan(payload)
+  );
+  ipcMain.handle("agentTools:get-latest", async (_event, payload = {}) =>
+    getLatestAgentToolState(payload)
+  );
+  ipcMain.handle("agentTools:execute-request", async (_event, payload = {}) =>
+    executeAgentToolRequest(payload)
+  );
+  ipcMain.handle("agentTools:approve", async (_event, payload = {}) =>
+    updatePendingToolApproval(payload, "approved")
+  );
+  ipcMain.handle("agentTools:deny", async (_event, payload = {}) =>
+    updatePendingToolApproval(payload, "denied")
+  );
+  ipcMain.handle("agentTools:execute-approved", async (_event, payload = {}) =>
+    executeApprovedToolRequests(payload)
+  );
+  ipcMain.handle("agentTools:open-folder", async (_event, payload = {}) =>
+    openAgentToolFolder(payload)
   );
   ipcMain.handle("qualityLoop:run", async (_event, payload = {}) =>
     startQualityLoop(payload)
@@ -3563,7 +3605,8 @@ async function buildAppSettings() {
       pm: backend.ARCHITECT_ENDPOINT
     },
     agents: await getMergedAgents(),
-    guiQa: normalizeGuiQaSettings(current.guiQa)
+    guiQa: normalizeGuiQaSettings(current.guiQa),
+    agentToolPolicy: normalizeAgentToolPolicy(current.agentToolPolicy)
   };
 }
 
@@ -3630,6 +3673,27 @@ function normalizeGuiQaSettings(value = {}) {
     autoRunAfterBuild: Boolean(candidate.autoRunAfterBuild),
     stopDevServerAfterQa: candidate.stopDevServerAfterQa !== false,
     maxAttempts: Number.isFinite(maxAttempts) ? Math.max(1, Math.round(maxAttempts)) : DEFAULT_GUI_QA_SETTINGS.maxAttempts
+  };
+}
+
+function normalizeAgentToolPolicy(value = {}) {
+  const candidate = value && typeof value === "object" ? value : {};
+  const dependencyInstallMode = String(candidate.dependencyInstallMode || DEFAULT_AGENT_TOOL_POLICY.dependencyInstallMode).trim().toLowerCase();
+  const terminalCommandMode = String(candidate.terminalCommandMode || DEFAULT_AGENT_TOOL_POLICY.terminalCommandMode).trim().toLowerCase();
+  return {
+    allowRunGuiQa: candidate.allowRunGuiQa !== false,
+    allowRunUiQualityCheck: candidate.allowRunUiQualityCheck !== false,
+    allowCreateDependencyPlan: candidate.allowCreateDependencyPlan !== false,
+    allowRunBuild: candidate.allowRunBuild !== false,
+    allowRunProject: candidate.allowRunProject !== false,
+    allowStopProject: candidate.allowStopProject !== false,
+    allowDesignPolishPass: candidate.allowDesignPolishPass !== false,
+    dependencyInstallMode: ["ask", "never", "allow_selected"].includes(dependencyInstallMode) ? dependencyInstallMode : DEFAULT_AGENT_TOOL_POLICY.dependencyInstallMode,
+    terminalCommandMode: ["ask", "never", "allow_whitelist"].includes(terminalCommandMode) ? terminalCommandMode : DEFAULT_AGENT_TOOL_POLICY.terminalCommandMode,
+    maxToolRequestsPerRound: Math.min(10, Math.max(1, Number(candidate.maxToolRequestsPerRound || DEFAULT_AGENT_TOOL_POLICY.maxToolRequestsPerRound) || DEFAULT_AGENT_TOOL_POLICY.maxToolRequestsPerRound)),
+    maxDesignPolishRounds: Math.min(4, Math.max(1, Number(candidate.maxDesignPolishRounds || DEFAULT_AGENT_TOOL_POLICY.maxDesignPolishRounds) || DEFAULT_AGENT_TOOL_POLICY.maxDesignPolishRounds)),
+    requireApprovalBeforeDependencyInstall: candidate.requireApprovalBeforeDependencyInstall !== false,
+    requireApprovalBeforeTerminalCommand: candidate.requireApprovalBeforeTerminalCommand !== false
   };
 }
 
@@ -4461,6 +4525,8 @@ async function runDesignPolishPass(payload = {}) {
   if (!healthUrl) {
     throw new Error("healthUrl is required for Design Polish Pass.");
   }
+  const agentToolPolicy = await getAgentToolPolicy();
+  const toolRunbook = await ensureAgentToolRunbook(root, payload.runId || "");
   const inputs = await resolveUiQualityInputs(root, payload);
   const dependencyPlan = designQuality.buildDependencyPlan({
     recommendation: inputs.recommendation,
@@ -4507,9 +4573,9 @@ async function runDesignPolishPass(payload = {}) {
     scores: designReview.scores || {},
     designIssues: [],
     requiredFixes: [],
-    confidence: 0
+      confidence: 0
   };
-  const maxRounds = Math.max(1, Math.min(2, Number(payload.maxRounds || 2) || 2));
+  const maxRounds = Math.max(1, Math.min(4, Number(payload.maxRounds || agentToolPolicy.maxDesignPolishRounds || 2) || agentToolPolicy.maxDesignPolishRounds || 2));
 
   for (let round = 1; round <= maxRounds; round += 1) {
     const qaOutput = await backend.runDesignQaReview({
@@ -4531,6 +4597,31 @@ async function runDesignPolishPass(payload = {}) {
         message: "QA returned invalid design review format."
       });
       await appendDesignRunbookEvent(root, "design-polish-needs-review", "QA returned invalid design review format.");
+      return getLatestUiQuality({ projectRoot: root });
+    }
+    const qaToolResults = await executeAgentToolRequestsBatch({
+      projectRoot: root,
+      role: "qa",
+      runId: toolRunbook.runId,
+      round,
+      toolRequests: qaOutput.toolRequests || [],
+      policy: agentToolPolicy,
+      context: {
+        source: "automation",
+        healthUrl,
+        processId: payload.processId || "",
+        guiQa: payload.guiQa || null,
+        userPrompt: payload.userPrompt || "",
+        projectId: payload.projectId || ""
+      }
+    });
+    if (qaToolResults.some((item) => item.status === "needs_approval")) {
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: "needs_manual_review",
+        message: "Agent tool approval is required before design polish can continue."
+      });
       return getLatestUiQuality({ projectRoot: root });
     }
     verdict = convertDesignQaVerdict(qaOutput.parsed, qaOutput.rawOutput);
@@ -4589,6 +4680,31 @@ async function runDesignPolishPass(payload = {}) {
       await appendDesignRunbookEvent(root, "design-polish-needs-review", "DEV returned no valid UI patch.");
       return getLatestUiQuality({ projectRoot: root });
     }
+    const devToolResults = await executeAgentToolRequestsBatch({
+      projectRoot: root,
+      role: "dev",
+      runId: toolRunbook.runId,
+      round,
+      toolRequests: devPatch.toolRequests || [],
+      policy: agentToolPolicy,
+      context: {
+        source: "automation",
+        healthUrl,
+        processId: payload.processId || "",
+        guiQa: payload.guiQa || null,
+        userPrompt: payload.userPrompt || "",
+        projectId: payload.projectId || ""
+      }
+    });
+    if (devToolResults.some((item) => item.status === "needs_approval")) {
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: "needs_manual_review",
+        message: "Agent tool approval is required before DEV can continue."
+      });
+      return getLatestUiQuality({ projectRoot: root });
+    }
     const validation = validateQualityLoopFileOperations(root, devPatch.fileOperations);
     if (!validation.ok || !validation.validFormat) {
       await writeJsonFile(inputs.paths.polishStatePath, {
@@ -4607,6 +4723,29 @@ async function runDesignPolishPass(payload = {}) {
     await appendDesignRunbookEvent(root, "design-polish-patch-applied", "Design polish patch applied.", {
       appliedFiles: (patchApply.applied || []).map((item) => item.path)
     });
+    if (agentToolPolicy.allowRunBuild) {
+      const buildResult = await runControlledBuildTool(root, payload.projectId || "");
+      if (!buildResult.ok || String(buildResult.result?.status || "").toLowerCase() !== "passed") {
+        await writeJsonFile(inputs.paths.polishStatePath, {
+          schemaVersion: 1,
+          updatedAt: new Date().toISOString(),
+          status: "needs_manual_review",
+          message: buildResult.error || buildResult.result?.outputPreview || "Build failed after design patch."
+        });
+        await appendDesignRunbookEvent(root, "agent-tool-failed", "Build failed after design polish patch.", {
+          tool: "run_build"
+        });
+        return getLatestUiQuality({ projectRoot: root });
+      }
+    }
+    if (agentToolPolicy.allowRunGuiQa) {
+      await runGuiQaSmokeTest({
+        projectRoot: root,
+        processId: payload.processId || "",
+        healthUrl,
+        guiQa: payload.guiQa || null
+      }).catch(() => null);
+    }
     latestQuality = await runUiQualityCheck({
       projectRoot: root,
       healthUrl,
@@ -4663,6 +4802,717 @@ async function getLatestUiQuality(payload = {}) {
       dependencyPlan
     })
   };
+}
+
+async function getAgentToolPolicy() {
+  const current = await readSettings().catch(() => ({}));
+  return normalizeAgentToolPolicy(current.agentToolPolicy);
+}
+
+async function getPendingToolApprovalsPath(rootPath) {
+  const { baseDir } = await ensureAutonomyRunbookRoot(rootPath);
+  return path.join(baseDir, PENDING_TOOL_APPROVALS_FILE);
+}
+
+async function readPendingToolApprovals(rootPath) {
+  const filePath = await getPendingToolApprovalsPath(rootPath);
+  const approvals = await readJsonFile(filePath, []);
+  return Array.isArray(approvals) ? approvals : [];
+}
+
+async function writePendingToolApprovals(rootPath, approvals) {
+  const filePath = await getPendingToolApprovalsPath(rootPath);
+  await writeJsonFile(filePath, Array.isArray(approvals) ? approvals : []);
+  return filePath;
+}
+
+async function ensureAgentToolRunbook(rootPath, preferredRunId = "") {
+  const root = await normalizeExistingProjectRoot(rootPath);
+  const latest = await getLatestRunbook({ projectRoot: root }).catch(() => null);
+  if (preferredRunId) {
+    const existing = await loadRunbook(root, preferredRunId).catch(() => null);
+    if (existing?.runId) {
+      return existing;
+    }
+  }
+  if (latest?.runId) {
+    return latest;
+  }
+  const runId = preferredRunId || `toolrun-${Date.now()}`;
+  return upsertPersistentRunbook(root, {
+    runId,
+    projectName: path.basename(root),
+    mode: "manual_tools",
+    status: "running",
+    currentStage: "agent_tools",
+    currentRound: 0
+  }, {
+    type: "agent-tool-session-started",
+    status: "running",
+    message: "Agent tool session started."
+  });
+}
+
+async function getToolActionPaths(rootPath, runId) {
+  const runbook = await ensureAgentToolRunbook(rootPath, runId);
+  const paths = await getRunbookPaths(runbook.projectRoot, runbook.runId);
+  const toolActionsDir = path.join(paths.runDir, AGENT_TOOL_ACTIONS_DIR_NAME);
+  await fs.mkdir(toolActionsDir, { recursive: true });
+  return {
+    root: runbook.projectRoot,
+    runId: runbook.runId,
+    runDir: paths.runDir,
+    toolActionsDir,
+    indexPath: path.join(toolActionsDir, TOOL_ACTIONS_INDEX_FILE)
+  };
+}
+
+async function persistToolActionResult(rootPath, runId, result) {
+  const paths = await getToolActionPaths(rootPath, runId);
+  const safeId = String(result?.id || `toolreq-${Date.now()}`).replace(/[^a-z0-9._-]+/gi, "-");
+  const filePath = path.join(paths.toolActionsDir, `${safeId}.json`);
+  const payload = {
+    ...result,
+    savedAt: new Date().toISOString()
+  };
+  await writeJsonFile(filePath, payload);
+  const existingIndex = await readJsonFile(paths.indexPath, []);
+  const nextIndex = [
+    ...(Array.isArray(existingIndex) ? existingIndex.filter((item) => item?.id !== payload.id) : []),
+    {
+      id: payload.id,
+      tool: payload.tool,
+      status: payload.status,
+      message: payload.message,
+      role: payload.role || "",
+      round: payload.round || 0,
+      approvalId: payload.approvalId || "",
+      filePath,
+      savedAt: payload.savedAt
+    }
+  ].slice(-80);
+  await writeJsonFile(paths.indexPath, nextIndex);
+  return {
+    filePath,
+    indexPath: paths.indexPath
+  };
+}
+
+function normalizeAgentToolRequest(value = {}, fallbackId = "") {
+  const request = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    id: String(request.id || fallbackId || `toolreq-${Date.now()}`).trim(),
+    tool: String(request.tool || "").trim(),
+    reason: String(request.reason || "").trim(),
+    expectedBenefit: String(request.expectedBenefit || "").trim(),
+    args: request.args && typeof request.args === "object" && !Array.isArray(request.args) ? request.args : {},
+    requiresApproval: request.requiresApproval === true
+  };
+}
+
+function buildAgentToolResult(request, patch = {}) {
+  return {
+    id: request.id,
+    tool: request.tool,
+    status: patch.status || "failed",
+    message: String(patch.message || "").trim(),
+    result: patch.result && typeof patch.result === "object" ? patch.result : {},
+    artifactPaths: Array.isArray(patch.artifactPaths) ? patch.artifactPaths.filter(Boolean) : [],
+    role: String(patch.role || "").trim(),
+    round: Number(patch.round || 0),
+    approvalId: String(patch.approvalId || "").trim()
+  };
+}
+
+function getAgentToolRisk(toolName) {
+  const tool = String(toolName || "").trim().toLowerCase();
+  if (["create_ui_quality_contract", "generate_ui_stack_recommendation", "create_dependency_plan", "run_ui_quality_check", "run_gui_qa", "refresh_gui_qa_result", "refresh_runbook"].includes(tool)) {
+    return "safe";
+  }
+  if (["run_project", "stop_project", "run_build"].includes(tool)) {
+    return "moderate";
+  }
+  return "risky";
+}
+
+async function getLatestActiveProcess(rootPath) {
+  const records = await refreshProcessRecords(rootPath).catch(() => []);
+  return records.find((entry) => ["running", "starting"].includes(String(entry.status || "").toLowerCase())) || null;
+}
+
+async function resolveToolHealthUrl(rootPath, preferredUrl = "") {
+  const text = String(preferredUrl || "").trim();
+  if (text) {
+    return text;
+  }
+  const active = await getLatestActiveProcess(rootPath);
+  return String(active?.healthUrl || "").trim();
+}
+
+async function updateRunbookForPendingApprovals(rootPath, runId) {
+  const approvals = await readPendingToolApprovals(rootPath);
+  const pending = approvals.filter((item) => String(item?.status || "").toLowerCase() === "pending");
+  if (pending.length > 0) {
+    await upsertPersistentRunbook(rootPath, {
+      runId,
+      status: "needs_review",
+      pendingApprovalsCount: pending.length,
+      currentStage: "awaiting_tool_approval",
+      stopReason: "Pending agent tool approval."
+    }, {
+      type: "agent-tool-requested",
+      status: "needs_review",
+      message: "Pending agent tool approval.",
+      data: { pendingApprovals: pending.length }
+    });
+  } else {
+    await upsertPersistentRunbook(rootPath, {
+      runId,
+      pendingApprovalsCount: 0
+    });
+  }
+}
+
+async function createPendingToolApprovalRecord(rootPath, runId, role, request, commands = [], riskLevel = "risky") {
+  const approvals = await readPendingToolApprovals(rootPath);
+  const approval = {
+    approvalId: `approval-${Date.now()}`,
+    createdAt: new Date().toISOString(),
+    projectRoot: rootPath,
+    runId,
+    role: String(role || "").trim().toLowerCase() || "qa",
+    tool: request.tool,
+    reason: request.reason,
+    commands: Array.isArray(commands) ? commands.filter(Boolean) : [],
+    args: request.args || {},
+    riskLevel,
+    status: "pending"
+  };
+  approvals.push(approval);
+  const filePath = await writePendingToolApprovals(rootPath, approvals);
+  await updateRunbookForPendingApprovals(rootPath, runId);
+  return { approval, filePath };
+}
+
+async function runControlledBuildTool(rootPath, projectId = "") {
+  try {
+    const validation = await runProjectCommand({
+      projectRoot: rootPath,
+      projectId,
+      mode: "validate"
+    });
+    return {
+      ok: true,
+      result: validation,
+      artifactPaths: [validation?.stdoutLog ? path.join(rootPath, validation.stdoutLog) : "", validation?.stderrLog ? path.join(rootPath, validation.stderrLog) : ""].filter(Boolean)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.message || "Build could not be run.",
+      result: {}
+    };
+  }
+}
+
+async function validateDependencyInstallRequest(rootPath, requestArgs = {}) {
+  const latestQuality = await getLatestUiQuality({ projectRoot: rootPath }).catch(() => null);
+  const allowedCommands = uniqueStrings([
+    ...(latestQuality?.dependencyPlan?.requiredInstalls || []).map((item) => item.command),
+    ...(latestQuality?.dependencyPlan?.optionalInstalls || []).map((item) => item.command)
+  ]);
+  const requestedCommands = uniqueStrings([
+    ...normalizeStringArray(requestArgs.commands),
+    requestArgs.command ? String(requestArgs.command).trim() : ""
+  ]);
+  const selectedCommands = requestedCommands.filter((command) => allowedCommands.includes(command));
+  return {
+    latestQuality,
+    allowedCommands,
+    requestedCommands,
+    selectedCommands,
+    valid: selectedCommands.length > 0 && selectedCommands.length === requestedCommands.length
+  };
+}
+
+async function executeDependencyInstallApproval(rootPath, approval, context = {}) {
+  const commands = Array.isArray(approval?.commands) ? approval.commands.filter(Boolean) : [];
+  const sessions = [];
+  for (const command of commands) {
+    const entry = await runProjectCommand({
+      projectRoot: rootPath,
+      projectId: context.projectId || "",
+      mode: "custom",
+      command
+    });
+    sessions.push(entry);
+  }
+  return sessions;
+}
+
+async function executeAgentToolRequest(options = {}) {
+  const root = await normalizeExistingProjectRoot(options.projectRoot);
+  const role = String(options.role || "qa").trim().toLowerCase() || "qa";
+  const request = normalizeAgentToolRequest(options.request, `toolreq-${Date.now()}`);
+  if (!request.tool) {
+    throw new Error("Tool request is missing a tool name.");
+  }
+  const runbook = await ensureAgentToolRunbook(root, options.runId || "");
+  const runId = runbook.runId;
+  const round = Number(options.round || 0);
+  const policy = normalizeAgentToolPolicy(options.policy || await getAgentToolPolicy());
+  const context = options.context && typeof options.context === "object" ? options.context : {};
+  const riskLevel = getAgentToolRisk(request.tool);
+  const startedEventType = request.tool === "request_dependency_install" ? "dependency-install-requested" : "agent-tool-started";
+  await upsertPersistentRunbook(root, {
+    runId,
+    currentStage: "agent_tool_dispatch",
+    pendingApprovalsCount: Number(runbook.pendingApprovalsCount || 0)
+  }, {
+    type: "agent-tool-requested",
+    status: "running",
+    message: `${role.toUpperCase()} requested ${request.tool}.`,
+    data: { tool: request.tool, role, round }
+  });
+
+  const deny = async (message) => {
+    const result = buildAgentToolResult(request, {
+      status: "denied",
+      message,
+      role,
+      round
+    });
+    const stored = await persistToolActionResult(root, runId, result);
+    await upsertPersistentRunbook(root, { runId }, {
+      type: "agent-tool-denied",
+      status: "needs_review",
+      message,
+      data: { tool: request.tool, role, round }
+    });
+    return {
+      ...result,
+      artifactPaths: uniqueStrings(result.artifactPaths.concat([stored.filePath, stored.indexPath]))
+    };
+  };
+
+  const needsApproval = async (commands = [], message = "") => {
+    const pending = await createPendingToolApprovalRecord(root, runId, role, request, commands, riskLevel);
+    const result = buildAgentToolResult(request, {
+      status: "needs_approval",
+      message: message || "Tool request requires user approval.",
+      role,
+      round,
+      approvalId: pending.approval.approvalId,
+      artifactPaths: [pending.filePath]
+    });
+    const stored = await persistToolActionResult(root, runId, result);
+    await upsertPersistentRunbook(root, {
+      runId,
+      pendingApprovalsCount: (await readPendingToolApprovals(root)).filter((item) => item.status === "pending").length
+    }, {
+      type: request.tool === "request_dependency_install" ? "dependency-install-requested" : "agent-tool-requested",
+      status: "needs_review",
+      message: result.message,
+      data: { tool: request.tool, approvalId: pending.approval.approvalId, role }
+    });
+    return {
+      ...result,
+      artifactPaths: uniqueStrings(result.artifactPaths.concat([stored.filePath, stored.indexPath]))
+    };
+  };
+
+  const executeCompleted = async (message, resultPayload = {}, artifactPaths = []) => {
+    await upsertPersistentRunbook(root, { runId }, {
+      type: startedEventType,
+      status: "running",
+      message: `${request.tool} started.`,
+      data: { role, round }
+    });
+    const result = buildAgentToolResult(request, {
+      status: "completed",
+      message,
+      result: resultPayload,
+      artifactPaths,
+      role,
+      round
+    });
+    const stored = await persistToolActionResult(root, runId, result);
+    await upsertPersistentRunbook(root, { runId }, {
+      type: request.tool === "request_dependency_install" ? "dependency-install-executed" : "agent-tool-completed",
+      status: "running",
+      message,
+      data: { tool: request.tool, role, round }
+    });
+    return {
+      ...result,
+      artifactPaths: uniqueStrings(result.artifactPaths.concat([stored.filePath, stored.indexPath]))
+    };
+  };
+
+  try {
+    switch (String(request.tool || "").trim().toLowerCase()) {
+      case "create_ui_quality_contract": {
+        const latest = await createUiQualityContract({ projectRoot: root, ...(request.args || {}) });
+        return executeCompleted("UI quality contract created.", latest, [latest?.designAssets?.contractPath, latest?.designAssets?.qualityMdPath]);
+      }
+      case "generate_ui_stack_recommendation": {
+        const latest = await generateUiStackRecommendation({ projectRoot: root, ...(request.args || {}) });
+        return executeCompleted("UI stack recommendation created.", latest, [latest?.designAssets?.dependencyPlanPath]);
+      }
+      case "create_dependency_plan": {
+        if (!policy.allowCreateDependencyPlan) {
+          return deny("Policy denied dependency-plan creation.");
+        }
+        const latest = await createDependencyPlan({ projectRoot: root, ...(request.args || {}) });
+        return executeCompleted("Dependency plan created.", latest, [latest?.designAssets?.dependencyPlanPath]);
+      }
+      case "run_ui_quality_check": {
+        if (!policy.allowRunUiQualityCheck) {
+          return deny("Policy denied UI quality checks.");
+        }
+        const healthUrl = await resolveToolHealthUrl(root, request.args.healthUrl || context.healthUrl || "");
+        if (!healthUrl) {
+          return deny("healthUrl is required for UI Quality Check.");
+        }
+        const latest = await runUiQualityCheck({
+          projectRoot: root,
+          healthUrl,
+          processId: context.processId || "",
+          guiQa: context.guiQa || null,
+          userPrompt: context.userPrompt || ""
+        });
+        return executeCompleted("UI quality check completed.", latest, [latest?.designAssets?.domAuditPath, latest?.designAssets?.designReviewPath, latest?.designAssets?.desktopScreenshotPath, latest?.designAssets?.mobileScreenshotPath]);
+      }
+      case "run_gui_qa": {
+        if (!policy.allowRunGuiQa) {
+          return deny("Policy denied GUI QA runs.");
+        }
+        const healthUrl = await resolveToolHealthUrl(root, request.args.healthUrl || context.healthUrl || "");
+        if (!healthUrl) {
+          return deny("healthUrl is required for GUI QA.");
+        }
+        const result = await runGuiQaSmokeTest({
+          projectRoot: root,
+          processId: context.processId || "",
+          healthUrl,
+          guiQa: context.guiQa || null
+        });
+        return executeCompleted("GUI QA completed.", result, [result?.resultPath, result?.screenshotPath]);
+      }
+      case "refresh_gui_qa_result": {
+        const latest = await getLatestGuiQaResult({ projectRoot: root });
+        return executeCompleted("GUI QA result refreshed.", latest, [latest?.resultPath, latest?.screenshotPath]);
+      }
+      case "refresh_runbook": {
+        const latest = await getLatestRunbook({ projectRoot: root });
+        return executeCompleted("Runbook refreshed.", latest || {}, [latest?.runDir ? path.join(latest.runDir, RUNBOOK_FILE) : ""]);
+      }
+      case "open_design_folder": {
+        if (context.source === "automation") {
+          return deny("open_design_folder is manual-only and cannot run inside backend automation.");
+        }
+        const opened = await openDesignFolder({ projectRoot: root, ...(request.args || {}) });
+        return executeCompleted("Design folder opened.", opened, [opened?.path]);
+      }
+      case "run_project": {
+        if (!policy.allowRunProject) {
+          return deny("Policy denied starting the project.");
+        }
+        const active = await getLatestActiveProcess(root);
+        const result = active && ["running", "starting"].includes(String(active.status || "").toLowerCase())
+          ? { process: active, reused: true, processes: await refreshProcessRecords(root) }
+          : await runProjectCommand({
+              projectRoot: root,
+              projectId: context.projectId || "",
+              mode: "run",
+              command: request.args.command || ""
+            });
+        const processResult = result?.process || result;
+        return executeCompleted("Project run command completed.", result, [processResult?.stdoutLog ? path.join(root, processResult.stdoutLog) : "", processResult?.stderrLog ? path.join(root, processResult.stderrLog) : ""].filter(Boolean));
+      }
+      case "stop_project": {
+        if (!policy.allowStopProject) {
+          return deny("Policy denied stopping the project.");
+        }
+        const active = await getLatestActiveProcess(root);
+        if (!active?.id) {
+          return deny("No active managed project process was found.");
+        }
+        const stopped = await stopManagedProjectProcess({ projectRoot: root, processId: active.id });
+        return executeCompleted("Project stopped.", stopped, [stopped?.stdoutLog ? path.join(root, stopped.stdoutLog) : "", stopped?.stderrLog ? path.join(root, stopped.stderrLog) : ""].filter(Boolean));
+      }
+      case "run_build": {
+        if (!policy.allowRunBuild) {
+          return deny("Policy denied build runs.");
+        }
+        const build = await runControlledBuildTool(root, context.projectId || "");
+        if (!build.ok) {
+          const failed = buildAgentToolResult(request, {
+            status: "failed",
+            message: build.error,
+            role,
+            round
+          });
+          const stored = await persistToolActionResult(root, runId, failed);
+          await upsertPersistentRunbook(root, { runId }, {
+            type: "agent-tool-failed",
+            status: "needs_review",
+            message: build.error,
+            data: { tool: request.tool, role, round }
+          });
+          return {
+            ...failed,
+            artifactPaths: [stored.filePath, stored.indexPath]
+          };
+        }
+        return executeCompleted("Build completed.", build.result, build.artifactPaths);
+      }
+      case "request_dependency_install": {
+        const validation = await validateDependencyInstallRequest(root, request.args || {});
+        if (!validation.valid) {
+          return deny("Dependency install request must use commands from dependency-plan.json only.");
+        }
+        if (policy.dependencyInstallMode === "never") {
+          return deny("Dependency installs are disabled by policy.");
+        }
+        if (policy.requireApprovalBeforeDependencyInstall || policy.dependencyInstallMode === "ask") {
+          return needsApproval(validation.selectedCommands, "Dependency install request is pending approval.");
+        }
+        return executeCompleted("Dependency install request validated.", {
+          commands: validation.selectedCommands
+        }, [validation.latestQuality?.designAssets?.dependencyPlanPath || ""]);
+      }
+      case "run_terminal_command": {
+        const command = normalizeSuggestedCommand(request.args.command || "");
+        if (!command) {
+          return deny("Terminal command is empty.");
+        }
+        const terminalValidation = validateTerminalCommand(command, root);
+        if (!terminalValidation.allowed) {
+          return deny(terminalValidation.reason || "Terminal command blocked by safety policy.");
+        }
+        if (policy.terminalCommandMode === "never") {
+          return deny("Terminal commands are disabled by policy.");
+        }
+        if (policy.requireApprovalBeforeTerminalCommand || policy.terminalCommandMode === "ask") {
+          return needsApproval([command], "Terminal command is pending approval.");
+        }
+        const terminal = await runTerminalCommand({
+          projectRoot: root,
+          command
+        });
+        return executeCompleted("Terminal command executed.", terminal, [terminal?.session?.stdoutLog ? path.join(root, terminal.session.stdoutLog) : "", terminal?.session?.stderrLog ? path.join(root, terminal.session.stderrLog) : ""].filter(Boolean));
+      }
+      case "request_dev_patch": {
+        return executeCompleted("DEV patch request recorded for the next safe patch phase.", {
+          acknowledged: true
+        }, []);
+      }
+      case "apply_dev_patch": {
+        return deny("apply_dev_patch is restricted to validated internal patch flows.");
+      }
+      default:
+        return deny(`Unsupported agent tool: ${request.tool}`);
+    }
+  } catch (error) {
+    const failed = buildAgentToolResult(request, {
+      status: "failed",
+      message: error?.message || `Tool ${request.tool} failed.`,
+      role,
+      round
+    });
+    const stored = await persistToolActionResult(root, runId, failed);
+    await upsertPersistentRunbook(root, { runId }, {
+      type: "agent-tool-failed",
+      status: "needs_review",
+      message: failed.message,
+      data: { tool: request.tool, role, round }
+    });
+    return {
+      ...failed,
+      artifactPaths: [stored.filePath, stored.indexPath]
+    };
+  }
+}
+
+async function updatePendingToolApproval(payload = {}, nextStatus = "approved") {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const approvals = await readPendingToolApprovals(root);
+  const targetIds = new Set(normalizeStringArray(payload.approvalIds).concat(String(payload.approvalId || "").trim()).filter(Boolean));
+  const changed = [];
+  const updated = approvals.map((approval) => {
+    if (targetIds.size > 0 && !targetIds.has(String(approval.approvalId || ""))) {
+      return approval;
+    }
+    if (String(approval.status || "").toLowerCase() !== "pending") {
+      return approval;
+    }
+    const nextApproval = {
+      ...approval,
+      status: nextStatus,
+      updatedAt: new Date().toISOString()
+    };
+    changed.push(nextApproval);
+    return nextApproval;
+  });
+  const filePath = await writePendingToolApprovals(root, updated);
+  const latest = await ensureAgentToolRunbook(root, payload.runId || "");
+  await updateRunbookForPendingApprovals(root, latest.runId);
+  for (const approval of changed) {
+    await upsertPersistentRunbook(root, { runId: latest.runId }, {
+      type: nextStatus === "approved"
+        ? (approval.tool === "request_dependency_install" ? "dependency-install-approved" : "agent-tool-approved")
+        : (approval.tool === "request_dependency_install" ? "dependency-install-denied" : "agent-tool-denied"),
+      status: nextStatus === "approved" ? "running" : "needs_review",
+      message: `${approval.tool} ${nextStatus}.`,
+      data: { approvalId: approval.approvalId, tool: approval.tool }
+    });
+  }
+  return {
+    projectRoot: root,
+    approvals: updated,
+    changed,
+    filePath
+  };
+}
+
+async function executeApprovedToolRequests(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const policy = await getAgentToolPolicy();
+  const approvals = await readPendingToolApprovals(root);
+  const targetIds = new Set(normalizeStringArray(payload.approvalIds).concat(String(payload.approvalId || "").trim()).filter(Boolean));
+  const latest = await ensureAgentToolRunbook(root, payload.runId || "");
+  const executed = [];
+  const nextApprovals = [];
+  for (const approval of approvals) {
+    const isTarget = targetIds.size === 0 || targetIds.has(String(approval.approvalId || ""));
+    if (!isTarget || String(approval.status || "").toLowerCase() !== "approved") {
+      nextApprovals.push(approval);
+      continue;
+    }
+    if (approval.tool === "request_dependency_install") {
+      const sessions = await executeDependencyInstallApproval(root, approval, payload.context || {});
+      const build = policy.allowRunBuild ? await runControlledBuildTool(root, payload?.context?.projectId || "") : null;
+      executed.push({
+        approvalId: approval.approvalId,
+        tool: approval.tool,
+        status: "executed",
+        sessions,
+        build
+      });
+      nextApprovals.push({
+        ...approval,
+        status: "executed",
+        executedAt: new Date().toISOString()
+      });
+      await upsertPersistentRunbook(root, { runId: latest.runId }, {
+        type: "dependency-install-executed",
+        status: "running",
+        message: "Approved dependency install executed.",
+        data: { approvalId: approval.approvalId, commands: approval.commands || [] }
+      });
+    } else if (approval.tool === "run_terminal_command") {
+      const command = String((approval.commands || [])[0] || "").trim();
+      const terminal = await runTerminalCommand({
+        projectRoot: root,
+        command
+      });
+      executed.push({
+        approvalId: approval.approvalId,
+        tool: approval.tool,
+        status: "executed",
+        terminal
+      });
+      nextApprovals.push({
+        ...approval,
+        status: "executed",
+        executedAt: new Date().toISOString()
+      });
+      await upsertPersistentRunbook(root, { runId: latest.runId }, {
+        type: "agent-tool-completed",
+        status: "running",
+        message: "Approved terminal command executed.",
+        data: { approvalId: approval.approvalId, command }
+      });
+    } else {
+      nextApprovals.push(approval);
+    }
+  }
+  const filePath = await writePendingToolApprovals(root, nextApprovals);
+  await updateRunbookForPendingApprovals(root, latest.runId);
+  return {
+    projectRoot: root,
+    executed,
+    approvals: nextApprovals,
+    filePath
+  };
+}
+
+async function getLatestAgentToolState(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const policy = await getAgentToolPolicy();
+  const pendingApprovals = await readPendingToolApprovals(root);
+  const latestRunbook = await getLatestRunbook({ projectRoot: root }).catch(() => null);
+  let toolActionsIndex = [];
+  let toolActionsDir = "";
+  if (latestRunbook?.runId) {
+    const paths = await getToolActionPaths(root, latestRunbook.runId);
+    toolActionsDir = paths.toolActionsDir;
+    toolActionsIndex = await readJsonFile(paths.indexPath, []);
+  }
+  return {
+    projectRoot: root,
+    policy,
+    pendingApprovals,
+    pendingApprovalCount: pendingApprovals.filter((item) => String(item?.status || "").toLowerCase() === "pending").length,
+    toolActionsIndex: Array.isArray(toolActionsIndex) ? toolActionsIndex : [],
+    toolActionsDir,
+    latestRunbook
+  };
+}
+
+async function openAgentToolFolder(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const latest = await ensureAgentToolRunbook(root, payload.runId || "");
+  const paths = await getToolActionPaths(root, latest.runId);
+  const result = await shell.openPath(paths.toolActionsDir);
+  return {
+    ok: result === "",
+    path: paths.toolActionsDir
+  };
+}
+
+async function executeAgentToolRequestsBatch(options = {}) {
+  const requests = Array.isArray(options.toolRequests) ? options.toolRequests : [];
+  const policy = normalizeAgentToolPolicy(options.policy || await getAgentToolPolicy());
+  const limited = requests.slice(0, policy.maxToolRequestsPerRound);
+  const results = [];
+  for (const request of limited) {
+    results.push(await executeAgentToolRequest({
+      projectRoot: options.projectRoot,
+      role: options.role,
+      runId: options.runId,
+      round: options.round,
+      request,
+      policy,
+      context: options.context || {}
+    }));
+  }
+  for (const ignored of requests.slice(policy.maxToolRequestsPerRound)) {
+    const normalized = normalizeAgentToolRequest(ignored, `toolreq-${Date.now()}`);
+    const denied = buildAgentToolResult(normalized, {
+      status: "denied",
+      message: `Exceeded maxToolRequestsPerRound (${policy.maxToolRequestsPerRound}).`,
+      role: options.role,
+      round: options.round
+    });
+    const stored = await persistToolActionResult(options.projectRoot, options.runId || "", denied).catch(() => null);
+    if (stored) {
+      denied.artifactPaths = [stored.filePath, stored.indexPath];
+    }
+    results.push(denied);
+  }
+  return results;
 }
 
 async function buildUiQualityPromptPayload(projectRoot, userPrompt = "") {
@@ -6347,6 +7197,7 @@ function buildDefaultRunbook(root, payload = {}) {
     latestQaVerdict: payload.latestQaVerdict ?? null,
     latestDevPatch: payload.latestDevPatch ?? null,
     latestPmFinal: payload.latestPmFinal ?? null,
+    pendingApprovalsCount: Number(payload.pendingApprovalsCount || 0),
     stopReason: String(payload.stopReason || ""),
     nextAction: normalizeRunbookNextAction(payload.nextAction)
   };
@@ -6408,6 +7259,16 @@ function deriveRunbookNextAction(runbook = {}) {
   const evidence = runbook.latestEvidence || {};
   const models = runbook.models || {};
   const qaVerdict = String(runbook.latestQaVerdict?.verdict || "").toLowerCase();
+  const pendingApprovalsCount = Number(runbook.pendingApprovalsCount || 0);
+
+  if (pendingApprovalsCount > 0) {
+    return normalizeRunbookNextAction({
+      type: "approve_tool_request",
+      label: "Review pending agent tool request.",
+      safeToResume: false,
+      requiresUser: true
+    });
+  }
 
   if (String(evidence.playwrightStatus || "").toLowerCase() === "package_missing" || String(evidence.playwrightStatus || "").toLowerCase() === "browsers_missing") {
     return normalizeRunbookNextAction({
@@ -6572,6 +7433,8 @@ async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
   const root = await normalizeExistingProjectRoot(rootPath);
   const { dir: guiQaDir } = await getGuiQaArtifactPaths(root);
   const designPaths = await ensureDesignDir(root);
+  const pendingApprovalsPath = await getPendingToolApprovalsPath(root).catch(() => "");
+  const toolActionPaths = runbook?.runId ? await getToolActionPaths(root, runbook.runId).catch(() => null) : null;
   const reviewData = await readProjectReviewData(root).catch(() => null);
   const latestResultPath = String(runbook.latestEvidence?.guiQaResultPath || "");
   const latestScreenshotPath = String(runbook.latestEvidence?.guiQaScreenshotPath || "");
@@ -6591,8 +7454,18 @@ async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
     designPaths.domAuditPath,
     designPaths.designReviewPath,
     designPaths.desktopScreenshotPath,
-    designPaths.mobileScreenshotPath
+    designPaths.mobileScreenshotPath,
+    pendingApprovalsPath,
+    toolActionPaths?.indexPath || ""
   ].filter(Boolean);
+  if (toolActionPaths?.toolActionsDir) {
+    const toolEntries = await fs.readdir(toolActionPaths.toolActionsDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of toolEntries) {
+      if (entry.isFile()) {
+        candidatePaths.push(path.join(toolActionPaths.toolActionsDir, entry.name));
+      }
+    }
+  }
   const existingArtifacts = [];
   for (const candidate of candidatePaths) {
     const exists = await pathExists(candidate);
@@ -6611,6 +7484,11 @@ async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
     designDependencyPlan: await pathExists(designPaths.dependencyPlanPath) ? designPaths.dependencyPlanPath : "",
     designDomAudit: await pathExists(designPaths.domAuditPath) ? designPaths.domAuditPath : "",
     designReview: await pathExists(designPaths.designReviewPath) ? designPaths.designReviewPath : "",
+    pendingToolApprovals: pendingApprovalsPath && await pathExists(pendingApprovalsPath) ? pendingApprovalsPath : "",
+    toolActionIndex: toolActionPaths?.indexPath && await pathExists(toolActionPaths.indexPath) ? toolActionPaths.indexPath : "",
+    toolActionFiles: toolActionPaths?.toolActionsDir
+      ? existingArtifacts.filter((item) => item.startsWith(toolActionPaths.toolActionsDir) && item.endsWith(".json"))
+      : [],
     designScreenshots: [
       await pathExists(designPaths.desktopScreenshotPath) ? designPaths.desktopScreenshotPath : "",
       await pathExists(designPaths.mobileScreenshotPath) ? designPaths.mobileScreenshotPath : ""
