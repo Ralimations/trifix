@@ -7,6 +7,9 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:restart": "powershell -ExecutionPolicy Bypass -File scripts/restart-dev.ps1",
+    "dev:clean": "powershell -ExecutionPolicy Bypass -File scripts/restart-dev.ps1 -NoStart",
+    "dev:dryrun": "powershell -ExecutionPolicy Bypass -File scripts/restart-dev.ps1 -DryRun",
     "dev:vite": "vite --host 127.0.0.1 --port 5173",
     "build": "vite build --base ./",
     "preview": "vite preview --host 127.0.0.1 --port 4173",

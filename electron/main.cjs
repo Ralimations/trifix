@@ -3,6 +3,7 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const { createRequire } = require("node:module");
 const path = require("node:path");
+const designQuality = require("./designQuality.cjs");
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
@@ -35,6 +36,19 @@ const GUI_QA_RESULT_FILE = "latest-result.json";
 const GUI_QA_SCREENSHOT_FILE = "latest-screenshot.png";
 const GUI_QA_VERDICT_FILE = "latest-qa-verdict.json";
 const GUI_QA_ROUNDS_DIR_NAME = "rounds";
+const DESIGN_DIR_NAME = "design";
+const UI_QUALITY_CONTRACT_FILE = "ui-quality-contract.json";
+const UI_QUALITY_MD_FILE = "UI_QUALITY.md";
+const UI_LIBRARY_REGISTRY_FILE = "ui-library-registry.json";
+const UI_LIBRARIES_MD_FILE = "UI_LIBRARIES.md";
+const DEPENDENCY_PLAN_FILE = "dependency-plan.json";
+const UI_DOM_AUDIT_FILE = "ui-dom-audit.json";
+const DESIGN_REVIEW_FILE = "design-review.json";
+const DESIGN_STACK_FILE = "ui-stack-recommendation.json";
+const DESIGN_POLISH_STATE_FILE = "design-polish-state.json";
+const DESIGN_SCREENSHOTS_DIR = "screenshots";
+const DESIGN_DESKTOP_SCREENSHOT_FILE = "latest-desktop.png";
+const DESIGN_MOBILE_SCREENSHOT_FILE = "latest-mobile.png";
 const AUTONOMY_RUNBOOK_DIR_NAME = "autonomy";
 const AUTONOMY_RUNS_DIR_NAME = "runs";
 const AUTONOMY_LATEST_RUN_FILE = "latest-run.json";
@@ -196,6 +210,8 @@ async function loadBackend() {
     runGuiQaReview: orchestrator.runGuiQaReview,
     runGuiQaDevPatch: orchestrator.runGuiQaDevPatch,
     runGuiQaPmFinalization: orchestrator.runGuiQaPmFinalization,
+    runDesignQaReview: orchestrator.runDesignQaReview,
+    runDesignDevPatch: orchestrator.runDesignDevPatch,
     runState,
     artifactLedger,
     verifier,
@@ -475,6 +491,27 @@ function registerIpc() {
   ipcMain.handle("guiQa:run-smoke-test", async (_event, payload = {}) =>
     runGuiQaSmokeTest(payload)
   );
+  ipcMain.handle("designQuality:create-contract", async (_event, payload = {}) =>
+    createUiQualityContract(payload)
+  );
+  ipcMain.handle("designQuality:get-latest", async (_event, payload = {}) =>
+    getLatestUiQuality(payload)
+  );
+  ipcMain.handle("designQuality:run-check", async (_event, payload = {}) =>
+    runUiQualityCheck(payload)
+  );
+  ipcMain.handle("designQuality:run-polish-pass", async (_event, payload = {}) =>
+    runDesignPolishPass(payload)
+  );
+  ipcMain.handle("designQuality:open-folder", async (_event, payload = {}) =>
+    openDesignFolder(payload)
+  );
+  ipcMain.handle("designQuality:generate-ui-stack", async (_event, payload = {}) =>
+    generateUiStackRecommendation(payload)
+  );
+  ipcMain.handle("designQuality:create-dependency-plan", async (_event, payload = {}) =>
+    createDependencyPlan(payload)
+  );
   ipcMain.handle("qualityLoop:run", async (_event, payload = {}) =>
     startQualityLoop(payload)
   );
@@ -556,9 +593,13 @@ function registerIpc() {
 
       let activeTrackedEntry = trackedEntry;
       let result;
+      const uiPromptPayload = payload?.projectRoot
+        ? await buildUiQualityPromptPayload(payload.projectRoot, payload?.input || "")
+        : {};
       result = await backend.runPipeline(
         {
           ...payload,
+          ...uiPromptPayload,
           runId,
           files,
           graphContext,
@@ -1065,12 +1106,16 @@ async function executeAutonomyTask(task) {
     const graphContext = task.payload?.projectRoot
       ? await buildPipelineGraphContext(task.payload.projectRoot, task.payload, files)
       : null;
+    const uiPromptPayload = task.payload?.projectRoot
+      ? await buildUiQualityPromptPayload(task.payload.projectRoot, task.payload?.input || "")
+      : {};
 
     const result = await withAutonomyRuntimeLimit(
       task,
       backend.runPipeline(
         {
           ...task.payload,
+          ...uiPromptPayload,
           files,
           graphContext,
           mode: "autonomous",
@@ -2532,6 +2577,7 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     const repairResult = await backend.runPipeline(
       {
         ...payload,
+        ...(await buildUiQualityPromptPayload(root, payload?.input || result?.decision?.summary || "")),
         runId: `${runId}-repair-${attempt}`,
         projectRoot: root,
         projectId: activeTrackedEntry?.id || payload?.projectId,
@@ -3364,6 +3410,9 @@ async function exportReviewData(payload = {}) {
     ledgerDir ? fs.readFile(path.join(ledgerDir, RUN_LOG_FILE), "utf8").catch(() => "") : Promise.resolve(""),
     getMergedAgents().catch(() => [])
   ]);
+  const designQualityState = exportRoot
+    ? await getLatestUiQuality({ projectRoot: exportRoot }).catch(() => null)
+    : null;
   const normalizedAgents = normalizeAgents(agents);
   const exportBaseName = sanitizeGeneratedSlug(
     runId
@@ -3396,6 +3445,7 @@ async function exportReviewData(payload = {}) {
     resultSnapshot: payload?.result || null,
     artifacts,
     runState,
+    designQuality: designQualityState,
     finalReport,
     runLogExcerpts: collectReviewLogEntries(runLogRaw, runId),
     payloadSizes: {
@@ -3525,6 +3575,7 @@ async function readProjectReviewData(rootPath) {
       finalReport: "",
       artifacts: null,
       runState: null,
+      designQuality: null,
       runLogExcerpts: [],
       reportAvailable: false
     };
@@ -3541,6 +3592,7 @@ async function readProjectReviewData(rootPath) {
       finalReport: "",
       artifacts: null,
       runState: null,
+      designQuality: null,
       runLogExcerpts: [],
       reportAvailable: false
     };
@@ -3558,6 +3610,7 @@ async function readProjectReviewData(rootPath) {
     finalReport: typeof finalReport === "string" ? finalReport : "",
     artifacts: artifacts && typeof artifacts === "object" ? artifacts : null,
     runState: runState && typeof runState === "object" ? runState : null,
+    designQuality: await getLatestUiQuality({ projectRoot: normalizedRoot }).catch(() => null),
     runLogExcerpts: collectReviewLogEntries(runLogRaw, String(runState?.runId || "")).slice(-80),
     reportAvailable: Boolean(String(finalReport || "").trim())
   };
@@ -3970,6 +4023,692 @@ async function getLatestGuiQaResult(payload = {}) {
   }
 }
 
+function getDesignDataFilePath() {
+  return path.join(__dirname, "data", "default-ui-library-registry.json");
+}
+
+async function ensureDesignDir(rootPath) {
+  const root = await normalizeExistingProjectRoot(rootPath);
+  const baseDir = path.join(root, AUTONOMY_DIR_NAME, DESIGN_DIR_NAME);
+  const screenshotsDir = path.join(baseDir, DESIGN_SCREENSHOTS_DIR);
+  await fs.mkdir(screenshotsDir, { recursive: true });
+  return {
+    root,
+    baseDir,
+    screenshotsDir,
+    contractPath: path.join(baseDir, UI_QUALITY_CONTRACT_FILE),
+    qualityMdPath: path.join(baseDir, UI_QUALITY_MD_FILE),
+    registryPath: path.join(baseDir, UI_LIBRARY_REGISTRY_FILE),
+    librariesMdPath: path.join(baseDir, UI_LIBRARIES_MD_FILE),
+    dependencyPlanPath: path.join(baseDir, DEPENDENCY_PLAN_FILE),
+    domAuditPath: path.join(baseDir, UI_DOM_AUDIT_FILE),
+    designReviewPath: path.join(baseDir, DESIGN_REVIEW_FILE),
+    stackPath: path.join(baseDir, DESIGN_STACK_FILE),
+    polishStatePath: path.join(baseDir, DESIGN_POLISH_STATE_FILE),
+    desktopScreenshotPath: path.join(screenshotsDir, DESIGN_DESKTOP_SCREENSHOT_FILE),
+    mobileScreenshotPath: path.join(screenshotsDir, DESIGN_MOBILE_SCREENSHOT_FILE)
+  };
+}
+
+async function readProjectPackageJson(rootPath) {
+  const filePath = path.join(rootPath, "package.json");
+  return readJsonFile(filePath, null);
+}
+
+function inferProjectConstraints(rootPath, packageJson = null, promptText = "") {
+  const lowerPrompt = String(promptText || "").toLowerCase();
+  const deps = {
+    ...(packageJson?.dependencies || {}),
+    ...(packageJson?.devDependencies || {})
+  };
+  return {
+    singleFileHtml: !packageJson && (path.basename(rootPath).toLowerCase().includes("html") || /single[- ]file|plain html/.test(lowerPrompt)),
+    noTailwind: /no tailwind/.test(lowerPrompt),
+    existingTailwind: Boolean(deps.tailwindcss),
+    existingReact: Boolean(deps.react),
+    existingVite: Boolean(deps.vite)
+  };
+}
+
+async function ensureUiLibraryRegistry(rootPath) {
+  const paths = await ensureDesignDir(rootPath);
+  const defaultRegistry = await readJsonFile(getDesignDataFilePath(), {
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    libraries: []
+  });
+  await ensureJsonFile(paths.registryPath, defaultRegistry);
+  const registry = await readJsonFile(paths.registryPath, defaultRegistry);
+  await fs.writeFile(paths.librariesMdPath, designQuality.formatUiLibrariesMarkdown(registry), "utf8");
+  return {
+    registry,
+    registryPath: paths.registryPath,
+    librariesMdPath: paths.librariesMdPath
+  };
+}
+
+async function readUiQualityContract(rootPath) {
+  const paths = await ensureDesignDir(rootPath);
+  return readJsonFile(paths.contractPath, null);
+}
+
+async function createUiQualityContract(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const paths = await ensureDesignDir(root);
+  const packageJson = await readProjectPackageJson(root);
+  const projectType = designQuality.detectProjectType({
+    userPrompt: payload.userPrompt || "",
+    packageJson,
+    rootPath: root
+  });
+  const contract = designQuality.buildUiQualityContract({
+    projectType,
+    preset: payload.preset || "",
+    userPrompt: payload.userPrompt || packageJson?.name || ""
+  });
+  await writeJsonFile(paths.contractPath, contract);
+  await fs.writeFile(paths.qualityMdPath, designQuality.formatUiQualityMarkdown(contract), "utf8");
+  await ensureUiLibraryRegistry(root);
+  await appendDesignRunbookEvent(root, "ui-quality-contract-created", "UI quality contract created.", {
+    projectType: contract.projectType,
+    preset: contract.preset
+  });
+  return getLatestUiQuality({ projectRoot: root });
+}
+
+async function resolveUiQualityInputs(rootPath, options = {}) {
+  const root = await normalizeExistingProjectRoot(rootPath);
+  const paths = await ensureDesignDir(root);
+  const packageJson = await readProjectPackageJson(root);
+  const contract = await readJsonFile(paths.contractPath, null)
+    || designQuality.buildUiQualityContract({
+      projectType: designQuality.detectProjectType({
+        userPrompt: options.userPrompt || "",
+        packageJson,
+        rootPath: root
+      }),
+      preset: options.preset || "",
+      userPrompt: options.userPrompt || packageJson?.name || ""
+    });
+  const registryInfo = await ensureUiLibraryRegistry(root);
+  const projectConstraints = inferProjectConstraints(root, packageJson, options.userPrompt || "");
+  const recommendation = designQuality.selectUiStackForProject({
+    projectType: contract.projectType,
+    userPrompt: options.userPrompt || "",
+    uiQualityPreset: contract.preset,
+    allowedDependencies: options.allowedDependencies !== false,
+    existingPackageJson: packageJson,
+    projectConstraints
+  });
+  return {
+    root,
+    paths,
+    packageJson,
+    contract,
+    registry: registryInfo.registry,
+    projectConstraints,
+    recommendation
+  };
+}
+
+async function generateUiStackRecommendation(payload = {}) {
+  const inputs = await resolveUiQualityInputs(payload.projectRoot, payload);
+  await writeJsonFile(inputs.paths.contractPath, inputs.contract);
+  await fs.writeFile(inputs.paths.qualityMdPath, designQuality.formatUiQualityMarkdown(inputs.contract), "utf8");
+  await writeJsonFile(inputs.paths.stackPath, {
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    contractPreset: inputs.contract.preset,
+    projectType: inputs.contract.projectType,
+    recommendation: inputs.recommendation
+  });
+  const dependencyPlan = designQuality.buildDependencyPlan({
+    recommendation: inputs.recommendation,
+    existingPackageJson: inputs.packageJson,
+    requiresUserApproval: true
+  });
+  await writeJsonFile(inputs.paths.dependencyPlanPath, dependencyPlan);
+  await appendDesignRunbookEvent(inputs.root, "ui-library-registry-created", "UI library registry is ready.");
+  await appendDesignRunbookEvent(inputs.root, "ui-stack-selected", "UI stack recommendation created.", {
+    componentSystem: inputs.recommendation?.recommendedStack?.componentSystem || "",
+    styling: inputs.recommendation?.recommendedStack?.styling || ""
+  });
+  await appendDesignRunbookEvent(inputs.root, "dependency-plan-created", "Dependency plan created.", {
+    requiredInstalls: dependencyPlan.requiredInstalls.length
+  });
+  return getLatestUiQuality({ projectRoot: inputs.root });
+}
+
+async function createDependencyPlan(payload = {}) {
+  const inputs = await resolveUiQualityInputs(payload.projectRoot, payload);
+  const dependencyPlan = designQuality.buildDependencyPlan({
+    recommendation: inputs.recommendation,
+    existingPackageJson: inputs.packageJson,
+    requiresUserApproval: true
+  });
+  await writeJsonFile(inputs.paths.dependencyPlanPath, dependencyPlan);
+  await appendDesignRunbookEvent(inputs.root, "dependency-plan-created", "Dependency plan created.", {
+    requiredInstalls: dependencyPlan.requiredInstalls.length
+  });
+  return getLatestUiQuality({ projectRoot: inputs.root });
+}
+
+async function openDesignFolder(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const paths = await ensureDesignDir(root);
+  const target = String(payload.target || "").trim().toLowerCase();
+  const openPathTarget = target === "ui-libraries"
+    ? paths.librariesMdPath
+    : paths.baseDir;
+  const result = await shell.openPath(openPathTarget);
+  return {
+    ok: result === "",
+    path: openPathTarget
+  };
+}
+
+function buildDesignDomAuditSnapshot(pageState = {}, guiQaResult = {}, contract = {}, dependencyPlan = {}, screenshotPaths = {}) {
+  return {
+    schemaVersion: 1,
+    checkedAt: new Date().toISOString(),
+    buttonCount: Number(pageState.buttonCount || 0),
+    inputCount: Number(pageState.inputCount || 0),
+    tableCount: Number(pageState.tableCount || 0),
+    headingCount: Number(pageState.headingCount || 0),
+    hasNav: Boolean(pageState.hasNav),
+    hasHeader: Boolean(pageState.hasHeader),
+    hasSidebar: Boolean(pageState.hasSidebar),
+    hasSearchOrFilter: Boolean(pageState.hasSearchOrFilter),
+    hasThemeToggle: Boolean(pageState.hasThemeToggle),
+    cardLikeCount: Number(pageState.cardLikeCount || 0),
+    statusBadgeLikeCount: Number(pageState.statusBadgeLikeCount || 0),
+    hasTableLikeSection: Boolean(pageState.hasTableLikeSection),
+    bodyTextLength: Number(pageState.bodyTextLength || 0),
+    pageTitle: String(pageState.pageTitle || ""),
+    finalUrl: String(guiQaResult.finalUrl || guiQaResult.baseURL || ""),
+    httpStatus: Number.isInteger(guiQaResult.httpStatus) ? guiQaResult.httpStatus : null,
+    pageLoaded: Boolean(guiQaResult.pageLoaded),
+    consoleErrors: Array.isArray(guiQaResult.consoleErrors) ? guiQaResult.consoleErrors : [],
+    pageErrors: Array.isArray(guiQaResult.pageErrors) ? guiQaResult.pageErrors : [],
+    selectedUiPreset: String(contract.preset || ""),
+    recommendedUiStack: dependencyPlan.selectedStack || {},
+    desktopScreenshotPath: screenshotPaths.desktop || "",
+    mobileScreenshotPath: screenshotPaths.mobile || ""
+  };
+}
+
+async function runUiDomAudit(rootPath, healthUrl, guiQaSettings = null) {
+  const capability = await detectPlaywrightCapability({ projectRoot: rootPath });
+  if (capability.status !== "available") {
+    throw new Error(capability.details || "Playwright is not available.");
+  }
+  const { screenshotPath } = await getGuiQaArtifactPaths(rootPath);
+  const paths = await ensureDesignDir(rootPath);
+  const resolvedBrowserPackage = resolveOptionalPackage("playwright", rootPath)
+    || resolveOptionalPackage("playwright-core", rootPath);
+  const playwright = loadOptionalPackage(resolvedBrowserPackage);
+  const current = await readSettings();
+  const guiQa = normalizeGuiQaSettings(guiQaSettings || current.guiQa);
+  const consoleErrors = [];
+  const pageErrors = [];
+  let browser;
+  let context;
+  let page;
+  let result = {
+    status: "error",
+    baseURL: healthUrl,
+    finalUrl: "",
+    title: "",
+    httpStatus: null,
+    pageLoaded: false,
+    bodyExists: false,
+    bodyTextLength: 0,
+    consoleErrors,
+    pageErrors,
+    screenshotPath,
+    checkedAt: new Date().toISOString()
+  };
+  let pageState = {};
+  try {
+    browser = await playwright.chromium.launch({
+      headless: guiQa.mode !== "live",
+      slowMo: guiQa.slowMoMs > 0 ? guiQa.slowMoMs : undefined
+    });
+    context = await browser.newContext({ baseURL: healthUrl, viewport: { width: 1440, height: 960 } });
+    page = await context.newPage();
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text());
+      }
+    });
+    page.on("pageerror", (error) => pageErrors.push(error?.message || String(error)));
+    const response = await page.goto(healthUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000
+    });
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForSelector("body", { timeout: 10000 });
+    await page.screenshot({ path: paths.desktopScreenshotPath, fullPage: true });
+    result = {
+      ...result,
+      status: "passed",
+      finalUrl: page.url(),
+      title: await page.title(),
+      httpStatus: response?.status?.() ?? null,
+      pageLoaded: true,
+      bodyExists: true,
+      bodyTextLength: await page.locator("body").innerText().then((text) => String(text || "").trim().length).catch(() => 0)
+    };
+    pageState = await page.evaluate(() => {
+      const count = (selector) => document.querySelectorAll(selector).length;
+      const text = document.body?.innerText || "";
+      const byClassHint = (fragment) =>
+        Array.from(document.querySelectorAll("*")).filter((node) =>
+          typeof node.className === "string" && node.className.toLowerCase().includes(fragment)
+        ).length;
+      const hasSearch = Array.from(document.querySelectorAll("input,button,[role='button'],select")).some((node) => {
+        const textBits = `${node.getAttribute("placeholder") || ""} ${node.getAttribute("aria-label") || ""} ${node.textContent || ""}`.toLowerCase();
+        return /search|filter|find|query/.test(textBits);
+      });
+      const hasThemeToggle = Array.from(document.querySelectorAll("button,[role='button'],input[type='checkbox']")).some((node) => {
+        const textBits = `${node.getAttribute("aria-label") || ""} ${node.textContent || ""}`.toLowerCase();
+        return /theme|dark mode|light mode/.test(textBits);
+      });
+      return {
+        buttonCount: count("button,[role='button']"),
+        inputCount: count("input,textarea,select"),
+        tableCount: count("table,[role='table']"),
+        headingCount: count("h1,h2,h3,h4,h5,h6,[role='heading']"),
+        hasNav: Boolean(document.querySelector("nav,[role='navigation']")),
+        hasHeader: Boolean(document.querySelector("header")),
+        hasSidebar: Boolean(document.querySelector("aside,[data-sidebar],[class*='sidebar']")),
+        hasSearchOrFilter: hasSearch,
+        hasThemeToggle,
+        cardLikeCount: byClassHint("card") + count("[data-card]"),
+        statusBadgeLikeCount: byClassHint("badge") + byClassHint("status"),
+        hasTableLikeSection: Boolean(document.querySelector("table,[role='table'],[data-table],[class*='table']")),
+        bodyTextLength: String(text).trim().length,
+        pageTitle: document.title || ""
+      };
+    });
+    const mobileContext = await browser.newContext({ baseURL: healthUrl, viewport: { width: 390, height: 844 } });
+    const mobilePage = await mobileContext.newPage();
+    await mobilePage.goto(healthUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await mobilePage.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await mobilePage.screenshot({ path: paths.mobileScreenshotPath, fullPage: true }).catch(() => {});
+    await mobileContext.close().catch(() => {});
+  } finally {
+    if (context) {
+      await context.close().catch(() => {});
+    }
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+  }
+  return {
+    guiQaResult: result,
+    pageState,
+    desktopScreenshotPath: paths.desktopScreenshotPath,
+    mobileScreenshotPath: await fileExists(paths.mobileScreenshotPath) ? paths.mobileScreenshotPath : ""
+  };
+}
+
+async function runUiQualityCheck(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const healthUrl = String(payload.healthUrl || "").trim();
+  if (!healthUrl) {
+    throw new Error("healthUrl is required for UI Quality Check.");
+  }
+  await appendDesignRunbookEvent(root, "ui-quality-check-started", "UI quality check started.");
+  const inputs = await resolveUiQualityInputs(root, payload);
+  await writeJsonFile(inputs.paths.contractPath, inputs.contract);
+  await fs.writeFile(inputs.paths.qualityMdPath, designQuality.formatUiQualityMarkdown(inputs.contract), "utf8");
+  await writeJsonFile(inputs.paths.stackPath, {
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    contractPreset: inputs.contract.preset,
+    projectType: inputs.contract.projectType,
+    recommendation: inputs.recommendation
+  });
+  const dependencyPlan = designQuality.buildDependencyPlan({
+    recommendation: inputs.recommendation,
+    existingPackageJson: inputs.packageJson,
+    requiresUserApproval: true
+  });
+  await writeJsonFile(inputs.paths.dependencyPlanPath, dependencyPlan);
+  const auditRun = await runUiDomAudit(root, healthUrl, payload.guiQa || null);
+  const domAudit = buildDesignDomAuditSnapshot(
+    auditRun.pageState,
+    auditRun.guiQaResult,
+    inputs.contract,
+    dependencyPlan,
+    {
+      desktop: auditRun.desktopScreenshotPath,
+      mobile: auditRun.mobileScreenshotPath
+    }
+  );
+  const designReview = designQuality.buildDeterministicDesignReview({
+    domAudit,
+    contract: inputs.contract,
+    dependencyPlan
+  });
+  await writeJsonFile(inputs.paths.domAuditPath, domAudit);
+  await writeJsonFile(inputs.paths.designReviewPath, designReview);
+  await writeJsonFile(inputs.paths.polishStatePath, {
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    status: "checked",
+    recommendation: designReview.recommendation,
+    reviewMode: designReview.reviewMode
+  });
+  await appendDesignRunbookEvent(root, "design-review-created", "Design review created.", {
+    recommendation: designReview.recommendation
+  });
+  await appendDesignRunbookEvent(root, "ui-quality-check-completed", "UI quality check completed.", {
+    recommendation: designReview.recommendation
+  });
+  return getLatestUiQuality({ projectRoot: root });
+}
+
+function convertDesignQaVerdict(parsed, rawOutput) {
+  const verdict = String(parsed?.verdict || "").trim().toLowerCase();
+  const normalizeScore = (value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.max(0, Math.min(10, numeric)) : 0;
+  };
+  return {
+    verdict: ["pass", "needs_patch", "manual_review"].includes(verdict) ? verdict : "manual_review",
+    summary: String(parsed?.summary || trimText(rawOutput, 800) || "Design QA completed.").trim(),
+    scores: {
+      layout: normalizeScore(parsed?.scores?.layout),
+      spacing: normalizeScore(parsed?.scores?.spacing),
+      hierarchy: normalizeScore(parsed?.scores?.hierarchy),
+      typography: normalizeScore(parsed?.scores?.typography),
+      color: normalizeScore(parsed?.scores?.color),
+      accessibility: normalizeScore(parsed?.scores?.accessibility),
+      interactivity: normalizeScore(parsed?.scores?.interactivity),
+      polish: normalizeScore(parsed?.scores?.polish)
+    },
+    designIssues: Array.isArray(parsed?.designIssues)
+      ? parsed.designIssues.map((issue) => ({
+          severity: ["low", "medium", "high"].includes(String(issue?.severity || "").trim().toLowerCase()) ? String(issue.severity).trim().toLowerCase() : "medium",
+          category: ["layout", "spacing", "hierarchy", "typography", "color", "accessibility", "interactivity", "polish"].includes(String(issue?.category || "").trim().toLowerCase()) ? String(issue.category).trim().toLowerCase() : "polish",
+          description: String(issue?.description || "").trim(),
+          suggestedFix: String(issue?.suggestedFix || "").trim()
+        })).filter((issue) => issue.description)
+      : [],
+    requiredFixes: Array.isArray(parsed?.requiredFixes) ? parsed.requiredFixes.map((item) => String(item || "").trim()).filter(Boolean) : [],
+    confidence: Number.isFinite(Number(parsed?.confidence)) ? Math.max(0, Math.min(1, Number(parsed.confidence))) : 0,
+    rawOutput: String(rawOutput || "")
+  };
+}
+
+function isValidDesignQaVerdict(parsed) {
+  return parsed
+    && typeof parsed === "object"
+    && !Array.isArray(parsed)
+    && ["pass", "needs_patch", "manual_review"].includes(String(parsed?.verdict || "").trim().toLowerCase())
+    && typeof parsed?.summary === "string"
+    && typeof parsed?.scores === "object"
+    && Array.isArray(parsed?.designIssues)
+    && Array.isArray(parsed?.requiredFixes)
+    && Number.isFinite(Number(parsed?.confidence));
+}
+
+async function runDesignPolishPass(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const healthUrl = String(payload.healthUrl || "").trim();
+  if (!healthUrl) {
+    throw new Error("healthUrl is required for Design Polish Pass.");
+  }
+  const inputs = await resolveUiQualityInputs(root, payload);
+  const dependencyPlan = designQuality.buildDependencyPlan({
+    recommendation: inputs.recommendation,
+    existingPackageJson: inputs.packageJson,
+    requiresUserApproval: true
+  });
+  await writeJsonFile(inputs.paths.dependencyPlanPath, dependencyPlan);
+  if (dependencyPlan.requiredInstalls.length > 0) {
+    await appendDesignRunbookEvent(root, "dependency-install-suggested", "Dependency install commands prepared.", {
+      commands: dependencyPlan.requiredInstalls.map((item) => item.command)
+    });
+  }
+  await appendDesignRunbookEvent(root, "design-polish-started", "Design polish pass started.");
+  let latestQuality = await runUiQualityCheck({
+    projectRoot: root,
+    healthUrl,
+    userPrompt: payload.userPrompt || "",
+    guiQa: payload.guiQa || null
+  });
+  const designReview = latestQuality.designReview || {};
+  const modelHealth = await backend.getModelHealth().catch(() => ({}));
+  const qaAvailable = Boolean(modelHealth?.supervisor?.online);
+  const devAvailable = Boolean(modelHealth?.junior?.online);
+  if (!qaAvailable) {
+    await writeJsonFile(inputs.paths.polishStatePath, {
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      status: "needs_manual_review",
+      message: "QA unavailable. UI quality evidence is ready for manual review."
+    });
+    await appendDesignRunbookEvent(root, "design-polish-needs-review", "QA unavailable. UI quality evidence is ready for manual review.");
+    return getLatestUiQuality({ projectRoot: root });
+  }
+
+  const uiSummary = designQuality.summarizeUiQualityForPrompt({
+    contract: latestQuality.contract,
+    stackRecommendation: latestQuality.stackRecommendation,
+    dependencyPlan: latestQuality.dependencyPlan
+  });
+
+  let verdict = {
+    verdict: designReview.recommendation === "pass_candidate" ? "pass" : "manual_review",
+    summary: designReview.notes || "",
+    scores: designReview.scores || {},
+    designIssues: [],
+    requiredFixes: [],
+    confidence: 0
+  };
+  const maxRounds = Math.max(1, Math.min(2, Number(payload.maxRounds || 2) || 2));
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const qaOutput = await backend.runDesignQaReview({
+      originalRequest: String(payload.userPrompt || "").trim(),
+      uiQualitySummary: uiSummary,
+      designReview,
+      domAudit: latestQuality.domAudit,
+      dependencyPlan: latestQuality.dependencyPlan,
+      screenshotPath: latestQuality.designAssets?.desktopScreenshotPath || "",
+      currentFilesSummary: await buildQualityLoopFileSummary(root),
+      changedFiles: await collectQualityChangedFiles(root)
+    });
+    if (!qaOutput?.validFormat || !isValidDesignQaVerdict(qaOutput.parsed)) {
+      await fs.writeFile(`${inputs.paths.designReviewPath}.qa-raw.txt`, String(qaOutput?.rawOutput || ""), "utf8");
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: "needs_manual_review",
+        message: "QA returned invalid design review format."
+      });
+      await appendDesignRunbookEvent(root, "design-polish-needs-review", "QA returned invalid design review format.");
+      return getLatestUiQuality({ projectRoot: root });
+    }
+    verdict = convertDesignQaVerdict(qaOutput.parsed, qaOutput.rawOutput);
+    await writeJsonFile(inputs.paths.designReviewPath, {
+      schemaVersion: 1,
+      checkedAt: new Date().toISOString(),
+      reviewMode: "ai_assisted",
+      scores: verdict.scores,
+      issues: verdict.designIssues,
+      recommendation: verdict.verdict === "pass" ? "pass_candidate" : verdict.verdict === "needs_patch" ? "needs_patch" : "manual_review",
+      screenshotPath: latestQuality.designAssets?.desktopScreenshotPath || "",
+      notes: verdict.summary,
+      needsHumanVisualReview: true
+    });
+
+    if (verdict.verdict !== "needs_patch") {
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: verdict.verdict === "pass" ? "passed" : "needs_manual_review",
+        message: verdict.summary
+      });
+      await appendDesignRunbookEvent(root, verdict.verdict === "pass" ? "design-polish-passed" : "design-polish-needs-review", verdict.summary || "Design polish finished.");
+      return getLatestUiQuality({ projectRoot: root });
+    }
+
+    if (!devAvailable) {
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: "needs_manual_review",
+        message: "DEV unavailable. Design patch cannot be generated."
+      });
+      await appendDesignRunbookEvent(root, "design-polish-needs-review", "DEV unavailable. Design patch cannot be generated.");
+      return getLatestUiQuality({ projectRoot: root });
+    }
+
+    const devPatch = await backend.runDesignDevPatch({
+      originalRequest: String(payload.userPrompt || "").trim(),
+      uiQualitySummary: uiSummary,
+      qaVerdict: verdict,
+      domAudit: latestQuality.domAudit,
+      designReview,
+      dependencyPlan: latestQuality.dependencyPlan,
+      screenshotPath: latestQuality.designAssets?.desktopScreenshotPath || "",
+      relevantFileExcerpts: await readRelevantQualityFiles(root, await collectQualityChangedFiles(root)),
+      currentFileTree: await buildQualityLoopFileSummary(root)
+    });
+    if (!devPatch?.validFormat || !Array.isArray(devPatch.fileOperations) || devPatch.fileOperations.length === 0) {
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: "needs_manual_review",
+        message: "DEV unavailable or returned no valid UI patch."
+      });
+      await appendDesignRunbookEvent(root, "design-polish-needs-review", "DEV returned no valid UI patch.");
+      return getLatestUiQuality({ projectRoot: root });
+    }
+    const validation = validateQualityLoopFileOperations(root, devPatch.fileOperations);
+    if (!validation.ok || !validation.validFormat) {
+      await writeJsonFile(inputs.paths.polishStatePath, {
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        status: "needs_manual_review",
+        message: validation.message
+      });
+      await appendDesignRunbookEvent(root, "design-polish-needs-review", validation.message);
+      return getLatestUiQuality({ projectRoot: root });
+    }
+    const patchApply = await applyFileOperationsToExistingProject(root, {
+      project: { rootPath: root },
+      decision: { affectedFiles: devPatch.affectedFiles || [] }
+    }, devPatch.affectedFiles || [], devPatch.fileOperations);
+    await appendDesignRunbookEvent(root, "design-polish-patch-applied", "Design polish patch applied.", {
+      appliedFiles: (patchApply.applied || []).map((item) => item.path)
+    });
+    latestQuality = await runUiQualityCheck({
+      projectRoot: root,
+      healthUrl,
+      userPrompt: payload.userPrompt || "",
+      guiQa: payload.guiQa || null
+    });
+  }
+
+  await writeJsonFile(inputs.paths.polishStatePath, {
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    status: "needs_manual_review",
+    message: "Design polish reached max rounds."
+  });
+  await appendDesignRunbookEvent(root, "design-polish-needs-review", "Design polish reached max rounds.");
+  return getLatestUiQuality({ projectRoot: root });
+}
+
+async function getLatestUiQuality(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const paths = await ensureDesignDir(root);
+  const contract = await readJsonFile(paths.contractPath, null);
+  const registry = await readJsonFile(paths.registryPath, null);
+  const stackData = await readJsonFile(paths.stackPath, null);
+  const dependencyPlan = await readJsonFile(paths.dependencyPlanPath, null);
+  const domAudit = await readJsonFile(paths.domAuditPath, null);
+  const designReview = await readJsonFile(paths.designReviewPath, null);
+  const polishState = await readJsonFile(paths.polishStatePath, null);
+  return {
+    projectRoot: root,
+    contract,
+    registry,
+    stackRecommendation: stackData?.recommendation || null,
+    dependencyPlan,
+    domAudit,
+    designReview,
+    polishState,
+    designAssets: {
+      contractPath: paths.contractPath,
+      qualityMdPath: paths.qualityMdPath,
+      registryPath: paths.registryPath,
+      librariesMdPath: paths.librariesMdPath,
+      dependencyPlanPath: paths.dependencyPlanPath,
+      domAuditPath: paths.domAuditPath,
+      designReviewPath: paths.designReviewPath,
+      desktopScreenshotPath: await fileExists(paths.desktopScreenshotPath) ? paths.desktopScreenshotPath : "",
+      mobileScreenshotPath: await fileExists(paths.mobileScreenshotPath) ? paths.mobileScreenshotPath : "",
+      designDir: paths.baseDir
+    },
+    installCommands: dependencyPlan?.requiredInstalls?.map((item) => item.command) || [],
+    summaryForPrompt: designQuality.summarizeUiQualityForPrompt({
+      contract,
+      stackRecommendation: stackData?.recommendation || null,
+      dependencyPlan
+    })
+  };
+}
+
+async function buildUiQualityPromptPayload(projectRoot, userPrompt = "") {
+  if (!projectRoot) {
+    return {
+      uiQualitySummary: "",
+      uiQualityContract: null,
+      uiStackRecommendation: null,
+      uiDependencyPlan: null
+    };
+  }
+  const inputs = await resolveUiQualityInputs(projectRoot, { userPrompt });
+  const dependencyPlan = designQuality.buildDependencyPlan({
+    recommendation: inputs.recommendation,
+    existingPackageJson: inputs.packageJson,
+    requiresUserApproval: true
+  });
+  return {
+    uiQualitySummary: designQuality.summarizeUiQualityForPrompt({
+      contract: inputs.contract,
+      stackRecommendation: inputs.recommendation,
+      dependencyPlan
+    }),
+    uiQualityContract: inputs.contract,
+    uiStackRecommendation: inputs.recommendation,
+    uiDependencyPlan: dependencyPlan
+  };
+}
+
+async function appendDesignRunbookEvent(rootPath, type, message, data = {}) {
+  try {
+    const latest = await getLatestRunbook({ projectRoot: rootPath }).catch(() => null);
+    if (!latest?.runId) {
+      return;
+    }
+    await upsertPersistentRunbook(rootPath, {
+      runId: latest.runId
+    }, {
+      type,
+      status: latest.status || "idle",
+      message,
+      data
+    });
+  } catch {}
+}
+
 async function startQualityLoop(payload = {}) {
   const projectRoot = await normalizeCommandRoot(payload.projectRoot);
   const existing = Array.from(qualityLoops.values()).find((task) =>
@@ -4084,6 +4823,7 @@ async function executeQualityLoop(task, payload = {}) {
   const reviewData = await readProjectReviewData(root).catch(() => null);
   const originalRequest = String(payload.originalRequest || runState?.taskInput || "").trim();
   const pmPlan = trimText(String(reviewData?.finalReport || ""), 2400);
+  const uiPromptPayload = await buildUiQualityPromptPayload(root, originalRequest);
   const health = await backend.getModelHealth().catch(() => ({}));
   const qaAvailable = Boolean(health?.supervisor?.online);
   const devAvailable = Boolean(health?.junior?.online);
@@ -4324,6 +5064,7 @@ async function executeQualityLoop(task, payload = {}) {
     const qaVerdict = await backend.runGuiQaReview({
       originalRequest,
       pmPlan,
+      uiQualitySummary: uiPromptPayload.uiQualitySummary || "",
       currentFilesSummary: await buildQualityLoopFileSummary(root),
       changedFiles: await collectQualityChangedFiles(root),
       buildEvidence,
@@ -4398,6 +5139,7 @@ async function executeQualityLoop(task, payload = {}) {
         const pmFinal = await backend.runGuiQaPmFinalization({
           originalRequest,
           pmPlan,
+          uiQualitySummary: uiPromptPayload.uiQualitySummary || "",
           qaVerdict: deterministicVerdict,
           guiQaResult,
           buildEvidence
@@ -4497,6 +5239,7 @@ async function executeQualityLoop(task, payload = {}) {
 
     const devPatch = await backend.runGuiQaDevPatch({
       originalRequest,
+      uiQualitySummary: uiPromptPayload.uiQualitySummary || "",
       qaVerdict: deterministicVerdict,
       guiQaResult,
       consoleErrors: guiQaResult.consoleErrors || [],
@@ -5828,6 +6571,7 @@ async function writeRunbookFiles(paths, runbook, timelineEntry = null, latestSta
 async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
   const root = await normalizeExistingProjectRoot(rootPath);
   const { dir: guiQaDir } = await getGuiQaArtifactPaths(root);
+  const designPaths = await ensureDesignDir(root);
   const reviewData = await readProjectReviewData(root).catch(() => null);
   const latestResultPath = String(runbook.latestEvidence?.guiQaResultPath || "");
   const latestScreenshotPath = String(runbook.latestEvidence?.guiQaScreenshotPath || "");
@@ -5838,7 +6582,16 @@ async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
     latestResultPath,
     latestScreenshotPath,
     latestQaVerdictPath,
-    String(runbook.latestEvidence?.buildLogPath || "")
+    String(runbook.latestEvidence?.buildLogPath || ""),
+    designPaths.qualityMdPath,
+    designPaths.contractPath,
+    designPaths.registryPath,
+    designPaths.librariesMdPath,
+    designPaths.dependencyPlanPath,
+    designPaths.domAuditPath,
+    designPaths.designReviewPath,
+    designPaths.desktopScreenshotPath,
+    designPaths.mobileScreenshotPath
   ].filter(Boolean);
   const existingArtifacts = [];
   for (const candidate of candidatePaths) {
@@ -5853,6 +6606,15 @@ async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
     finalReport: await pathExists(path.join(root, AUTONOMY_DIR_NAME, "final-report.md")) ? path.join(root, AUTONOMY_DIR_NAME, "final-report.md") : "",
     guiQaLatestResult: latestResultPath,
     guiQaScreenshot: latestScreenshotPath,
+    designQualityContract: await pathExists(designPaths.contractPath) ? designPaths.contractPath : "",
+    designLibraryRegistry: await pathExists(designPaths.registryPath) ? designPaths.registryPath : "",
+    designDependencyPlan: await pathExists(designPaths.dependencyPlanPath) ? designPaths.dependencyPlanPath : "",
+    designDomAudit: await pathExists(designPaths.domAuditPath) ? designPaths.domAuditPath : "",
+    designReview: await pathExists(designPaths.designReviewPath) ? designPaths.designReviewPath : "",
+    designScreenshots: [
+      await pathExists(designPaths.desktopScreenshotPath) ? designPaths.desktopScreenshotPath : "",
+      await pathExists(designPaths.mobileScreenshotPath) ? designPaths.mobileScreenshotPath : ""
+    ].filter(Boolean),
     roundResultFiles: roundResults,
     qaVerdicts: uniqueStrings([latestQaVerdictPath, ...(roundResults.filter((item) => item.endsWith("qa-verdict.json")))]),
     devPatches: roundResults.filter((item) => item.endsWith("dev-patch.json")),

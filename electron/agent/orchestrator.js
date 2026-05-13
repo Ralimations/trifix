@@ -134,6 +134,53 @@ export async function runGuiQaPmFinalization(payload = {}, onRequestStatus = nul
   };
 }
 
+export async function runDesignQaReview(payload = {}, onRequestStatus = null) {
+  const input = buildDesignQaReviewEvidence(payload);
+  const output = await callAgentWithBrain({
+    agent: AGENTS.supervisor,
+    systemPrompt: buildDesignQaReviewSystemPrompt(),
+    input,
+    brainSeed: [
+      payload?.originalRequest,
+      payload?.uiQualitySummary,
+      JSON.stringify(payload?.designReview || {}),
+      JSON.stringify(payload?.domAudit || {})
+    ].filter(Boolean).join("\n\n"),
+    onRequestStatus
+  });
+  const parsed = extractJsonObject(output) || null;
+  return {
+    rawOutput: output,
+    parsed,
+    validFormat: isValidDesignQaVerdictShape(parsed)
+  };
+}
+
+export async function runDesignDevPatch(payload = {}, onRequestStatus = null) {
+  const input = buildDesignDevPatchEvidence(payload);
+  const output = await callAgentWithBrain({
+    agent: AGENTS.junior,
+    systemPrompt: buildDesignDevPatchSystemPrompt(),
+    input,
+    brainSeed: [
+      payload?.originalRequest,
+      payload?.uiQualitySummary,
+      JSON.stringify(payload?.qaVerdict || {}),
+      JSON.stringify(payload?.domAudit || {})
+    ].filter(Boolean).join("\n\n"),
+    onRequestStatus
+  });
+  const parsed = parseLeadOutput(String(output || ""), [], normalizePmArchitecture(null, payload?.originalRequest || "", null, ""));
+  return {
+    rawOutput: output,
+    summary: parsed.summary || "",
+    fileOperations: parsed.fileOperations || [],
+    commandRequests: parsed.commandRequests || [],
+    affectedFiles: parsed.affectedFiles || [],
+    validFormat: Array.isArray(parsed.fileOperations) && parsed.fileOperations.length > 0
+  };
+}
+
 export async function runPipeline(payload, emitProgress = () => {}) {
   const input = String(payload?.input || "").trim();
   const language = String(payload?.language || "auto");
@@ -143,6 +190,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const projectFsd = payload?.fsd || null;
   const projectRoot = String(payload?.projectRoot || "").trim();
   const isExistingProjectRequest = Boolean(projectRoot);
+  const uiQualitySummary = String(payload?.uiQualitySummary || "").trim();
   const feedback = String(payload?.feedback || "").trim();
   const loopCount = Number(payload?.loopCount || 0);
   const runId = payload?.runId || randomUUID();
@@ -236,14 +284,14 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       endpoint: AGENTS.architect.endpoint,
       model: AGENTS.architect.model,
       systemPromptLength: buildSupervisorSpecSystemPrompt().length,
-      inputLength: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }).length,
+      inputLength: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest, uiQualitySummary }).length,
       timeoutMs: AGENTS.architect.timeoutMs,
       timeoutSource: AGENTS.architect.timeoutSource || "default"
     });
     pmPlan = await callAgentWithBrain({
       agent: AGENTS.architect,
       systemPrompt: buildSupervisorSpecSystemPrompt(),
-      input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest }),
+      input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest, uiQualitySummary }),
       brainSeed: pmBrainSeed,
       onRequestStatus: (requestStatus) =>
         emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount })
@@ -387,6 +435,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         feedback,
         revisionBrief,
         loopCount,
+        uiQualitySummary,
         isExistingProjectRequest,
         singleFileHtmlMode
       })
@@ -401,6 +450,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
         feedback,
         revisionBrief,
         loopCount,
+        uiQualitySummary,
         isExistingProjectRequest,
         singleFileHtmlMode
       });
@@ -439,7 +489,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     seniorParallelTask = trackAgentCall(callAgentWithBrain({
       agent: AGENTS.supervisor,
       systemPrompt: buildSeniorParallelSystemPrompt(),
-      input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }),
+      input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount, uiQualitySummary }),
       brainSeed: [input, compactContext, pmPlan, JSON.stringify(pmArchitecture || {})].filter(Boolean).join("\n\n"),
       onRequestStatus: (requestStatus) =>
         emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
@@ -626,6 +676,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
           feedback,
           revisionBrief,
           loopCount,
+          uiQualitySummary,
           isExistingProjectRequest
         }),
         brainSeed: [input, compactContext, pmPlan, seniorParallelReview, juniorInitialOutput].filter(Boolean).join("\n\n"),
@@ -714,7 +765,8 @@ Deterministic verification still applies. Manual review is required before consi
           artifactLedger: qaArtifactLedger,
           feedback,
           revisionBrief,
-          loopCount
+          loopCount,
+          uiQualitySummary
         }),
         brainSeed: [input, compactContext, pmPlan, seniorParallelReview, JSON.stringify(finalLeadResult || {})].filter(Boolean).join("\n\n"),
         onRequestStatus: (requestStatus) =>
@@ -796,6 +848,7 @@ Developer-only degraded mode was used. PM planning was unavailable. Generated fi
           feedback,
           revisionBrief,
           loopCount,
+          uiQualitySummary,
           isExistingProjectRequest
         }),
         brainSeed: [input, compactContext, pmPlan, seniorFinalReview, finalDevOutput].filter(Boolean).join("\n\n"),
@@ -2509,12 +2562,14 @@ function buildJuniorDeveloperOnlyContext({
   feedback,
   revisionBrief,
   loopCount,
+  uiQualitySummary = "",
   isExistingProjectRequest = false,
   singleFileHtmlMode = false
 }) {
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 2600 : 3800),
     `DEVELOPER_ONLY_MODE: yes`,
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
     `Preferred language: ${language}`,
     feedback ? `PATCH_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 900)}` : "",
@@ -2761,10 +2816,11 @@ async function createRevisionBrief({ compactContext, feedback, loopCount }) {
   return trimForPrompt(output, 800);
 }
 
-function buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
+function buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest = false, uiQualitySummary = "" }) {
   const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 7000 : 12000),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1400)}` : "",
     feedback ? `DENIAL_FEEDBACK_LOOP_${loopCount}:\n${trimForPrompt(feedback, 900)}` : "",
     revisionBrief ? `REVISION_BRIEF:\n${trimForPrompt(revisionBrief, 500)}` : "",
     [
@@ -2797,6 +2853,7 @@ function buildJuniorInitialContext({
   feedback,
   revisionBrief,
   loopCount,
+  uiQualitySummary = "",
   isExistingProjectRequest = false,
   singleFileHtmlMode = false
 }) {
@@ -2815,6 +2872,7 @@ function buildJuniorInitialContext({
   }
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 3200 : 5200),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1200)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     ...(isExistingProjectRequest
@@ -3021,7 +3079,7 @@ function summarizeQaFileExcerpts(fileOperations = []) {
   ].join("\n")).join("\n\n");
 }
 
-function buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount }) {
+function buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount, uiQualitySummary = "" }) {
   const evidence = buildQaEvidenceContext({
     originalRequest: compactContext,
     pmArchitecture,
@@ -3032,6 +3090,7 @@ function buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitectur
   });
   return [
     trimForPrompt(compactContext, 6500),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1400)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
@@ -3058,10 +3117,12 @@ function buildJuniorPatchContext({
   feedback,
   revisionBrief,
   loopCount,
+  uiQualitySummary = "",
   isExistingProjectRequest = false
 }) {
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 2400 : 3400),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1000)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     ...(isExistingProjectRequest
@@ -3082,7 +3143,7 @@ function buildJuniorPatchContext({
   ].filter(Boolean).join("\n\n");
 }
 
-function buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, pmArchitecture, seniorParallelReview, finalDevOutput, finalLeadResult, artifactLedger, feedback, revisionBrief, loopCount }) {
+function buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, pmArchitecture, seniorParallelReview, finalDevOutput, finalLeadResult, artifactLedger, feedback, revisionBrief, loopCount, uiQualitySummary = "" }) {
   const evidence = buildQaEvidenceContext({
     originalRequest: compactContext,
     pmArchitecture,
@@ -3093,6 +3154,7 @@ function buildSeniorFinalReviewContext({ compactContext, prd, pmPlan, pmArchitec
   });
   return [
     trimForPrompt(compactContext, 4200),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1100)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `SENIOR_PARALLEL_NOTES:\n${trimForPrompt(seniorParallelReview, 1200)}`,
@@ -3118,10 +3180,12 @@ function buildSupervisorFinalContext({
   feedback,
   revisionBrief,
   loopCount,
+  uiQualitySummary = "",
   isExistingProjectRequest = false
 }) {
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 3000 : 4200),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `SUPERVISOR_SPEC:\n${trimForPrompt(pmPlan, 1000)}`,
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `DEV_CHECKLIST:\n${trimForPrompt(qaInstructions, 800)}`,
@@ -3195,10 +3259,11 @@ function buildPmPlanningContext({ compactContext, feedback, revisionBrief, loopC
   ].filter(Boolean).join("\n\n");
 }
 
-function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount }) {
+function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture, feedback, revisionBrief, loopCount, uiQualitySummary = "" }) {
   const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, 7000),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `PM_PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_PLAN:\n${trimForPrompt(pmPlan, 1800)}`,
     `PM_FILE_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
@@ -3225,10 +3290,11 @@ function buildQaInstructionContext({ compactContext, prd, pmPlan, pmArchitecture
   ].filter(Boolean).join("\n\n");
 }
 
-function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions, qaStructureReview, language, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
+function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitecture, qaInstructions, qaStructureReview, language, feedback, revisionBrief, loopCount, uiQualitySummary = "", isExistingProjectRequest = false }) {
   const intent = analyzeProjectIntent(compactContext);
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 2800 : 4500),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_DIRECTION:\n${trimForPrompt(pmPlan, isExistingProjectRequest ? 500 : 900)}`,
     ...(isExistingProjectRequest
@@ -3265,9 +3331,10 @@ function buildDevImplementationContext({ compactContext, prd, pmPlan, pmArchitec
   ].filter(Boolean).join("\n\n");
 }
 
-function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, devLeadResult, feedback, revisionBrief, loopCount }) {
+function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, devLeadResult, feedback, revisionBrief, loopCount, uiQualitySummary = "" }) {
   return [
     trimForPrompt(compactContext, 4500),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_DIRECTION:\n${trimForPrompt(pmPlan, 800)}`,
     `QA_ORIGINAL_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, 1000)}`,
@@ -3292,9 +3359,10 @@ function buildQaReviewContext({ compactContext, prd, pmPlan, qaInstructions, dev
   ].filter(Boolean).join("\n\n");
 }
 
-function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount, isExistingProjectRequest = false }) {
+function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, devOutput, qaReview, devLeadResult, language, feedback, revisionBrief, loopCount, uiQualitySummary = "", isExistingProjectRequest = false }) {
   return [
     trimForPrompt(compactContext, isExistingProjectRequest ? 3600 : 6500),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
     `PRD:\n${formatPrdForPrompt(prd, { compact: true })}`,
     `PM_INITIAL_PLAN:\n${trimForPrompt(pmPlan, isExistingProjectRequest ? 700 : 1400)}`,
     `QA_INSTRUCTIONS:\n${trimForPrompt(qaInstructions, isExistingProjectRequest ? 800 : 1400)}`,
@@ -3336,6 +3404,7 @@ function buildGuiQaReviewSystemPrompt() {
 function buildGuiQaReviewEvidence(payload = {}) {
   return [
     `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2500)}`,
+    payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1400)}` : "",
     payload?.pmPlan ? `PM_PLAN:\n${trimForPrompt(payload.pmPlan, 1800)}` : "",
     payload?.acceptanceCriteria?.length ? `ACCEPTANCE_CRITERIA:\n${payload.acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
     payload?.currentFilesSummary ? `CURRENT_FILES_SUMMARY:\n${trimForPrompt(payload.currentFilesSummary, 2000)}` : "",
@@ -3405,6 +3474,7 @@ function buildGuiQaDevPatchSystemPrompt() {
 function buildGuiQaDevPatchEvidence(payload = {}) {
   return [
     `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2200)}`,
+    payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1200)}` : "",
     `QA_VERDICT_JSON:\n${JSON.stringify(payload?.qaVerdict || {}, null, 2)}`,
     `GUI_QA_RESULT_JSON:\n${JSON.stringify(payload?.guiQaResult || {}, null, 2)}`,
     payload?.failedAcceptanceCriteria?.length ? `FAILED_ACCEPTANCE_CRITERIA:\n${payload.failedAcceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
@@ -3427,12 +3497,95 @@ function buildGuiQaPmFinalizationSystemPrompt() {
 function buildGuiQaPmFinalizationEvidence(payload = {}) {
   return [
     `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2000)}`,
+    payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1200)}` : "",
     payload?.pmPlan ? `PM_PLAN:\n${trimForPrompt(payload.pmPlan, 1600)}` : "",
     `QA_VERDICT_JSON:\n${JSON.stringify(payload?.qaVerdict || {}, null, 2)}`,
     payload?.guiQaResult ? `GUI_QA_RESULT_JSON:\n${JSON.stringify(payload.guiQaResult, null, 2)}` : "",
     payload?.buildEvidence ? `BUILD_EVIDENCE:\n${trimForPrompt(payload.buildEvidence, 1800)}` : "",
     "Summarize the final outcome without optimism beyond the evidence."
   ].filter(Boolean).join("\n\n");
+}
+
+function buildDesignQaReviewSystemPrompt() {
+  return [
+    "You are Senior Dev / QA reviewing frontend UI quality evidence.",
+    "Reject works-but-basic UI.",
+    "Judge layout, spacing, hierarchy, typography, color, accessibility, interactivity, and polish.",
+    "Use the UI quality contract, selected stack, DOM audit, and screenshot evidence.",
+    "If visual quality is uncertain, use manual_review.",
+    "Output strict JSON only.",
+    "{",
+    '  "verdict": "pass" | "needs_patch" | "manual_review",',
+    '  "summary": "...",',
+    '  "scores": { "layout": 0, "spacing": 0, "hierarchy": 0, "typography": 0, "color": 0, "accessibility": 0, "interactivity": 0, "polish": 0 },',
+    '  "designIssues": [{"severity":"low|medium|high","category":"layout|spacing|hierarchy|typography|color|accessibility|interactivity|polish","description":"...","suggestedFix":"..."}],',
+    '  "requiredFixes": ["..."],',
+    '  "confidence": 0.0',
+    "}"
+  ].join("\n");
+}
+
+function buildDesignQaReviewEvidence(payload = {}) {
+  return [
+    `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2200)}`,
+    payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1400)}` : "",
+    payload?.currentFilesSummary ? `CURRENT_FILES_SUMMARY:\n${trimForPrompt(payload.currentFilesSummary, 1800)}` : "",
+    payload?.changedFiles?.length ? `CHANGED_FILES:\n${payload.changedFiles.map((item) => `- ${item}`).join("\n")}` : "",
+    `DOM_AUDIT_JSON:\n${JSON.stringify(payload?.domAudit || {}, null, 2)}`,
+    `DESIGN_REVIEW_JSON:\n${JSON.stringify(payload?.designReview || {}, null, 2)}`,
+    `DEPENDENCY_PLAN_JSON:\n${JSON.stringify(payload?.dependencyPlan || {}, null, 2)}`,
+    payload?.screenshotPath ? `SCREENSHOT_PATH:\n${payload.screenshotPath}` : "",
+    [
+      "Reject tutorial-grade dashboards.",
+      "If the chosen stack is inconsistent or the DOM structure is too weak, use needs_patch.",
+      "Use manual_review when evidence is insufficient."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildDesignDevPatchSystemPrompt() {
+  return [
+    "You are Junior Dev applying a UI-only design polish patch.",
+    "Patch relevant UI files only: CSS, layout, component structure, mock data, interaction affordances, and selected UI library usage when already installed or clearly allowed.",
+    "Do not redesign unrelated functionality.",
+    "Do not add unnecessary dependencies.",
+    "Return JSON only with summary, fileOperations, and commandRequests."
+  ].join("\n");
+}
+
+function buildDesignDevPatchEvidence(payload = {}) {
+  return [
+    `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2200)}`,
+    payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1400)}` : "",
+    `QA_VERDICT_JSON:\n${JSON.stringify(payload?.qaVerdict || {}, null, 2)}`,
+    `DOM_AUDIT_JSON:\n${JSON.stringify(payload?.domAudit || {}, null, 2)}`,
+    `DESIGN_REVIEW_JSON:\n${JSON.stringify(payload?.designReview || {}, null, 2)}`,
+    `DEPENDENCY_PLAN_JSON:\n${JSON.stringify(payload?.dependencyPlan || {}, null, 2)}`,
+    payload?.relevantFileExcerpts ? `RELEVANT_FILE_EXCERPTS:\n${trimForPrompt(payload.relevantFileExcerpts, 3200)}` : "",
+    payload?.currentFileTree ? `CURRENT_FILE_TREE:\n${trimForPrompt(payload.currentFileTree, 1800)}` : "",
+    payload?.screenshotPath ? `SCREENSHOT_PATH:\n${payload.screenshotPath}` : "",
+    "Return machine-readable fileOperations only for changed UI files."
+  ].filter(Boolean).join("\n\n");
+}
+
+function isValidDesignQaVerdictShape(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return false;
+  }
+  const verdict = String(parsed?.verdict || "").trim().toLowerCase();
+  if (!["pass", "needs_patch", "manual_review"].includes(verdict)) {
+    return false;
+  }
+  if (typeof parsed?.summary !== "string") {
+    return false;
+  }
+  if (!parsed?.scores || typeof parsed.scores !== "object") {
+    return false;
+  }
+  if (!Array.isArray(parsed?.designIssues) || !Array.isArray(parsed?.requiredFixes)) {
+    return false;
+  }
+  return Number.isFinite(Number(parsed?.confidence));
 }
 
 function buildAgentTestPrompt(agent, scenario) {

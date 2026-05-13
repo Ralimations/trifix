@@ -4,6 +4,7 @@ import {
   Bot,
   BriefcaseBusiness,
   CheckCircle2,
+  Copy,
   ChevronDown,
   ChevronRight,
   Clock3,
@@ -5219,6 +5220,29 @@ function formatQualityLoopStatus(status) {
   return normalized.replace(/_/g, " ");
 }
 
+function formatDesignProjectType(projectType) {
+  const normalized = String(projectType || "unknown").trim().toLowerCase();
+  if (!normalized || normalized === "unknown") return "unknown";
+  return normalized.replace(/-/g, " ");
+}
+
+function formatDesignPreset(preset) {
+  const normalized = String(preset || "").trim();
+  if (!normalized) return "Not selected";
+  return normalized.replace(/-/g, " ");
+}
+
+function formatDesignReviewRecommendation(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "not reviewed";
+  return normalized.replace(/_/g, " ");
+}
+
+function formatDesignScore(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : "n/a";
+}
+
 function SettingsView({ settings, project, activeProcess, qualityLoopState, onQualityLoopStateChange, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
   const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
   const [guiQaDraft, setGuiQaDraft] = useState(() => normalizeGuiQaDraft(settings?.guiQa));
@@ -5246,6 +5270,11 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   const [runbookState, setRunbookState] = useState(null);
   const [runbookError, setRunbookError] = useState("");
   const [isRunbookBusy, setIsRunbookBusy] = useState(false);
+  const [uiQualityState, setUiQualityState] = useState(null);
+  const [uiQualityError, setUiQualityError] = useState("");
+  const [isUiQualityBusy, setIsUiQualityBusy] = useState(false);
+  const [isUiQualityRefreshing, setIsUiQualityRefreshing] = useState(false);
+  const [uiInstallCopyState, setUiInstallCopyState] = useState("idle");
   const detectedTargetUrl = activeProcess?.healthUrl || "";
   const canRunGuiQa = guiQaDraft.enabled && playwrightCapability?.status === "available" && Boolean(detectedTargetUrl);
   const qualityLoopBusy = ["running", "gui_qa_pending", "gui_qa_running", "qa_reviewing_gui_evidence", "dev_patching_gui_issue"].includes(String(qualityLoopState?.status || "").toLowerCase());
@@ -5272,6 +5301,9 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
       pageErrors: [],
       screenshotExists: false
     });
+    setUiQualityState(null);
+    setUiQualityError("");
+    setUiInstallCopyState("idle");
     setPlaywrightCapability({
       status: "not_checked",
       packageStatus: "not_checked",
@@ -5288,6 +5320,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     void checkPlaywrightCapability({ silent: true });
     void refreshQualityLoopHealth();
     void refreshRunbook(project.rootPath, true);
+    void refreshUiQuality(project.rootPath, true);
   }, [project?.rootPath]);
 
   useEffect(() => {
@@ -5325,6 +5358,29 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
     } finally {
       if (!silent) {
         setIsRunbookBusy(false);
+      }
+    }
+  }
+
+  async function refreshUiQuality(projectRoot = project?.rootPath || "", silent = false) {
+    if (!projectRoot || !window.trifix?.getLatestUiQuality) {
+      setUiQualityState(null);
+      return;
+    }
+    if (!silent) {
+      setIsUiQualityRefreshing(true);
+      setUiQualityError("");
+    }
+    try {
+      const latest = await window.trifix.getLatestUiQuality({ projectRoot });
+      setUiQualityState(latest || null);
+    } catch (error) {
+      if (!silent) {
+        setUiQualityError(error?.message || "Could not load design quality data.");
+      }
+    } finally {
+      if (!silent) {
+        setIsUiQualityRefreshing(false);
       }
     }
   }
@@ -5636,6 +5692,171 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
       setIsRunbookBusy(false);
     }
   }
+
+  async function createUiQualityContractAction() {
+    if (!project?.rootPath || !window.trifix?.createUiQualityContract) {
+      return;
+    }
+    setIsUiQualityBusy(true);
+    setUiQualityError("");
+    try {
+      await window.trifix.createUiQualityContract({
+        projectRoot: project.rootPath
+      });
+      await refreshUiQuality(project.rootPath, true);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not create UI quality contract.");
+    } finally {
+      setIsUiQualityBusy(false);
+    }
+  }
+
+  async function generateUiStackRecommendationAction() {
+    if (!project?.rootPath || !window.trifix?.generateUiStackRecommendation) {
+      return;
+    }
+    setIsUiQualityBusy(true);
+    setUiQualityError("");
+    try {
+      await window.trifix.generateUiStackRecommendation({
+        projectRoot: project.rootPath
+      });
+      await refreshUiQuality(project.rootPath, true);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not generate UI stack recommendation.");
+    } finally {
+      setIsUiQualityBusy(false);
+    }
+  }
+
+  async function createDependencyPlanAction() {
+    if (!project?.rootPath || !window.trifix?.createDependencyPlan) {
+      return;
+    }
+    setIsUiQualityBusy(true);
+    setUiQualityError("");
+    try {
+      await window.trifix.createDependencyPlan({
+        projectRoot: project.rootPath
+      });
+      await refreshUiQuality(project.rootPath, true);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not create dependency plan.");
+    } finally {
+      setIsUiQualityBusy(false);
+    }
+  }
+
+  async function runUiQualityCheckAction() {
+    if (!project?.rootPath || !window.trifix?.runUiQualityCheck) {
+      return;
+    }
+    setIsUiQualityBusy(true);
+    setUiQualityError("");
+    try {
+      await checkPlaywrightCapability({ silent: true });
+      await window.trifix.runUiQualityCheck({
+        projectRoot: project.rootPath,
+        processId: activeProcess?.id || "",
+        healthUrl: detectedTargetUrl,
+        guiQa: normalizeGuiQaDraft(guiQaDraft)
+      });
+      await refreshUiQuality(project.rootPath, true);
+      await refreshGuiQaResult(project.rootPath);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not run UI quality check.");
+    } finally {
+      setIsUiQualityBusy(false);
+    }
+  }
+
+  async function runDesignPolishPassAction() {
+    if (!project?.rootPath || !window.trifix?.runDesignPolishPass) {
+      return;
+    }
+    setIsUiQualityBusy(true);
+    setUiQualityError("");
+    try {
+      await checkPlaywrightCapability({ silent: true });
+      await window.trifix.runDesignPolishPass({
+        projectRoot: project.rootPath,
+        processId: activeProcess?.id || "",
+        healthUrl: detectedTargetUrl,
+        guiQa: normalizeGuiQaDraft(guiQaDraft)
+      });
+      await refreshUiQuality(project.rootPath, true);
+      await refreshGuiQaResult(project.rootPath);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not run design polish pass.");
+    } finally {
+      setIsUiQualityBusy(false);
+    }
+  }
+
+  async function copyInstallCommandsAction() {
+    const commands = (uiQualityState?.installCommands || []).filter(Boolean).join("\n");
+    if (!commands) {
+      setUiInstallCopyState("empty");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(commands);
+      setUiInstallCopyState("copied");
+    } catch (error) {
+      setUiInstallCopyState("error");
+      setUiQualityError(error?.message || "Could not copy install commands.");
+    }
+  }
+
+  async function openCurrentDesignFolder() {
+    if (!project?.rootPath || !window.trifix?.openDesignFolder) {
+      return;
+    }
+    setUiQualityError("");
+    try {
+      await window.trifix.openDesignFolder({
+        projectRoot: project.rootPath
+      });
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not open design folder.");
+    }
+  }
+
+  async function openUiLibrariesGuide() {
+    if (!project?.rootPath || !window.trifix?.openDesignFolder) {
+      return;
+    }
+    try {
+      await window.trifix.openDesignFolder({
+        projectRoot: project.rootPath,
+        target: "ui-libraries"
+      });
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not open UI libraries guide.");
+    }
+  }
+
+  const uiContract = uiQualityState?.contract || null;
+  const uiStack = uiQualityState?.stackRecommendation || null;
+  const dependencyPlan = uiQualityState?.dependencyPlan || null;
+  const domAudit = uiQualityState?.domAudit || null;
+  const designReview = uiQualityState?.designReview || null;
+  const polishState = uiQualityState?.polishState || null;
+  const installCommands = Array.isArray(uiQualityState?.installCommands) ? uiQualityState.installCommands.filter(Boolean) : [];
+  const designIssues = Array.isArray(designReview?.issues) ? designReview.issues : [];
+  const designWarnings = [
+    !project?.rootPath ? "Select a project first." : "",
+    !detectedTargetUrl ? "Run Project first. UI quality checks require an active healthUrl." : "",
+    playwrightCapability?.status !== "available" ? "Playwright missing. Re-check capability before running UI quality checks." : "",
+    dependencyPlan?.requiresUserApproval ? "Dependency installs require explicit user approval. Commands are suggested only." : ""
+  ].filter(Boolean);
+  const canRunUiQualityCheck = Boolean(project?.rootPath) && Boolean(detectedTargetUrl) && playwrightCapability?.status === "available" && !isUiQualityBusy;
+  const canRunDesignPolishPass = canRunUiQualityCheck && !qualityLoopBusy;
 
   return (
     <section className="simple-view">
@@ -6059,6 +6280,249 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
           <div className="error-banner" role="alert">
             <TriangleAlert size={18} />
             <span>{runbookError}</span>
+          </div>
+        ) : null}
+      </div>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Design Quality</p>
+            <h2>UI quality contract and polish loop</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={createUiQualityContractAction} disabled={!project?.rootPath || isUiQualityBusy}>
+              {isUiQualityBusy ? <Loader2 size={18} className="spin" /> : <Sparkles size={18} />}
+              Create UI Quality Contract
+            </button>
+            <button className="secondary-button" type="button" onClick={() => refreshUiQuality()} disabled={!project?.rootPath || isUiQualityRefreshing || isUiQualityBusy}>
+              {isUiQualityRefreshing ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
+              Refresh UI Quality
+            </button>
+            <button className="secondary-button" type="button" onClick={openCurrentDesignFolder} disabled={!project?.rootPath}>
+              <FolderOpen size={18} />
+              Open Design Folder
+            </button>
+            <button className="secondary-button" type="button" onClick={openUiLibrariesGuide} disabled={!uiQualityState?.designAssets?.librariesMdPath}>
+              <Eye size={18} />
+              Open UI_LIBRARIES.md
+            </button>
+          </div>
+        </div>
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Stack Planning</p>
+            <h2>Preset, libraries, and dependency safety</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={generateUiStackRecommendationAction} disabled={!project?.rootPath || isUiQualityBusy}>
+              <RefreshCw size={18} />
+              Generate UI Stack Recommendation
+            </button>
+            <button className="secondary-button" type="button" onClick={createDependencyPlanAction} disabled={!project?.rootPath || isUiQualityBusy}>
+              <FilePlus2 size={18} />
+              Create Dependency Plan
+            </button>
+            <button className="secondary-button" type="button" onClick={copyInstallCommandsAction} disabled={!installCommands.length}>
+              <Copy size={18} />
+              Copy Install Commands
+            </button>
+          </div>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Project type</span>
+            <code>{formatDesignProjectType(uiContract?.projectType)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Quality level</span>
+            <code>{uiContract?.qualityLevel || "Not created"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Selected preset</span>
+            <code>{formatDesignPreset(uiContract?.preset)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Visual goal</span>
+            <code>{uiContract?.visualGoal || "Not created"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Component system</span>
+            <code>{uiStack?.recommendedStack?.componentSystem || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Styling</span>
+            <code>{uiStack?.recommendedStack?.styling || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Icons</span>
+            <code>{uiStack?.recommendedStack?.icons || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Charts</span>
+            <code>{uiStack?.recommendedStack?.charts || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Tables</span>
+            <code>{uiStack?.recommendedStack?.tables || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Animation</span>
+            <code>{uiStack?.recommendedStack?.animation || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Forms</span>
+            <code>{uiStack?.recommendedStack?.forms || "Not selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Dependency approval</span>
+            <code>{dependencyPlan?.requiresUserApproval ? "required" : "not required"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Install commands</span>
+            <code>{installCommands.length ? installCommands.join(" | ") : "No install commands suggested"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Polish status</span>
+            <code>{polishState?.status || "idle"}</code>
+          </div>
+        </div>
+        {(uiContract?.mustHave || []).length ? <p className="muted">Must have: {uiContract.mustHave.slice(0, 5).join(" | ")}</p> : null}
+        {(uiContract?.avoid || []).length ? <p className="muted">Avoid: {uiContract.avoid.slice(0, 4).join(" | ")}</p> : null}
+        {(uiStack?.reasoning || []).length ? <p className="muted">Stack reasoning: {uiStack.reasoning.join(" | ")}</p> : null}
+        {(dependencyPlan?.warnings || []).length ? <p className="muted">Dependency warnings: {dependencyPlan.warnings.join(" | ")}</p> : null}
+        {uiInstallCopyState === "copied" ? <div className="save-note">Install commands copied.</div> : null}
+        {uiInstallCopyState === "empty" ? <p className="muted">No install commands are available yet.</p> : null}
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">UI Audit</p>
+            <h2>Deterministic DOM and screenshot review</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={runUiQualityCheckAction} disabled={!canRunUiQualityCheck}>
+              {isUiQualityBusy ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+              Run UI Quality Check
+            </button>
+            <button className="primary-button" type="button" onClick={runDesignPolishPassAction} disabled={!canRunDesignPolishPass}>
+              {isUiQualityBusy ? <Loader2 size={18} className="spin" /> : <Sparkles size={18} />}
+              Improve UI / Design Polish Pass
+            </button>
+          </div>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Page title</span>
+            <code>{domAudit?.pageTitle || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Final URL</span>
+            <code>{domAudit?.finalUrl || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Buttons</span>
+            <code>{Number.isFinite(Number(domAudit?.buttonCount)) ? Number(domAudit.buttonCount) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Inputs</span>
+            <code>{Number.isFinite(Number(domAudit?.inputCount)) ? Number(domAudit.inputCount) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Tables</span>
+            <code>{Number.isFinite(Number(domAudit?.tableCount)) ? Number(domAudit.tableCount) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Headings</span>
+            <code>{Number.isFinite(Number(domAudit?.headingCount)) ? Number(domAudit.headingCount) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Navigation</span>
+            <code>{domAudit?.hasNav ? "detected" : "not detected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Header</span>
+            <code>{domAudit?.hasHeader ? "detected" : "not detected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Sidebar</span>
+            <code>{domAudit?.hasSidebar ? "detected" : "not detected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Search/filter</span>
+            <code>{domAudit?.hasSearchOrFilter ? "detected" : "not detected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Theme toggle</span>
+            <code>{domAudit?.hasThemeToggle ? "detected" : "not detected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Card-like elements</span>
+            <code>{Number.isFinite(Number(domAudit?.cardLikeCount)) ? Number(domAudit.cardLikeCount) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Status badges</span>
+            <code>{Number.isFinite(Number(domAudit?.statusBadgeLikeCount)) ? Number(domAudit.statusBadgeLikeCount) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Body text length</span>
+            <code>{Number.isFinite(Number(domAudit?.bodyTextLength)) ? Number(domAudit.bodyTextLength) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Desktop screenshot</span>
+            <code>{uiQualityState?.designAssets?.desktopScreenshotPath || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Mobile screenshot</span>
+            <code>{uiQualityState?.designAssets?.mobileScreenshotPath || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Review recommendation</span>
+            <code>{formatDesignReviewRecommendation(designReview?.recommendation)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Review mode</span>
+            <code>{designReview?.reviewMode || "not reviewed"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Layout score</span>
+            <code>{formatDesignScore(designReview?.scores?.layout)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Spacing score</span>
+            <code>{formatDesignScore(designReview?.scores?.spacing)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Hierarchy score</span>
+            <code>{formatDesignScore(designReview?.scores?.hierarchy)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Typography score</span>
+            <code>{formatDesignScore(designReview?.scores?.typography)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Color score</span>
+            <code>{formatDesignScore(designReview?.scores?.color)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Accessibility score</span>
+            <code>{formatDesignScore(designReview?.scores?.accessibility)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Interactivity score</span>
+            <code>{formatDesignScore(designReview?.scores?.interactivity)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Polish score</span>
+            <code>{formatDesignScore(designReview?.scores?.polish)}</code>
+          </div>
+        </div>
+        {designWarnings.map((warning) => <p className="muted" key={`design:${warning}`}>{warning}</p>)}
+        {domAudit?.consoleErrors?.length ? <p className="muted">Console errors: {domAudit.consoleErrors.join(" | ")}</p> : null}
+        {domAudit?.pageErrors?.length ? <p className="muted">Page errors: {domAudit.pageErrors.join(" | ")}</p> : null}
+        {designReview?.notes ? <p className="muted">{designReview.notes}</p> : null}
+        {designIssues.length ? <p className="muted">Issues: {designIssues.map((issue) => issue?.message || issue?.description || String(issue || "")).filter(Boolean).join(" | ")}</p> : null}
+        {uiQualityError ? (
+          <div className="error-banner" role="alert">
+            <TriangleAlert size={18} />
+            <span>{uiQualityError}</span>
           </div>
         ) : null}
       </div>
