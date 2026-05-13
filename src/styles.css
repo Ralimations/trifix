@@ -2732,6 +2732,92 @@ select:focus {
   height: 18px;
 }
 
+.terminal-preset-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.terminal-console-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.9fr);
+  gap: 18px;
+}
+
+.terminal-output {
+  min-height: 360px;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
+  padding: 16px;
+  border-radius: 12px;
+  background: #0b1016;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #dfe8f6;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-history-list {
+  display: grid;
+  gap: 10px;
+}
+
+.terminal-history-item {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  padding: 14px;
+  border-radius: 12px;
+  text-align: left;
+  color: #dce6f5;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.terminal-history-item.active {
+  border-color: rgba(116, 185, 255, 0.52);
+  background: rgba(116, 185, 255, 0.12);
+}
+
+.terminal-history-item span {
+  color: #99a9bf;
+  font-size: 12px;
+}
+
+.terminal-status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  text-transform: capitalize;
+  background: rgba(255, 255, 255, 0.08);
+  color: #dce6f5;
+}
+
+.terminal-status-badge.running {
+  background: rgba(116, 185, 255, 0.16);
+  color: #bfe0ff;
+}
+
+.terminal-status-badge.passed {
+  background: rgba(69, 212, 131, 0.16);
+  color: #9af0bd;
+}
+
+.terminal-status-badge.failed,
+.terminal-status-badge.blocked,
+.terminal-status-badge.stopped {
+  background: rgba(255, 120, 120, 0.16);
+  color: #ffb6b6;
+}
+
 .spin {
   animation: spin 900ms linear infinite;
 }
@@ -2900,6 +2986,10 @@ select:focus {
 
   .workflow-stepper-list {
     min-width: 960px;
+  }
+
+  .terminal-console-grid {
+    grid-template-columns: 1fr;
   }
 
   .agent-card {

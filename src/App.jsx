@@ -147,6 +147,24 @@ const phraseBank = {
   }
 };
 
+let activeQualityLoopRunId = "";
+const ignoredQualityLoopRunIds = new Set();
+
+function normalizeCapabilityState(capability, fallbackRoot = "") {
+  if (!capability || typeof capability !== "object") {
+    return null;
+  }
+  return {
+    status: String(capability.status || "not_checked"),
+    packageStatus: String(capability.packageStatus || "not_checked"),
+    browsersStatus: String(capability.browsersStatus || "not_checked"),
+    browser: String(capability.browser || "chromium"),
+    checkedAt: typeof capability.checkedAt === "string" ? capability.checkedAt : "",
+    targetRoot: typeof capability.targetRoot === "string" ? capability.targetRoot : fallbackRoot,
+    details: typeof capability.details === "string" ? capability.details : "Capability not checked yet."
+  };
+}
+
 export function App() {
   const [activeView, setActiveView] = useState("landing");
   const [activeTab, setActiveTab] = useState("architect");
@@ -181,10 +199,17 @@ export function App() {
   const [commandLog, setCommandLog] = useState([]);
   const [projectProcesses, setProjectProcesses] = useState([]);
   const [processLogView, setProcessLogView] = useState(null);
+  const [terminalCommandInput, setTerminalCommandInput] = useState("");
+  const [terminalSessions, setTerminalSessions] = useState([]);
+  const [terminalSelectedSessionId, setTerminalSelectedSessionId] = useState("");
+  const [terminalError, setTerminalError] = useState("");
+  const [terminalNotice, setTerminalNotice] = useState("");
+  const [isTerminalSubmitting, setIsTerminalSubmitting] = useState(false);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   const [isGraphRunning, setIsGraphRunning] = useState(false);
   const [testerResult, setTesterResult] = useState(null);
   const [isTesterRunning, setIsTesterRunning] = useState(false);
+  const [qualityLoopState, setQualityLoopState] = useState(null);
   const [draftProjectName, setDraftProjectName] = useState("");
   const [taskTitle, setTaskTitle] = useState("");
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -227,6 +252,14 @@ export function App() {
     () => projectProcesses.find((process) => ["running", "starting"].includes(process.status)) || projectProcesses[0] || null,
     [projectProcesses]
   );
+  const selectedTerminalSession = useMemo(
+    () => terminalSessions.find((session) => session.sessionId === terminalSelectedSessionId) || terminalSessions[0] || null,
+    [terminalSelectedSessionId, terminalSessions]
+  );
+  const runningTerminalSession = useMemo(
+    () => terminalSessions.find((session) => session.status === "running") || null,
+    [terminalSessions]
+  );
   const canRun =
     !isRunning &&
     !isRunStarting &&
@@ -242,6 +275,19 @@ export function App() {
     modelAvailabilityRef.current = modelAvailability;
   }, [modelAvailability]);
 
+  function isTerminalQualityLoopStatus(status) {
+    return [
+      "quality_loop_passed",
+      "quality_loop_failed",
+      "quality_loop_needs_review",
+      "stopped",
+      "gui_qa_failed",
+      "qa_evidence_ready",
+      "gui_qa_skipped_missing_playwright",
+      "blocked_missing_health_url"
+    ].includes(String(status || "").toLowerCase());
+  }
+
   function updateActiveTab(nextTab, { userInitiated = false, force = false } = {}) {
     if (userInitiated) {
       userSelectedReviewTabRef.current = true;
@@ -252,6 +298,115 @@ export function App() {
 
     if (force || (!userSelectedReviewTabRef.current && !suppressAutoTabSwitchRef.current)) {
       setActiveTab(nextTab);
+    }
+  }
+
+  useEffect(() => {
+    if (!project?.rootPath) {
+      setTerminalSessions([]);
+      setTerminalSelectedSessionId("");
+      setTerminalCommandInput("");
+      setTerminalError("");
+      setTerminalNotice("");
+      return;
+    }
+
+    let cancelled = false;
+    let intervalId = null;
+
+    async function loadTerminalHistory() {
+      try {
+        const history = await window.trifix.getTerminalHistory({
+          projectRoot: project.rootPath
+        });
+        if (cancelled) {
+          return;
+        }
+        const sessions = history?.sessions || [];
+        setTerminalSessions(sessions);
+        setTerminalSelectedSessionId((current) => (
+          current && sessions.some((session) => session.sessionId === current)
+            ? current
+            : sessions[0]?.sessionId || ""
+        ));
+      } catch (loadError) {
+        if (!cancelled && activeView === "commands") {
+          setTerminalError(loadError?.message || "Could not load terminal history.");
+        }
+      }
+    }
+
+    if (activeView === "commands" || runningTerminalSession) {
+      void loadTerminalHistory();
+      intervalId = window.setInterval(loadTerminalHistory, 1000);
+    }
+
+    return () => {
+      cancelled = true;
+      if (intervalId) {
+        window.clearInterval(intervalId);
+      }
+    };
+  }, [activeView, project?.rootPath, runningTerminalSession?.sessionId]);
+
+  async function runTerminalCommand() {
+    if (!project?.rootPath) {
+      setTerminalError("Select a project first.");
+      return;
+    }
+
+    setIsTerminalSubmitting(true);
+    setTerminalError("");
+    setTerminalNotice("");
+    try {
+      const response = await window.trifix.runTerminalCommand({
+        projectRoot: project.rootPath,
+        command: terminalCommandInput
+      });
+      const nextSession = response?.session || null;
+      if (nextSession?.sessionId) {
+        setTerminalSelectedSessionId(nextSession.sessionId);
+      }
+      if (response?.message) {
+        if (nextSession?.status === "blocked") {
+          setTerminalError(response.message);
+        } else {
+          setTerminalNotice(response.message);
+        }
+      }
+      const history = await window.trifix.getTerminalHistory({
+        projectRoot: project.rootPath
+      });
+      const sessions = history?.sessions || [];
+      setTerminalSessions(sessions);
+      if (!nextSession?.sessionId && sessions[0]?.sessionId) {
+        setTerminalSelectedSessionId(sessions[0].sessionId);
+      }
+    } catch (runError) {
+      setTerminalError(runError?.message || "Could not run command.");
+    } finally {
+      setIsTerminalSubmitting(false);
+    }
+  }
+
+  async function stopTerminalSession() {
+    if (!project?.rootPath || !runningTerminalSession?.sessionId) {
+      return;
+    }
+
+    setTerminalError("");
+    setTerminalNotice("");
+    try {
+      await window.trifix.stopTerminalCommand({
+        projectRoot: project.rootPath,
+        sessionId: runningTerminalSession.sessionId
+      });
+      const history = await window.trifix.getTerminalHistory({
+        projectRoot: project.rootPath
+      });
+      setTerminalSessions(history?.sessions || []);
+    } catch (stopError) {
+      setTerminalError(stopError?.message || "Could not stop command.");
     }
   }
 
@@ -408,12 +563,54 @@ export function App() {
         void refreshTrackedProjects();
       }
     });
+    const unsubscribeQualityLoop = bridge.onQualityLoopProgress
+      ? bridge.onQualityLoopProgress((progress) => {
+        if (!progress?.runId) {
+          return;
+        }
+        if (ignoredQualityLoopRunIds.has(progress.runId)) {
+          return;
+        }
+        if (activeQualityLoopRunId && progress.runId !== activeQualityLoopRunId) {
+          return;
+        }
+        if (!activeQualityLoopRunId && progress.projectRoot === project?.rootPath) {
+          activeQualityLoopRunId = progress.runId;
+        }
+        if (progress.runId !== activeQualityLoopRunId) {
+          return;
+        }
+        setQualityLoopState(progress || null);
+        if (isTerminalQualityLoopStatus(progress.status)) {
+          activeQualityLoopRunId = "";
+        }
+      })
+      : () => {};
 
     return () => {
       unsubscribePipeline();
       unsubscribeAutonomy();
+      unsubscribeQualityLoop();
     };
-  }, []);
+  }, [project?.rootPath]);
+
+  useEffect(() => {
+    if (!project?.rootPath || !window.trifix?.getQualityLoopStatus) {
+      activeQualityLoopRunId = "";
+      ignoredQualityLoopRunIds.clear();
+      setQualityLoopState(null);
+      return;
+    }
+
+    window.trifix.getQualityLoopStatus({ projectRoot: project.rootPath })
+      .then((status) => {
+        activeQualityLoopRunId = status?.runId && !isTerminalQualityLoopStatus(status?.status)
+          ? status.runId
+          : "";
+        setQualityLoopState(status || null);
+      })
+      .catch(() => {});
+  }, [project?.rootPath]);
 
   useEffect(() => {
     if (!settings?.agents) {
@@ -2570,6 +2767,12 @@ export function App() {
               onClick={() => setActiveView("reports")}
             />
             <SidebarButton
+              active={activeView === "commands"}
+              icon={<Code2 size={18} />}
+              label="Commands"
+              onClick={() => setActiveView("commands")}
+            />
+            <SidebarButton
               active={activeView === "settings"}
               icon={<Settings size={18} />}
               label="Settings"
@@ -2686,11 +2889,32 @@ export function App() {
             />
           </WorkspaceErrorBoundary>
         ) : null}
+        {activeView === "commands" ? (
+          <WorkspaceErrorBoundary resetKey={`${activeView}:${project?.rootPath || "none"}:${runningTerminalSession?.sessionId || "idle"}`}>
+            <TerminalCommandsView
+              project={project}
+              commandInput={terminalCommandInput}
+              onCommandInput={setTerminalCommandInput}
+              onRunCommand={runTerminalCommand}
+              onStopCommand={stopTerminalSession}
+              sessions={terminalSessions}
+              selectedSession={selectedTerminalSession}
+              selectedSessionId={terminalSelectedSessionId}
+              onSelectSession={setTerminalSelectedSessionId}
+              runningSession={runningTerminalSession}
+              error={terminalError}
+              notice={terminalNotice}
+              isSubmitting={isTerminalSubmitting}
+            />
+          </WorkspaceErrorBoundary>
+        ) : null}
         {activeView === "settings" ? (
           <SettingsView
             settings={settings}
             project={project}
             activeProcess={activeProjectProcess}
+            qualityLoopState={qualityLoopState}
+            onQualityLoopStateChange={setQualityLoopState}
             testerResult={testerResult}
             isTesterRunning={isTesterRunning}
             agentNames={agentNames}
@@ -4205,6 +4429,141 @@ function ProcessLogModal({ processLog, onClose }) {
   );
 }
 
+function formatTerminalSessionStatus(status) {
+  const normalized = String(status || "idle").trim().toLowerCase();
+  if (["running", "passed", "failed", "stopped", "blocked"].includes(normalized)) {
+    return normalized;
+  }
+  return "idle";
+}
+
+function TerminalCommandsView({
+  project,
+  commandInput,
+  onCommandInput,
+  onRunCommand,
+  onStopCommand,
+  sessions = [],
+  selectedSession,
+  selectedSessionId,
+  onSelectSession,
+  runningSession,
+  error,
+  notice,
+  isSubmitting
+}) {
+  const presets = [
+    "npm install",
+    "npm run build",
+    "npm run dev",
+    "npm run preview",
+    "npm install -D @playwright/test",
+    "npx playwright install chromium",
+    "npx playwright test"
+  ];
+  const status = formatTerminalSessionStatus(selectedSession?.status || (runningSession ? "running" : "idle"));
+  const canRun = Boolean(project?.rootPath) && Boolean(commandInput.trim()) && !isSubmitting;
+  const output = selectedSession?.output || selectedSession?.outputPreview || "No command output yet.";
+
+  return (
+    <section className="simple-view">
+      <p className="eyebrow">Terminal / Commands</p>
+      <h1>Project command console</h1>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Project Scope</p>
+            <h2>Selected project root</h2>
+          </div>
+          <span className={`terminal-status-badge ${status}`}>{status}</span>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Project root</span>
+            <code>{project?.rootPath || "No project selected"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Running session</span>
+            <code>{runningSession?.command || "None"}</code>
+          </div>
+        </div>
+        <div className="terminal-preset-grid">
+          {presets.map((preset) => (
+            <button className="secondary-button" type="button" key={preset} onClick={() => onCommandInput(preset)}>
+              {preset}
+            </button>
+          ))}
+        </div>
+        <label className="dialogue-field">
+          <span>Command</span>
+          <input
+            type="text"
+            value={commandInput}
+            onChange={(event) => onCommandInput(event.target.value)}
+            placeholder="npm install"
+            disabled={!project?.rootPath}
+          />
+        </label>
+        <div className="button-row">
+          <button className="primary-button" type="button" onClick={onRunCommand} disabled={!canRun}>
+            {isSubmitting ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+            Run
+          </button>
+          <button className="secondary-button danger" type="button" onClick={onStopCommand} disabled={!runningSession}>
+            <XCircle size={18} />
+            Stop
+          </button>
+        </div>
+        {notice ? <div className="save-note">{notice}</div> : null}
+        {error ? (
+          <div className="error-banner" role="alert">
+            <TriangleAlert size={18} />
+            <span>{error}</span>
+          </div>
+        ) : null}
+      </div>
+      <div className="terminal-console-grid">
+        <div className="dialogue-editor">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Output</p>
+              <h2>{selectedSession?.command || "Terminal output"}</h2>
+            </div>
+            <span className={`terminal-status-badge ${status}`}>{status}</span>
+          </div>
+          <pre className="terminal-output">{output}</pre>
+        </div>
+        <div className="dialogue-editor">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">History</p>
+              <h2>Recent commands</h2>
+            </div>
+          </div>
+          <div className="terminal-history-list">
+            {sessions.length > 0 ? sessions.map((session) => (
+              <button
+                className={`terminal-history-item ${selectedSessionId === session.sessionId ? "active" : ""}`}
+                type="button"
+                key={session.sessionId}
+                onClick={() => onSelectSession(session.sessionId)}
+              >
+                <strong>{session.command}</strong>
+                <span>{session.startedAt || session.sessionId}</span>
+                <span className={`terminal-status-badge ${formatTerminalSessionStatus(session.status)}`}>
+                  {formatTerminalSessionStatus(session.status)}
+                </span>
+              </button>
+            )) : (
+              <p className="muted">No terminal sessions yet.</p>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function AutonomyStatusCard({
   autonomyRun,
   isRunning,
@@ -4850,10 +5209,17 @@ function formatGuiQaRunStatus(result) {
   if (status === "skipped_missing_playwright") return "skipped: missing playwright";
   if (status === "skipped_missing_health_url") return "skipped: waiting for dev server";
   if (status === "error") return "error";
+  if (status === "not_checked") return "not checked";
   return "not run";
 }
 
-function SettingsView({ settings, project, activeProcess, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
+function formatQualityLoopStatus(status) {
+  const normalized = String(status || "idle").trim().toLowerCase();
+  if (!normalized) return "idle";
+  return normalized.replace(/_/g, " ");
+}
+
+function SettingsView({ settings, project, activeProcess, qualityLoopState, onQualityLoopStateChange, testerResult, isTesterRunning, agentNames, onRunTester, onSettingsChange, onAgentNamesChange }) {
   const [dialogueDraft, setDialogueDraft] = useState(() => buildDialogueDraft(settings?.agents));
   const [guiQaDraft, setGuiQaDraft] = useState(() => normalizeGuiQaDraft(settings?.guiQa));
   const [nameDraft, setNameDraft] = useState(() => ({
@@ -4873,9 +5239,16 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
   const [guiQaError, setGuiQaError] = useState("");
   const [isCapabilityChecking, setIsCapabilityChecking] = useState(false);
   const [isGuiQaRunning, setIsGuiQaRunning] = useState(false);
+  const [isGuiQaRefreshing, setIsGuiQaRefreshing] = useState(false);
+  const [isQualityLoopStarting, setIsQualityLoopStarting] = useState(false);
+  const [qualityLoopAgentHealth, setQualityLoopAgentHealth] = useState(null);
   const [guiQaResult, setGuiQaResult] = useState(null);
+  const [runbookState, setRunbookState] = useState(null);
+  const [runbookError, setRunbookError] = useState("");
+  const [isRunbookBusy, setIsRunbookBusy] = useState(false);
   const detectedTargetUrl = activeProcess?.healthUrl || "";
   const canRunGuiQa = guiQaDraft.enabled && playwrightCapability?.status === "available" && Boolean(detectedTargetUrl);
+  const qualityLoopBusy = ["running", "gui_qa_pending", "gui_qa_running", "qa_reviewing_gui_evidence", "dev_patching_gui_issue"].includes(String(qualityLoopState?.status || "").toLowerCase());
 
   useEffect(() => {
     setDialogueDraft(buildDialogueDraft(settings?.agents));
@@ -4892,7 +5265,13 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
 
   useEffect(() => {
     setGuiQaError("");
-    setGuiQaResult(null);
+    setGuiQaResult({
+      status: "not_checked",
+      message: "No GUI QA result found for this project yet.",
+      consoleErrors: [],
+      pageErrors: [],
+      screenshotExists: false
+    });
     setPlaywrightCapability({
       status: "not_checked",
       packageStatus: "not_checked",
@@ -4900,6 +5279,55 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
       details: "Capability not checked yet."
     });
   }, [project?.rootPath]);
+
+  useEffect(() => {
+    if (!project?.rootPath) {
+      return;
+    }
+    void refreshGuiQaResult(project.rootPath);
+    void checkPlaywrightCapability({ silent: true });
+    void refreshQualityLoopHealth();
+    void refreshRunbook(project.rootPath, true);
+  }, [project?.rootPath]);
+
+  useEffect(() => {
+    if (!project?.rootPath || !qualityLoopState?.runId) {
+      return;
+    }
+    void refreshRunbook(project.rootPath, true);
+  }, [project?.rootPath, qualityLoopState?.runId, qualityLoopState?.status]);
+
+  async function refreshQualityLoopHealth() {
+    try {
+      const nextHealth = await window.trifix.getModelHealth?.();
+      setQualityLoopAgentHealth(nextHealth || null);
+    } catch {
+      setQualityLoopAgentHealth(null);
+    }
+  }
+
+  async function refreshRunbook(projectRoot = project?.rootPath || "", silent = false) {
+    if (!projectRoot || !window.trifix?.getLatestRunbook) {
+      setRunbookState(null);
+      return;
+    }
+    if (!silent) {
+      setIsRunbookBusy(true);
+      setRunbookError("");
+    }
+    try {
+      const latest = await window.trifix.getLatestRunbook({ projectRoot });
+      setRunbookState(latest || null);
+    } catch (error) {
+      if (!silent) {
+        setRunbookError(error?.message || "Could not load runbook.");
+      }
+    } finally {
+      if (!silent) {
+        setIsRunbookBusy(false);
+      }
+    }
+  }
 
   async function saveDialogue() {
     setSaveState("saving");
@@ -4937,22 +5365,40 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
     }
   }
 
-  async function checkPlaywrightCapability() {
-    setIsCapabilityChecking(true);
-    setGuiQaError("");
+  function applyCapabilitySnapshot(capability, { preserveAvailable = false } = {}) {
+    const normalized = normalizeCapabilityState(capability, project?.rootPath || "");
+    if (!normalized) {
+      return;
+    }
+    setPlaywrightCapability((current) => {
+      if (preserveAvailable && current?.status === "available" && normalized.status !== "available") {
+        return current;
+      }
+      return normalized;
+    });
+  }
+
+  async function checkPlaywrightCapability(options = {}) {
+    const silent = Boolean(options?.silent);
+    setIsCapabilityChecking(!silent);
+    if (!silent) {
+      setGuiQaError("");
+    }
     try {
       const capability = await (window.trifix.checkGuiQaCapability || window.trifix.checkPlaywrightCapability)({
         projectRoot: project?.rootPath || ""
       });
-      setPlaywrightCapability(capability || {
+      applyCapabilitySnapshot(capability || {
         status: "not_checked",
         packageStatus: "not_checked",
         browsersStatus: "not_checked",
         details: "Capability not checked yet."
       });
     } catch (error) {
-      setGuiQaError(error?.message || "Could not check Playwright capability.");
-      setPlaywrightCapability({
+      if (!silent) {
+        setGuiQaError(error?.message || "Could not check Playwright capability.");
+      }
+      applyCapabilitySnapshot({
         status: "not_checked",
         packageStatus: "not_checked",
         browsersStatus: "not_checked",
@@ -4974,6 +5420,7 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
         guiQa: normalizeGuiQaDraft(guiQaDraft)
       });
       setGuiQaResult(nextResult || null);
+      applyCapabilitySnapshot(nextResult?.capability, { preserveAvailable: false });
       if (nextResult?.message && nextResult?.status !== "passed") {
         setGuiQaError(nextResult.message);
       }
@@ -4988,6 +5435,205 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
       });
     } finally {
       setIsGuiQaRunning(false);
+    }
+  }
+
+  async function refreshGuiQaResult(projectRoot = project?.rootPath || "") {
+    if (!projectRoot) {
+      setGuiQaResult({
+        status: "not_checked",
+        message: "No GUI QA result found for this project yet.",
+        consoleErrors: [],
+        pageErrors: [],
+        screenshotExists: false
+      });
+      return;
+    }
+
+    setIsGuiQaRefreshing(true);
+    try {
+      const latest = await window.trifix.getLatestGuiQaResult({
+        projectRoot
+      });
+      setGuiQaResult({
+        status: "not_checked",
+        consoleErrors: [],
+        pageErrors: [],
+        screenshotExists: false,
+        ...(latest || {})
+      });
+      applyCapabilitySnapshot(latest?.capability, { preserveAvailable: true });
+      if (latest?.status === "error" && latest?.message) {
+        setGuiQaError(latest.message);
+      }
+    } catch (error) {
+      setGuiQaResult({
+        status: "error",
+        message: "Stored GUI QA result could not be read.",
+        consoleErrors: [],
+        pageErrors: [],
+        screenshotExists: false
+      });
+      setGuiQaError(error?.message || "Stored GUI QA result could not be read.");
+    } finally {
+      setIsGuiQaRefreshing(false);
+    }
+  }
+
+  async function runQualityLoop() {
+    if (!project?.rootPath) {
+      setGuiQaError("Select a project first.");
+      return;
+    }
+    setIsQualityLoopStarting(true);
+    setGuiQaError("");
+    try {
+      await refreshQualityLoopHealth();
+      await checkPlaywrightCapability({ silent: true });
+      const nextState = await window.trifix.runQualityLoop({
+        projectRoot: project.rootPath,
+        mode: "full_ai_loop",
+        guiQa: normalizeGuiQaDraft(guiQaDraft)
+      });
+      if (nextState?.runId) {
+        activeQualityLoopRunId = nextState.runId;
+        ignoredQualityLoopRunIds.delete(nextState.runId);
+      }
+      onQualityLoopStateChange(nextState || null);
+      await refreshRunbook(project.rootPath, true);
+      if (nextState?.status && /needs_review|blocked/i.test(String(nextState.status))) {
+        setGuiQaError(nextState.message || "Quality loop needs review.");
+      }
+    } catch (error) {
+      setGuiQaError(error?.message || "Could not start quality loop.");
+    } finally {
+      setIsQualityLoopStarting(false);
+    }
+  }
+
+  async function stopQualityLoop() {
+    if (!qualityLoopState?.runId) {
+      return;
+    }
+    try {
+      ignoredQualityLoopRunIds.add(qualityLoopState.runId);
+      activeQualityLoopRunId = "";
+      const stopped = await window.trifix.stopQualityLoop({ runId: qualityLoopState.runId });
+      onQualityLoopStateChange(stopped || {
+        ...qualityLoopState,
+        status: "stopped",
+        latestStopReason: "Stop requested.",
+        message: "Stop requested."
+      });
+      await refreshGuiQaResult(project?.rootPath || "");
+      await checkPlaywrightCapability({ silent: true });
+      await refreshRunbook(project?.rootPath || "", true);
+    } catch (error) {
+      ignoredQualityLoopRunIds.delete(qualityLoopState.runId);
+      setGuiQaError(error?.message || "Could not stop quality loop.");
+    }
+  }
+
+  async function runGuiQaEvidenceOnly() {
+    if (!project?.rootPath) {
+      setGuiQaError("Select a project first.");
+      return;
+    }
+    setIsQualityLoopStarting(true);
+    setGuiQaError("");
+    try {
+      await refreshQualityLoopHealth();
+      await checkPlaywrightCapability({ silent: true });
+      const nextState = await window.trifix.runQualityLoop({
+        projectRoot: project.rootPath,
+        mode: "evidence_only",
+        guiQa: normalizeGuiQaDraft(guiQaDraft)
+      });
+      if (nextState?.runId) {
+        activeQualityLoopRunId = nextState.runId;
+        ignoredQualityLoopRunIds.delete(nextState.runId);
+      }
+      onQualityLoopStateChange(nextState || null);
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setGuiQaError(error?.message || "Could not start GUI QA evidence collection.");
+    } finally {
+      setIsQualityLoopStarting(false);
+    }
+  }
+
+  const qaUnavailable = qualityLoopAgentHealth?.supervisor && !qualityLoopAgentHealth.supervisor.online;
+  const devUnavailable = qualityLoopAgentHealth?.junior && !qualityLoopAgentHealth.junior.online;
+  const pmUnavailable = qualityLoopAgentHealth?.architect && !qualityLoopAgentHealth.architect.online;
+  const canRunEvidenceOnly = Boolean(project?.rootPath) && guiQaDraft.enabled && Boolean(detectedTargetUrl) && playwrightCapability?.status === "available" && !isQualityLoopStarting && !qualityLoopBusy;
+  const canRunQualityLoop = Boolean(project?.rootPath) && guiQaDraft.enabled && playwrightCapability?.status === "available" && !qaUnavailable && !devUnavailable && !isQualityLoopStarting && !qualityLoopBusy;
+  const guiQaOnlyWarnings = [
+    !detectedTargetUrl ? "Start Project first. GUI QA Only requires an active healthUrl." : "",
+    playwrightCapability?.status !== "available" ? "Playwright missing. Re-check capability for the selected project before running GUI QA Only." : ""
+  ].filter(Boolean);
+  const fullLoopWarnings = [
+    playwrightCapability?.status !== "available" ? "Playwright missing. Run Quality Loop is blocked until Playwright is available." : "",
+    qaUnavailable ? "QA unavailable. GUI QA evidence was collected, but AI repair loop cannot run." : "",
+    devUnavailable ? "DEV unavailable. QA evidence was collected, but patches cannot be generated." : "",
+    pmUnavailable ? "PM unavailable. QA passed, but final approval requires manual review." : ""
+  ].filter(Boolean);
+
+  async function resumeFromRunbook() {
+    if (!project?.rootPath || !window.trifix?.resumeRunbook) {
+      return;
+    }
+    setIsRunbookBusy(true);
+    setRunbookError("");
+    try {
+      const resumed = await window.trifix.resumeRunbook({
+        projectRoot: project.rootPath,
+        runId: runbookState?.runId || ""
+      });
+      if (resumed?.state) {
+        onQualityLoopStateChange(resumed.state);
+      }
+      if (resumed?.message && !resumed?.resumed) {
+        setRunbookError(resumed.message);
+      }
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setRunbookError(error?.message || "Could not resume runbook.");
+    } finally {
+      setIsRunbookBusy(false);
+    }
+  }
+
+  async function openCurrentRunbookFolder() {
+    if (!project?.rootPath || !window.trifix?.openRunbookFolder) {
+      return;
+    }
+    setRunbookError("");
+    try {
+      await window.trifix.openRunbookFolder({
+        projectRoot: project.rootPath,
+        runId: runbookState?.runId || ""
+      });
+    } catch (error) {
+      setRunbookError(error?.message || "Could not open runbook folder.");
+    }
+  }
+
+  async function completeManualReview() {
+    if (!project?.rootPath || !window.trifix?.markManualReviewComplete) {
+      return;
+    }
+    setIsRunbookBusy(true);
+    setRunbookError("");
+    try {
+      await window.trifix.markManualReviewComplete({
+        projectRoot: project.rootPath,
+        runId: runbookState?.runId || ""
+      });
+      await refreshRunbook(project.rootPath, true);
+    } catch (error) {
+      setRunbookError(error?.message || "Could not mark manual review complete.");
+    } finally {
+      setIsRunbookBusy(false);
     }
   }
 
@@ -5145,10 +5791,16 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
             <p className="eyebrow">Manual Smoke Test</p>
             <h2>Run against the active dev server</h2>
           </div>
-          <button className="primary-button" type="button" onClick={runGuiSmokeTest} disabled={!canRunGuiQa || isGuiQaRunning}>
-            {isGuiQaRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
-            Run GUI Smoke Test
-          </button>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={() => refreshGuiQaResult()} disabled={isGuiQaRefreshing || !project?.rootPath}>
+              {isGuiQaRefreshing ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
+              Refresh GUI QA Result
+            </button>
+            <button className="primary-button" type="button" onClick={runGuiSmokeTest} disabled={!canRunGuiQa || isGuiQaRunning}>
+              {isGuiQaRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+              Run GUI Smoke Test
+            </button>
+          </div>
         </div>
         <div className="settings-grid">
           <div className="settings-row">
@@ -5165,7 +5817,27 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
           </div>
           <div className="settings-row">
             <span>Timestamp</span>
-            <code>{guiQaResult?.checkedAt || "Not run"}</code>
+            <code>{guiQaResult?.checkedAt || "Not checked"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Base URL</span>
+            <code>{guiQaResult?.baseURL || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Final URL</span>
+            <code>{guiQaResult?.finalUrl || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Page title</span>
+            <code>{guiQaResult?.title || "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>HTTP status</span>
+            <code>{Number.isInteger(guiQaResult?.httpStatus) ? guiQaResult.httpStatus : "Not captured"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Body text length</span>
+            <code>{Number.isFinite(Number(guiQaResult?.bodyTextLength)) ? Number(guiQaResult.bodyTextLength) : 0}</code>
           </div>
           <div className="settings-row">
             <span>Result JSON path</span>
@@ -5177,19 +5849,216 @@ function SettingsView({ settings, project, activeProcess, testerResult, isTester
           </div>
           <div className="settings-row">
             <span>Console errors</span>
-            <code>{(guiQaResult?.consoleErrors || []).length ? guiQaResult.consoleErrors.join(" | ") : "None"}</code>
+            <code>{(guiQaResult?.consoleErrors || []).length}</code>
           </div>
           <div className="settings-row">
             <span>Page errors</span>
-            <code>{(guiQaResult?.pageErrors || []).length ? guiQaResult.pageErrors.join(" | ") : "None"}</code>
+            <code>{(guiQaResult?.pageErrors || []).length}</code>
           </div>
         </div>
+        {guiQaResult?.screenshotExists && guiQaResult?.screenshotPath ? (
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={() => window.trifix.openFolderPath(guiQaResult.screenshotPath)}>
+              <Eye size={18} />
+              Open Screenshot
+            </button>
+          </div>
+        ) : null}
+        {(guiQaResult?.consoleErrors || []).length ? <p className="muted">Console errors: {guiQaResult.consoleErrors.join(" | ")}</p> : null}
+        {(guiQaResult?.pageErrors || []).length ? <p className="muted">Page errors: {guiQaResult.pageErrors.join(" | ")}</p> : null}
         {guiQaResult?.message ? <p className="muted">{guiQaResult.message}</p> : null}
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Quality Loop</p>
+            <h2>AI + Playwright quality loop</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={runGuiQaEvidenceOnly} disabled={!canRunEvidenceOnly}>
+              {isQualityLoopStarting && qualityLoopState?.mode === "evidence_only" ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+              Run GUI QA Only
+            </button>
+            <button className="primary-button" type="button" onClick={runQualityLoop} disabled={!canRunQualityLoop}>
+              {isQualityLoopStarting && qualityLoopState?.mode !== "evidence_only" ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
+              Run Quality Loop
+            </button>
+            <button className="secondary-button danger" type="button" onClick={stopQualityLoop} disabled={!qualityLoopState?.runId || !["running", "gui_qa_pending", "gui_qa_running", "qa_reviewing_gui_evidence", "dev_patching_gui_issue"].includes(String(qualityLoopState?.status || "").toLowerCase())}>
+              <XCircle size={18} />
+              Stop Quality Loop
+            </button>
+          </div>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Current mode</span>
+            <code>{qualityLoopState?.mode === "evidence_only" ? "Evidence Only" : "Full AI Loop"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Current round</span>
+            <code>{qualityLoopState?.currentRound || 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Max rounds</span>
+            <code>{qualityLoopState?.maxRounds || 3}</code>
+          </div>
+          <div className="settings-row">
+            <span>Loop status</span>
+            <code>{formatQualityLoopStatus(qualityLoopState?.status)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Current status</span>
+            <code>{qualityLoopState?.message || "Idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest stop reason</span>
+            <code>{qualityLoopState?.latestStopReason || "None"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Last known issue</span>
+            <code>{qualityLoopState?.lastKnownIssue || "None"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Build status</span>
+            <code>{qualityLoopState?.buildStatus || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Health URL</span>
+            <code>{qualityLoopState?.devServerUrl || detectedTargetUrl || "Not available"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Playwright status</span>
+            <code>{qualityLoopState?.playwrightStatus || playwrightCapability?.status || "not_checked"}</code>
+          </div>
+          <div className="settings-row">
+            <span>GUI QA status</span>
+            <code>{qualityLoopState?.guiQaStatus || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>QA status</span>
+            <code>{qualityLoopState?.qaStatus || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>QA verdict</span>
+            <code>{qualityLoopState?.qaVerdict || "pending"}</code>
+          </div>
+          <div className="settings-row">
+            <span>DEV patch status</span>
+            <code>{qualityLoopState?.devPatchStatus || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Final PM status</span>
+            <code>{qualityLoopState?.finalPmStatus || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest result</span>
+            <code>{qualityLoopState?.latestResultPath || guiQaResult?.resultPath || "Not available"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest screenshot</span>
+            <code>{qualityLoopState?.latestScreenshotPath || guiQaResult?.screenshotPath || "Not available"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest QA verdict</span>
+            <code>{qualityLoopState?.latestQaVerdictPath || "Not available"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Artifact folder</span>
+            <code>{qualityLoopState?.artifactDirPath || (project?.rootPath ? `${project.rootPath}/.trifix/gui-qa` : "Not available")}</code>
+          </div>
+        </div>
+        {guiQaOnlyWarnings.map((warning) => <p className="muted" key={`gui:${warning}`}>{warning}</p>)}
+        {fullLoopWarnings.map((warning) => <p className="muted" key={`loop:${warning}`}>{warning}</p>)}
+        {qualityLoopState?.message ? <p className="muted">{qualityLoopState.message}</p> : null}
         {guiQaSaveState === "saved" ? <div className="save-note">GUI QA settings saved.</div> : null}
         {guiQaError ? (
           <div className="error-banner" role="alert">
             <TriangleAlert size={18} />
             <span>{guiQaError}</span>
+          </div>
+        ) : null}
+      </div>
+      <div className="dialogue-editor">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Autonomy Runbook</p>
+            <h2>Persistent run status</h2>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={() => refreshRunbook()} disabled={isRunbookBusy || !project?.rootPath}>
+              {isRunbookBusy ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
+              Refresh Runbook
+            </button>
+            <button className="secondary-button" type="button" onClick={openCurrentRunbookFolder} disabled={!runbookState?.runId}>
+              <FolderOpen size={18} />
+              Open Runbook Folder
+            </button>
+            <button className="primary-button" type="button" onClick={resumeFromRunbook} disabled={!runbookState?.nextAction?.safeToResume || isRunbookBusy}>
+              <Play size={18} />
+              Resume From Next Action
+            </button>
+            <button className="secondary-button" type="button" onClick={completeManualReview} disabled={!runbookState?.runId || isRunbookBusy}>
+              <CheckCircle2 size={18} />
+              Mark Manual Review Complete
+            </button>
+          </div>
+        </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Latest runId</span>
+            <code>{runbookState?.runId || "None"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Status</span>
+            <code>{runbookState?.status || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Current stage</span>
+            <code>{runbookState?.currentStage || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Current round</span>
+            <code>{runbookState?.currentRound || 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Stop reason</span>
+            <code>{runbookState?.stopReason || "None"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest healthUrl</span>
+            <code>{runbookState?.latestEvidence?.healthUrl || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest GUI QA result</span>
+            <code>{runbookState?.latestEvidence?.guiQaResultPath || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest QA verdict</span>
+            <code>{runbookState?.latestQaVerdict?.summary || runbookState?.latestQaVerdict?.verdict || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest DEV patch</span>
+            <code>{runbookState?.latestDevPatch?.summary || runbookState?.latestDevPatch?.status || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest PM status</span>
+            <code>{runbookState?.latestPmFinal?.summary || runbookState?.latestPmFinal?.status || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Next action</span>
+            <code>{runbookState?.nextAction?.label || "None"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Safe to resume</span>
+            <code>{runbookState?.nextAction?.safeToResume ? "yes" : "no"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Artifact folder</span>
+            <code>{runbookState?.runDir || "Not available"}</code>
+          </div>
+        </div>
+        {runbookError ? (
+          <div className="error-banner" role="alert">
+            <TriangleAlert size={18} />
+            <span>{runbookError}</span>
           </div>
         ) : null}
       </div>

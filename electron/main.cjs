@@ -14,6 +14,8 @@ let projectsWriteQueue = Promise.resolve();
 const autonomyQueue = [];
 const autonomyRuns = new Map();
 const managedProcesses = new Map();
+const terminalSessions = new Map();
+const qualityLoops = new Map();
 let autonomyWorkerActive = false;
 let activeRunLock = null;
 const staleRunIds = new Set();
@@ -31,8 +33,21 @@ const PROCESS_REGISTRY_FILE = "processes.json";
 const GUI_QA_DIR_NAME = "gui-qa";
 const GUI_QA_RESULT_FILE = "latest-result.json";
 const GUI_QA_SCREENSHOT_FILE = "latest-screenshot.png";
+const GUI_QA_VERDICT_FILE = "latest-qa-verdict.json";
+const GUI_QA_ROUNDS_DIR_NAME = "rounds";
+const AUTONOMY_RUNBOOK_DIR_NAME = "autonomy";
+const AUTONOMY_RUNS_DIR_NAME = "runs";
+const AUTONOMY_LATEST_RUN_FILE = "latest-run.json";
+const RUNBOOK_FILE = "runbook.json";
+const RUNBOOK_TIMELINE_FILE = "timeline.jsonl";
+const RUNBOOK_LATEST_STATE_FILE = "latest-state.json";
+const RUNBOOK_NEXT_ACTION_FILE = "next-action.json";
+const RUNBOOK_ARTIFACTS_INDEX_FILE = "artifacts-index.json";
+const TERMINAL_DIR_NAME = "terminal";
 const DEFAULT_AUTONOMY_RUNTIME_MS = 8 * 60 * 60 * 1000;
 const MAX_AUTONOMY_RUNTIME_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_MAX_GUI_QA_REPAIR_ATTEMPTS = 2;
+const DEFAULT_MAX_QUALITY_ROUNDS = 3;
 const DEFAULT_GUI_QA_SETTINGS = Object.freeze({
   enabled: false,
   mode: "headless",
@@ -178,10 +193,14 @@ async function loadBackend() {
     getLastResult: orchestrator.getLastResult,
     runPipeline: orchestrator.runPipeline,
     runAgentTest: orchestrator.runAgentTest,
+    runGuiQaReview: orchestrator.runGuiQaReview,
+    runGuiQaDevPatch: orchestrator.runGuiQaDevPatch,
+    runGuiQaPmFinalization: orchestrator.runGuiQaPmFinalization,
     runState,
     artifactLedger,
     verifier,
-    getModelHealth: modelHealth.getModelHealth
+    getModelHealth: modelHealth.getModelHealth,
+    getAgentHealth: modelHealth.getAgentHealth
   };
 }
 
@@ -409,6 +428,21 @@ function registerIpc() {
   ipcMain.handle("autonomy:stop", async (_event, runId = "") =>
     stopAutonomyRun(runId)
   );
+  ipcMain.handle("autonomy:get-latest-runbook", async (_event, payload = {}) =>
+    getLatestRunbook(payload)
+  );
+  ipcMain.handle("autonomy:list-runbooks", async (_event, payload = {}) =>
+    listRunbooks(payload)
+  );
+  ipcMain.handle("autonomy:resume-runbook", async (_event, payload = {}) =>
+    resumeRunbook(payload)
+  );
+  ipcMain.handle("autonomy:open-runbook-folder", async (_event, payload = {}) =>
+    openRunbookFolder(payload)
+  );
+  ipcMain.handle("autonomy:mark-manual-review-complete", async (_event, payload = {}) =>
+    markManualReviewComplete(payload)
+  );
   ipcMain.handle("projects:list", async () => listProjects());
   ipcMain.handle("projects:remove", async (_event, id) => removeTrackedProject(id));
   ipcMain.handle("projects:update", async (_event, payload) => updateTrackedProject(payload?.id, payload));
@@ -435,8 +469,29 @@ function registerIpc() {
   ipcMain.handle("guiQa:check-capability", async (_event, payload = {}) =>
     detectPlaywrightCapability(payload)
   );
+  ipcMain.handle("guiQa:get-latest-result", async (_event, payload = {}) =>
+    getLatestGuiQaResult(payload)
+  );
   ipcMain.handle("guiQa:run-smoke-test", async (_event, payload = {}) =>
     runGuiQaSmokeTest(payload)
+  );
+  ipcMain.handle("qualityLoop:run", async (_event, payload = {}) =>
+    startQualityLoop(payload)
+  );
+  ipcMain.handle("qualityLoop:stop", async (_event, payload = {}) =>
+    stopQualityLoop(payload)
+  );
+  ipcMain.handle("qualityLoop:status", async (_event, payload = {}) =>
+    getQualityLoopStatus(payload)
+  );
+  ipcMain.handle("terminal:run-command", async (_event, payload = {}) =>
+    runTerminalCommand(payload)
+  );
+  ipcMain.handle("terminal:stop-command", async (_event, payload = {}) =>
+    stopTerminalCommand(payload)
+  );
+  ipcMain.handle("terminal:get-history", async (_event, payload = {}) =>
+    getTerminalHistory(payload)
   );
   ipcMain.handle("app:playwright:capability", async (_event, payload = {}) =>
     detectPlaywrightCapability(payload)
@@ -887,6 +942,22 @@ async function startAutonomyRun(payload = {}) {
 
     autonomyRuns.set(runId, task);
     autonomyQueue.push(task);
+    if (task.projectRoot) {
+      await upsertPersistentRunbook(task.projectRoot, {
+        runId,
+        projectName: path.basename(task.projectRoot),
+        mode: "normal_autonomy",
+        status: "running",
+        userGoal: String(payload?.input || ""),
+        currentStage: "queued",
+        currentRound: 0,
+        maxRounds: 3
+      }, {
+        type: "run-created",
+        status: "running",
+        message: "Runbook created for autonomy run."
+      });
+    }
     await persistAutonomyQueueState(task);
     processAutonomyQueue();
     return summarizeAutonomyTask(task);
@@ -924,6 +995,19 @@ async function stopAutonomyRun(runId = "") {
     task.status = "stopping";
   }
   await persistAutonomyQueueState(task);
+  if (task.projectRoot) {
+    await upsertPersistentRunbook(task.projectRoot, {
+      runId: task.runId,
+      mode: "normal_autonomy",
+      status: task.status === "stopping" ? "stopped" : task.status,
+      stopReason: "Stop requested.",
+      currentStage: "stopped"
+    }, {
+      type: "run-stopped",
+      status: task.status,
+      message: "Stop requested."
+    }).catch(() => {});
+  }
   releaseActiveRunLock(task.runId, task.status);
   return summarizeAutonomyTask(task);
 }
@@ -1221,6 +1305,25 @@ async function persistAutonomyQueueState(task, statePatch = {}) {
     stage: statePatch.currentStage || "",
     message: statePatch.currentTask || task.error || ""
   });
+  await upsertPersistentRunbook(task.projectRoot, {
+    runId: task.runId,
+    projectName: path.basename(task.projectRoot),
+    mode: "normal_autonomy",
+    status: mapRunStatus(task.status),
+    userGoal: String(task.payload?.input || ""),
+    currentStage: statePatch.currentStage || "autonomy-runner",
+    currentRound: Number(statePatch.attempt || 0),
+    maxRounds: Number(statePatch.maxAttempts || 3),
+    stopReason: task.stopRequested ? "Stop requested." : "",
+    latestEvidence: {
+      autonomyStatus: task.status,
+      deadlineAt: task.deadlineAt || ""
+    }
+  }, {
+    type: statePatch.currentStage === "autonomy-runner" ? "run-started" : "preflight-result",
+    status: mapRunStatus(task.status),
+    message: statePatch.currentTask || task.error || ""
+  }).catch(() => {});
 }
 
 async function writeAutonomyFinalReport(projectRoot, result, task) {
@@ -3799,6 +3902,1348 @@ async function getGuiQaArtifactPaths(root) {
   };
 }
 
+async function getLatestGuiQaResult(payload = {}) {
+  const root = await normalizeCommandRoot(payload.projectRoot);
+  const { resultPath, screenshotPath } = await getGuiQaArtifactPaths(root);
+  const screenshotExists = await fileExists(screenshotPath);
+
+  try {
+    const raw = await fs.readFile(resultPath, "utf8");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return {
+        status: "error",
+        message: "Stored GUI QA result could not be read.",
+        resultPath,
+        screenshotPath,
+        screenshotExists
+      };
+    }
+
+    const result = parsed && typeof parsed === "object" ? parsed : {};
+    return {
+      status: String(result.status || "not_checked"),
+      checkedAt: typeof result.checkedAt === "string" ? result.checkedAt : "",
+      baseURL: typeof result.baseURL === "string" ? result.baseURL : "",
+      finalUrl: typeof result.finalUrl === "string" ? result.finalUrl : "",
+      title: typeof result.title === "string" ? result.title : "",
+      httpStatus: Number.isInteger(result.httpStatus) ? result.httpStatus : null,
+      bodyTextLength: Number.isFinite(Number(result.bodyTextLength)) ? Math.max(0, Number(result.bodyTextLength)) : 0,
+      consoleErrors: Array.isArray(result.consoleErrors) ? result.consoleErrors.map((item) => String(item || "")) : [],
+      pageErrors: Array.isArray(result.pageErrors) ? result.pageErrors.map((item) => String(item || "")) : [],
+      message: typeof result.message === "string" ? result.message : "",
+      capability: result.capability && typeof result.capability === "object"
+        ? {
+            status: String(result.capability.status || "not_checked"),
+            packageStatus: String(result.capability.packageStatus || "not_checked"),
+            browsersStatus: String(result.capability.browsersStatus || "not_checked"),
+            browser: String(result.capability.browser || "chromium"),
+            checkedAt: typeof result.capability.checkedAt === "string" ? result.capability.checkedAt : "",
+            targetRoot: typeof result.capability.targetRoot === "string" ? result.capability.targetRoot : "",
+            details: typeof result.capability.details === "string" ? result.capability.details : ""
+          }
+        : null,
+      resultPath,
+      screenshotPath,
+      screenshotExists
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return {
+        status: "not_checked",
+        message: "No GUI QA result found for this project yet.",
+        resultPath,
+        screenshotPath,
+        screenshotExists
+      };
+    }
+
+    return {
+      status: "error",
+      message: "Stored GUI QA result could not be read.",
+      resultPath,
+      screenshotPath,
+      screenshotExists
+    };
+  }
+}
+
+async function startQualityLoop(payload = {}) {
+  const projectRoot = await normalizeCommandRoot(payload.projectRoot);
+  const existing = Array.from(qualityLoops.values()).find((task) =>
+    task.projectRoot === projectRoot
+    && !["quality_loop_passed", "quality_loop_failed", "quality_loop_needs_review", "stopped", "gui_qa_failed", "qa_evidence_ready", "gui_qa_skipped_missing_playwright", "blocked_missing_health_url"].includes(String(task.status || "").toLowerCase())
+  );
+  if (existing) {
+    return summarizeQualityLoop(existing);
+  }
+
+  const runId = `quality-${Date.now()}`;
+  const mode = String(payload.mode || "").trim().toLowerCase() === "evidence_only" ? "evidence_only" : "full_ai_loop";
+  const task = {
+    runId,
+    projectRoot,
+    mode,
+    status: "running",
+    stopRequested: false,
+    createdAt: new Date().toISOString(),
+    currentRound: 0,
+    maxRounds: Math.max(1, Number(payload.maxRounds || DEFAULT_MAX_QUALITY_ROUNDS) || DEFAULT_MAX_QUALITY_ROUNDS),
+    maxGuiQaRepairAttempts: Math.max(1, Number(payload.maxGuiQaRepairAttempts || DEFAULT_MAX_GUI_QA_REPAIR_ATTEMPTS) || DEFAULT_MAX_GUI_QA_REPAIR_ATTEMPTS),
+    buildStatus: "idle",
+    devServerUrl: "",
+    playwrightStatus: "not_checked",
+    guiQaStatus: "idle",
+    qaStatus: "idle",
+    qaVerdict: "",
+    devPatchStatus: "idle",
+    finalPmStatus: "idle",
+    message: "Quality loop queued.",
+    latestStopReason: "",
+    lastKnownIssue: "",
+    originalRequest: String(payload.originalRequest || "").trim(),
+    artifactDirPath: path.join(projectRoot, AUTONOMY_DIR_NAME, GUI_QA_DIR_NAME),
+    latestResultPath: "",
+    latestScreenshotPath: "",
+    latestQaVerdictPath: "",
+    previousAttempts: [],
+    repeatedFailures: [],
+    lastFailureSignature: ""
+  };
+  qualityLoops.set(runId, task);
+  await upsertPersistentRunbook(projectRoot, {
+    runId,
+    projectName: path.basename(projectRoot),
+    mode: mode === "evidence_only" ? "evidence_only" : "full_quality_loop",
+    status: "running",
+    userGoal: task.originalRequest,
+    currentStage: "queued",
+    currentRound: 0,
+    maxRounds: task.maxRounds
+  }, {
+    type: "run-created",
+    status: "running",
+    message: "Runbook created for quality loop."
+  });
+  sendQualityLoopProgress(task, { message: "Quality loop started." });
+  void executeQualityLoop(task, payload);
+  return summarizeQualityLoop(task);
+}
+
+async function stopQualityLoop(payload = {}) {
+  const task = qualityLoops.get(String(payload.runId || "").trim());
+  if (!task) {
+    return {
+      runId: String(payload.runId || "").trim(),
+      status: "stopped",
+      latestStopReason: "Stop requested.",
+      message: "Stop requested."
+    };
+  }
+  task.stopRequested = true;
+  task.status = "stopped";
+  task.message = "Stop requested.";
+  task.latestStopReason = "Stop requested.";
+  task.lastKnownIssue = "Stop requested.";
+  task.guiQaStatus = "idle";
+  task.qaStatus = task.qaStatus === "running" ? "idle" : task.qaStatus;
+  task.devPatchStatus = task.devPatchStatus === "dev_patching_gui_issue" ? "idle" : task.devPatchStatus;
+  task.finalPmStatus = task.finalPmStatus === "running" ? "idle" : task.finalPmStatus;
+  await updateAutonomyRunState(task.projectRoot, {
+    status: "stopped",
+    currentStage: "stopped",
+    nextAction: "manual_review",
+    lastError: task.message
+  }).catch(() => {});
+  sendQualityLoopProgress(task, { message: task.message });
+  return summarizeQualityLoop(task);
+}
+
+async function getQualityLoopStatus(payload = {}) {
+  const runId = String(payload.runId || "").trim();
+  if (runId) {
+    return summarizeQualityLoop(qualityLoops.get(runId) || null);
+  }
+
+  const projectRoot = String(payload.projectRoot || "").trim();
+  if (!projectRoot) {
+    return null;
+  }
+  const normalized = await normalizeCommandRoot(projectRoot).catch(() => "");
+  const task = Array.from(qualityLoops.values()).find((entry) => entry.projectRoot === normalized) || null;
+  return summarizeQualityLoop(task);
+}
+
+async function executeQualityLoop(task, payload = {}) {
+  const root = task.projectRoot;
+  const currentSettings = await readSettings().catch(() => ({}));
+  const guiQaSettings = normalizeGuiQaSettings(payload.guiQa || currentSettings.guiQa);
+  const runState = await backend.runState.loadRunState(root).catch(() => null);
+  const reviewData = await readProjectReviewData(root).catch(() => null);
+  const originalRequest = String(payload.originalRequest || runState?.taskInput || "").trim();
+  const pmPlan = trimText(String(reviewData?.finalReport || ""), 2400);
+  const health = await backend.getModelHealth().catch(() => ({}));
+  const qaAvailable = Boolean(health?.supervisor?.online);
+  const devAvailable = Boolean(health?.junior?.online);
+  const pmAvailable = Boolean(health?.architect?.online);
+  task.qaStatus = qaAvailable ? "idle" : "unavailable";
+  task.finalPmStatus = pmAvailable ? "idle" : "unavailable";
+  task.playwrightStatus = "not_checked";
+  task.latestStopReason = "";
+  task.lastKnownIssue = "";
+  await logQualityLoopEvent(task, "quality-loop-start", {
+    qaAvailable,
+    devAvailable,
+    pmAvailable
+  });
+
+  let guiPatchAttempts = 0;
+  const buildFailureSignatures = new Set();
+  const guiFailureSignatures = new Set();
+  const qaIssueSignatures = new Set();
+
+  for (let round = 1; round <= task.maxRounds; round += 1) {
+    if (task.stopRequested) {
+      break;
+    }
+
+    task.currentRound = round;
+    task.message = `Quality round ${round}/${task.maxRounds} started.`;
+    task.buildStatus = "running";
+    task.playwrightStatus = "checking";
+    task.guiQaStatus = "gui_qa_pending";
+    task.qaStatus = qaAvailable ? "idle" : "unavailable";
+    task.qaVerdict = "";
+    task.devPatchStatus = "idle";
+    await logQualityLoopEvent(task, "quality-loop-round-start", {
+      round
+    });
+    sendQualityLoopProgress(task, {
+      status: "gui_qa_pending",
+      message: task.message
+    });
+    await updateAutonomyRunState(root, {
+      status: "gui_qa_pending",
+      currentStage: "gui_qa_pending",
+      attempt: round,
+      maxAttempts: task.maxRounds
+    });
+
+    await logQualityLoopEvent(task, "quality-loop-build-start");
+    const validation = await executeAutomaticProjectSteps(root, "", { project: { requiredFiles: [] }, executor: { applied: [] }, pm: {}, dev: {} }, {
+      skipSetupCommands: false
+    });
+    const buildEvidence = trimText([
+      validation.error || "",
+      validation.validation?.output || "",
+      validation.verification?.summary || ""
+    ].filter(Boolean).join("\n\n"), 6000);
+    task.buildStatus = validation.status;
+    await logQualityLoopEvent(task, "quality-loop-build-result", {
+      buildStatus: validation.status,
+      summary: validation.error || validation.verification?.summary || ""
+    });
+    sendQualityLoopProgress(task, {
+      buildStatus: task.buildStatus,
+      message: validation.status === "passed" ? "Deterministic build verification passed." : (validation.error || "Deterministic verification failed.")
+    });
+    task.lastKnownIssue = validation.status === "passed"
+      ? ""
+      : trimText(validation.error || validation.validation?.output || validation.verification?.summary || "Deterministic verification failed.", 400);
+
+    const roundDir = await ensureGuiQaRoundDir(root, round);
+    if (buildEvidence) {
+      await fs.writeFile(path.join(roundDir, "build-log.txt"), buildEvidence, "utf8");
+    }
+
+    if (validation.status !== "passed" && task.mode !== "evidence_only") {
+      const buildSignature = buildQualityFailureSignature("build", validation);
+      if (buildFailureSignatures.has(buildSignature)) {
+        task.repeatedFailures.push(buildSignature);
+      }
+      buildFailureSignatures.add(buildSignature);
+      task.status = "quality_loop_needs_review";
+      task.latestStopReason = buildFailureSignatures.size > 1
+        ? "Same build error repeated."
+        : "Build failed before GUI QA.";
+      task.message = validation.status === "needs_review"
+        ? "Build evidence is incomplete. Manual review required."
+        : "Build failed. Manual review required.";
+      task.lastKnownIssue = trimText(buildEvidence || task.message, 400);
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "quality_loop_failed",
+        lastValidationStatus: validation.status,
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    await logQualityLoopEvent(task, "quality-loop-run-project-start");
+    const processInfo = await ensureQualityLoopProcess(root);
+    task.devServerUrl = processInfo.healthUrl || "";
+    await logQualityLoopEvent(task, "quality-loop-run-project-result", {
+      processId: processInfo.processId,
+      healthUrl: processInfo.healthUrl || ""
+    });
+    if (!task.devServerUrl) {
+      task.status = "blocked_missing_health_url";
+      task.guiQaStatus = "error";
+      task.latestStopReason = "healthUrl missing.";
+      task.message = "healthUrl missing. Manual review required.";
+      task.lastKnownIssue = "No healthUrl was detected after starting or reusing Run Project.";
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "gui_qa_failed",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+    await logQualityLoopEvent(task, "quality-loop-health-url-detected", {
+      healthUrl: task.devServerUrl
+    });
+
+    const capability = await detectPlaywrightCapability({ projectRoot: root });
+    task.playwrightStatus = capability.status;
+    if (capability.status !== "available") {
+      task.status = "gui_qa_skipped_missing_playwright";
+      task.guiQaStatus = "gui_qa_skipped_missing_playwright";
+      task.latestStopReason = "Playwright missing.";
+      task.message = guiQaSettings.enabled === false
+        ? "GUI QA is disabled. Manual review required."
+        : "Playwright is missing. Install Playwright, then rerun the quality loop.";
+      task.lastKnownIssue = capability.details || task.message;
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "gui_qa_failed",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    task.guiQaStatus = "gui_qa_running";
+    await logQualityLoopEvent(task, "quality-loop-gui-qa-start", {
+      healthUrl: task.devServerUrl
+    });
+    sendQualityLoopProgress(task, { guiQaStatus: task.guiQaStatus, message: "Running Playwright GUI QA." });
+    const guiQaResult = await runGuiQaSmokeTest({
+      projectRoot: root,
+      processId: processInfo.processId,
+      healthUrl: task.devServerUrl,
+      guiQa: {
+        ...guiQaSettings,
+        stopDevServerAfterQa: false
+      }
+    });
+    task.guiQaStatus = guiQaResult.status === "passed" ? "gui_qa_passed" : "gui_qa_failed";
+    task.latestResultPath = guiQaResult.resultPath || "";
+    task.latestScreenshotPath = guiQaResult.screenshotPath || "";
+    await writeGuiQaRoundArtifacts(root, round, guiQaResult);
+    await logQualityLoopEvent(task, "quality-loop-gui-qa-result", {
+      guiQaStatus: task.guiQaStatus,
+      httpStatus: guiQaResult.httpStatus ?? null,
+      resultStatus: guiQaResult.status,
+      screenshotPath: guiQaResult.screenshotPath || ""
+    });
+
+    const guiSignature = buildQualityFailureSignature("gui", guiQaResult);
+    if (guiFailureSignatures.has(guiSignature)) {
+      task.repeatedFailures.push(guiSignature);
+    }
+    guiFailureSignatures.add(guiSignature);
+
+    if (task.mode === "evidence_only") {
+      task.status = guiQaResult.status === "passed" ? "qa_evidence_ready" : "gui_qa_failed";
+      task.latestStopReason = guiQaResult.status === "passed"
+        ? "GUI QA evidence collected."
+        : "GUI QA evidence collected with failures.";
+      task.message = guiQaResult.status === "passed"
+        ? "GUI QA evidence is ready."
+        : (guiQaResult.message || "GUI QA evidence collected with failures.");
+      task.lastKnownIssue = trimText(guiQaResult.message || task.latestStopReason, 400);
+      await updateAutonomyRunState(root, {
+        status: task.status,
+        currentStage: task.guiQaStatus,
+        nextAction: "manual_review"
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    if (!qaAvailable) {
+      task.status = "quality_loop_needs_review";
+      task.qaStatus = "unavailable";
+      task.latestStopReason = "QA unavailable.";
+      task.message = "QA unavailable. GUI QA evidence was collected, but AI repair loop cannot run.";
+      task.lastKnownIssue = trimText(guiQaResult.message || "QA agent is offline or unavailable.", 400);
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "qa_reviewing_gui_evidence",
+        nextAction: "manual_review",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    task.message = "QA reviewing GUI evidence.";
+    task.qaStatus = "running";
+    sendQualityLoopProgress(task, {
+      guiQaStatus: task.guiQaStatus,
+      qaStatus: task.qaStatus,
+      status: "qa_reviewing_gui_evidence",
+      message: task.message
+    });
+
+    await logQualityLoopEvent(task, "quality-loop-qa-start");
+    const qaVerdict = await backend.runGuiQaReview({
+      originalRequest,
+      pmPlan,
+      currentFilesSummary: await buildQualityLoopFileSummary(root),
+      changedFiles: await collectQualityChangedFiles(root),
+      buildEvidence,
+      guiQaResult,
+      screenshotPath: guiQaResult.screenshotPath || "",
+      consoleErrors: guiQaResult.consoleErrors || [],
+      pageErrors: guiQaResult.pageErrors || [],
+      acceptanceCriteria: extractAcceptanceCriteria(reviewData?.finalReport || ""),
+      previousAttempts: task.previousAttempts,
+      repeatedFailures: task.repeatedFailures
+    });
+    await fs.writeFile(path.join(roundDir, "qa-verdict.raw.txt"), String(qaVerdict?.rawOutput || ""), "utf8");
+    if (!qaVerdict?.validFormat) {
+      task.status = "quality_loop_needs_review";
+      task.qaStatus = "invalid_format";
+      task.qaVerdict = "manual_review";
+      task.latestStopReason = "QA returned invalid review format.";
+      task.message = "QA returned invalid review format.";
+      task.lastKnownIssue = trimText(String(qaVerdict?.rawOutput || ""), 400) || task.message;
+      await fs.writeFile(path.join(roundDir, "qa-verdict.json"), JSON.stringify({
+        status: "invalid_format",
+        rawOutput: qaVerdict?.rawOutput || ""
+      }, null, 2), "utf8");
+      await logQualityLoopEvent(task, "quality-loop-qa-result", {
+        validFormat: false,
+        verdict: "manual_review"
+      });
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "qa_reviewing_gui_evidence",
+        nextAction: "manual_review",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    const deterministicVerdict = applyGuiQaDeterministicVerdict(qaVerdict, validation, guiQaResult, task.repeatedFailures);
+    const qaIssueSignature = buildQaIssueSignature(deterministicVerdict);
+    if (qaIssueSignatures.has(qaIssueSignature)) {
+      task.repeatedFailures.push(qaIssueSignature);
+      deterministicVerdict.verdict = "manual_review";
+      deterministicVerdict.summary = "Same QA issue repeated. Manual review required.";
+    }
+    qaIssueSignatures.add(qaIssueSignature);
+    await persistLatestGuiQaVerdict(root, deterministicVerdict);
+    await fs.writeFile(path.join(roundDir, "qa-verdict.json"), JSON.stringify(deterministicVerdict, null, 2), "utf8");
+    await logQualityLoopEvent(task, "quality-loop-qa-result", {
+      validFormat: true,
+      verdict: deterministicVerdict.verdict,
+      summary: deterministicVerdict.summary
+    });
+    task.latestQaVerdictPath = path.join(root, AUTONOMY_DIR_NAME, GUI_QA_DIR_NAME, GUI_QA_VERDICT_FILE);
+    task.qaStatus = "completed";
+    task.qaVerdict = deterministicVerdict.verdict;
+    task.lastKnownIssue = trimText(deterministicVerdict.summary || "", 400);
+    task.previousAttempts.push({
+      round,
+      verdict: deterministicVerdict.verdict,
+      summary: deterministicVerdict.summary
+    });
+
+    if (deterministicVerdict.verdict === "pass") {
+      task.finalPmStatus = pmAvailable ? "running" : "unavailable";
+      if (pmAvailable) {
+        task.status = "quality_loop_passed";
+        await logQualityLoopEvent(task, "quality-loop-finalize-start");
+        const pmFinal = await backend.runGuiQaPmFinalization({
+          originalRequest,
+          pmPlan,
+          qaVerdict: deterministicVerdict,
+          guiQaResult,
+          buildEvidence
+        });
+        task.finalPmStatus = pmFinal.finalStatus === "quality_loop_passed" ? "completed" : "manual_review";
+      } else {
+        task.status = "quality_loop_needs_review";
+      }
+      task.message = task.status === "quality_loop_passed"
+        ? "Quality loop passed."
+        : "PM unavailable. QA passed, but final approval requires manual review.";
+      task.lastKnownIssue = trimText(deterministicVerdict.summary || task.message, 400);
+      await updateAutonomyRunState(root, {
+        status: task.status,
+        currentStage: task.status === "quality_loop_passed" ? "quality_loop_passed" : "quality_loop_needs_review",
+        nextAction: task.status === "quality_loop_passed" ? "finalize" : "manual_review"
+      });
+      await logQualityLoopEvent(task, "quality-loop-finalize-result", {
+        finalPmStatus: task.finalPmStatus,
+        verdict: deterministicVerdict.verdict
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.status === "quality_loop_passed" ? "QA passed." : "PM unavailable after QA pass.",
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    if (deterministicVerdict.verdict === "manual_review") {
+      task.status = "quality_loop_needs_review";
+      task.latestStopReason = deterministicVerdict.summary || "Manual review required.";
+      task.message = deterministicVerdict.summary || "Manual review required.";
+      task.lastKnownIssue = trimText(deterministicVerdict.summary || task.message, 400);
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "quality_loop_needs_review",
+        nextAction: "manual_review",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    guiPatchAttempts += 1;
+    if (guiPatchAttempts > task.maxGuiQaRepairAttempts || task.repeatedFailures.length > 0) {
+      task.status = "quality_loop_needs_review";
+      task.latestStopReason = task.repeatedFailures.length > 0
+        ? `Repeated failure: ${task.repeatedFailures[task.repeatedFailures.length - 1]}`
+        : "Max GUI QA repair attempts reached.";
+      task.message = "GUI QA repair attempts exhausted or repeated failure detected. Recommended manual review.";
+      task.lastKnownIssue = trimText(deterministicVerdict.summary || task.latestStopReason, 400);
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "quality_loop_failed",
+        nextAction: "manual_review",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    if (!devAvailable) {
+      task.status = "quality_loop_needs_review";
+      task.latestStopReason = "DEV unavailable.";
+      task.message = "DEV unavailable. QA evidence was collected, but patches cannot be generated.";
+      task.lastKnownIssue = trimText(deterministicVerdict.summary || "DEV agent is offline or unavailable.", 400);
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "dev_patching_gui_issue",
+        nextAction: "manual_review",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    task.devPatchStatus = "dev_patching_gui_issue";
+    task.message = "DEV patching GUI issue.";
+    await logQualityLoopEvent(task, "quality-loop-dev-patch-start");
+    sendQualityLoopProgress(task, {
+      status: task.devPatchStatus,
+      message: task.message
+    });
+
+    const devPatch = await backend.runGuiQaDevPatch({
+      originalRequest,
+      qaVerdict: deterministicVerdict,
+      guiQaResult,
+      consoleErrors: guiQaResult.consoleErrors || [],
+      pageErrors: guiQaResult.pageErrors || [],
+      screenshotPath: guiQaResult.screenshotPath || "",
+      relevantFileExcerpts: await readRelevantQualityFiles(root, await collectQualityChangedFiles(root)),
+      currentFileTree: await buildQualityLoopFileSummary(root),
+      failedAcceptanceCriteria: deterministicVerdict.requiredFixes || []
+    });
+    await fs.writeFile(path.join(roundDir, "dev-patch.json"), JSON.stringify(devPatch, null, 2), "utf8");
+    await fs.writeFile(path.join(roundDir, "dev-patch.raw.txt"), String(devPatch?.rawOutput || ""), "utf8");
+    if (!devPatch?.validFormat || !Array.isArray(devPatch.fileOperations) || devPatch.fileOperations.length === 0) {
+      task.status = "quality_loop_needs_review";
+      task.devPatchStatus = "failed";
+      task.latestStopReason = "DEV returned no valid file operations.";
+      task.message = "DEV returned no valid file operations.";
+      task.lastKnownIssue = trimText(String(devPatch?.rawOutput || ""), 400) || task.message;
+      await logQualityLoopEvent(task, "quality-loop-dev-patch-result", {
+        validFormat: false,
+        fileOperationCount: Array.isArray(devPatch?.fileOperations) ? devPatch.fileOperations.length : 0
+      });
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "dev_patching_gui_issue",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    const devPatchValidation = validateQualityLoopFileOperations(root, devPatch.fileOperations);
+    if (!devPatchValidation.validFormat) {
+      task.status = "quality_loop_needs_review";
+      task.devPatchStatus = "failed";
+      task.latestStopReason = "DEV returned no valid file operations.";
+      task.message = "DEV returned no valid file operations.";
+      task.lastKnownIssue = devPatchValidation.message;
+      await logQualityLoopEvent(task, "quality-loop-dev-patch-result", {
+        validFormat: false,
+        fileOperationCount: Array.isArray(devPatch?.fileOperations) ? devPatch.fileOperations.length : 0,
+        invalidOperation: devPatchValidation.message
+      });
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "dev_patching_gui_issue",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    if (!devPatchValidation.ok) {
+      task.status = "quality_loop_needs_review";
+      task.devPatchStatus = "failed";
+      task.latestStopReason = "File operation safety violation.";
+      task.message = devPatchValidation.message;
+      task.lastKnownIssue = devPatchValidation.message;
+      await logQualityLoopEvent(task, "quality-loop-dev-patch-result", {
+        validFormat: true,
+        safetyViolation: devPatchValidation.message
+      });
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "dev_patching_gui_issue",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    const patchApply = await applyFileOperationsToExistingProject(root, {
+      project: { rootPath: root },
+      decision: { affectedFiles: devPatch.affectedFiles || [] }
+    }, devPatch.affectedFiles || [], devPatch.fileOperations);
+    if (!Array.isArray(patchApply.applied) || patchApply.applied.length === 0) {
+      task.status = "quality_loop_needs_review";
+      task.devPatchStatus = "failed";
+      task.latestStopReason = "DEV produced no changes.";
+      task.message = "No patch files were applied. Recommended manual review.";
+      task.lastKnownIssue = trimText(devPatch.summary || task.latestStopReason, 400);
+      await logQualityLoopEvent(task, "quality-loop-dev-patch-result", {
+        validFormat: true,
+        fileOperationCount: devPatch.fileOperations.length,
+        appliedCount: 0
+      });
+      await updateAutonomyRunState(root, {
+        status: "quality_loop_needs_review",
+        currentStage: "dev_patching_gui_issue",
+        lastError: task.message
+      });
+      await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+        reason: task.latestStopReason,
+        lastIssue: task.message
+      });
+      sendQualityLoopProgress(task, { status: task.status, message: task.message });
+      break;
+    }
+
+    task.devPatchStatus = "passed";
+    task.message = `DEV patch applied. Continuing to round ${round + 1}.`;
+    task.lastKnownIssue = trimText(devPatch.summary || task.message, 400);
+    await logQualityLoopEvent(task, "quality-loop-files-applied", {
+      appliedFiles: patchApply.applied.map((entry) => entry.path)
+    });
+    await logQualityLoopEvent(task, "quality-loop-dev-patch-result", {
+      validFormat: true,
+      fileOperationCount: devPatch.fileOperations.length,
+      appliedCount: patchApply.applied.length
+    });
+    sendQualityLoopProgress(task, { status: task.devPatchStatus, message: task.message });
+  }
+
+  if (task.stopRequested) {
+    task.status = "stopped";
+    task.latestStopReason = task.latestStopReason || "Stop requested.";
+    task.message = task.message || "Stop requested.";
+    task.lastKnownIssue = task.lastKnownIssue || task.message;
+    task.guiQaStatus = "idle";
+    task.qaStatus = task.qaStatus === "running" ? "idle" : task.qaStatus;
+    task.devPatchStatus = task.devPatchStatus === "dev_patching_gui_issue" ? "idle" : task.devPatchStatus;
+    task.finalPmStatus = task.finalPmStatus === "running" ? "idle" : task.finalPmStatus;
+    await updateAutonomyRunState(root, {
+      status: "stopped",
+      currentStage: "stopped",
+      nextAction: "manual_review",
+      lastError: task.message
+    }).catch(() => {});
+    await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+      reason: task.latestStopReason,
+      lastIssue: task.message
+    });
+    sendQualityLoopProgress(task, { status: task.status, message: task.message });
+  } else if (task.status === "running") {
+    task.status = "quality_loop_failed";
+    task.latestStopReason = "Max rounds reached.";
+    task.message = "Quality loop reached max rounds. Recommended manual review.";
+    task.lastKnownIssue = task.previousAttempts[task.previousAttempts.length - 1]?.summary || task.message;
+    await logQualityLoopEvent(task, "quality-loop-stop-reason", {
+      reason: task.latestStopReason,
+      lastIssue: task.message
+    });
+    sendQualityLoopProgress(task, { status: task.status, message: task.message });
+  }
+
+  qualityLoops.delete(task.runId);
+}
+
+function summarizeQualityLoop(task) {
+  if (!task) {
+    return null;
+  }
+  return {
+    runId: task.runId,
+    projectRoot: task.projectRoot,
+    mode: task.mode,
+    status: task.status,
+    stopRequested: Boolean(task.stopRequested),
+    currentRound: task.currentRound,
+    maxRounds: task.maxRounds,
+    buildStatus: task.buildStatus,
+    devServerUrl: task.devServerUrl,
+    playwrightStatus: task.playwrightStatus,
+    guiQaStatus: task.guiQaStatus,
+    qaStatus: task.qaStatus,
+    qaVerdict: task.qaVerdict,
+    devPatchStatus: task.devPatchStatus,
+    finalPmStatus: task.finalPmStatus,
+    latestStopReason: task.latestStopReason,
+    lastKnownIssue: task.lastKnownIssue,
+    artifactDirPath: task.artifactDirPath,
+    latestResultPath: task.latestResultPath,
+    latestScreenshotPath: task.latestScreenshotPath,
+    latestQaVerdictPath: task.latestQaVerdictPath,
+    message: task.message,
+    previousAttempts: task.previousAttempts
+  };
+}
+
+function sendQualityLoopProgress(task, patch = {}) {
+  Object.assign(task, patch);
+  mainWindow?.webContents?.send("qualityLoop:progress", summarizeQualityLoop(task));
+}
+
+async function logQualityLoopEvent(task, event, extra = {}) {
+  await appendAutonomyLog(task.projectRoot, {
+    type: event,
+    runId: task.runId,
+    round: task.currentRound,
+    mode: task.mode,
+    status: task.status,
+    stopReason: task.latestStopReason || "",
+    ...extra
+  });
+  await syncQualityLoopRunbook(task, event, extra).catch(() => {});
+}
+
+async function ensureQualityLoopProcess(root) {
+  let processes = await refreshProcessRecords(root);
+  let active = processes.find((entry) => ["running", "starting"].includes(entry.status)) || null;
+  if (!active) {
+    await runProjectCommand({
+      projectRoot: root,
+      mode: "run"
+    });
+    processes = await waitForQualityLoopProcess(root);
+    active = processes.find((entry) => ["running", "starting"].includes(entry.status)) || null;
+  } else if (!active.healthUrl) {
+    processes = await waitForQualityLoopProcess(root);
+    active = processes.find((entry) => ["running", "starting"].includes(entry.status)) || active;
+  }
+  return {
+    processId: active?.id || "",
+    healthUrl: active?.healthUrl || ""
+  };
+}
+
+async function waitForQualityLoopProcess(root, timeoutMs = 30000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const processes = await refreshProcessRecords(root);
+    const active = processes.find((entry) => ["running", "starting"].includes(entry.status));
+    if (active?.healthUrl) {
+      return processes;
+    }
+    await delay(1000);
+  }
+  return refreshProcessRecords(root);
+}
+
+async function ensureGuiQaRoundDir(root, round) {
+  const { dir } = await getGuiQaArtifactPaths(root);
+  const roundsDir = path.join(dir, GUI_QA_ROUNDS_DIR_NAME);
+  const roundDir = path.join(roundsDir, `round-${String(round).padStart(3, "0")}`);
+  await fs.mkdir(roundDir, { recursive: true });
+  return roundDir;
+}
+
+async function writeGuiQaRoundArtifacts(root, round, guiQaResult) {
+  const roundDir = await ensureGuiQaRoundDir(root, round);
+  await fs.writeFile(path.join(roundDir, "result.json"), JSON.stringify(guiQaResult || {}, null, 2), "utf8");
+  if (guiQaResult?.screenshotPath && await fileExists(guiQaResult.screenshotPath)) {
+    await fs.copyFile(guiQaResult.screenshotPath, path.join(roundDir, "screenshot.png"));
+  }
+}
+
+async function persistLatestGuiQaVerdict(root, verdict) {
+  const { dir } = await getGuiQaArtifactPaths(root);
+  await fs.writeFile(path.join(dir, GUI_QA_VERDICT_FILE), JSON.stringify(verdict || {}, null, 2), "utf8");
+}
+
+function buildQualityFailureSignature(kind, payload = {}) {
+  return [
+    kind,
+    String(payload?.status || ""),
+    String(payload?.httpStatus || ""),
+    String(payload?.message || payload?.error || ""),
+    String(payload?.bodyTextLength || ""),
+    String((payload?.pageErrors || []).join("|")).slice(0, 400),
+    String((payload?.consoleErrors || []).join("|")).slice(0, 400),
+    String(payload?.validation?.output || "").slice(0, 400)
+  ].join("|");
+}
+
+function buildQaIssueSignature(verdict = {}) {
+  return [
+    String(verdict?.verdict || ""),
+    String(verdict?.summary || "").slice(0, 300),
+    ...((verdict?.issues || []).map((issue) => `${issue.source}:${issue.description}`).slice(0, 6))
+  ].join("|");
+}
+
+function validateQualityLoopFileOperations(root, operations = []) {
+  for (const operation of operations || []) {
+    if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+      return {
+        ok: false,
+        validFormat: false,
+        message: "DEV returned a malformed file operation."
+      };
+    }
+
+    const action = String(operation?.action || "write").trim().toLowerCase();
+    if (action !== "write") {
+      return {
+        ok: false,
+        validFormat: false,
+        message: `DEV returned unsupported file operation action: ${action || "unknown"}`
+      };
+    }
+
+    const relativePath = String(operation?.path || "").trim();
+    if (!relativePath) {
+      return {
+        ok: false,
+        validFormat: false,
+        message: "DEV returned a file operation with no path."
+      };
+    }
+    if (typeof operation?.content !== "string") {
+      return {
+        ok: false,
+        validFormat: false,
+        message: `DEV returned a file operation with invalid content for ${relativePath}`
+      };
+    }
+
+    try {
+      const normalized = relativePath.replaceAll("\\", "/");
+      if (path.isAbsolute(normalized) || normalized.split("/").includes("..")) {
+        throw new Error(`Path escapes the project folder: ${relativePath}`);
+      }
+      const target = path.resolve(root, normalized);
+      const relative = path.relative(root, target);
+      if (relative.startsWith("..") || path.isAbsolute(relative) || !relative) {
+        throw new Error(`Path escapes the project folder: ${relativePath}`);
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        validFormat: true,
+        message: `Blocked file operation outside project root: ${relativePath}`
+      };
+    }
+  }
+
+  return { ok: true, validFormat: true };
+}
+
+function applyGuiQaDeterministicVerdict(qaVerdict, validation, guiQaResult, repeatedFailures = []) {
+  const next = {
+    ...(qaVerdict || {}),
+    issues: Array.isArray(qaVerdict?.issues) ? qaVerdict.issues : [],
+    requiredFixes: Array.isArray(qaVerdict?.requiredFixes) ? qaVerdict.requiredFixes : []
+  };
+  const httpOk = Number.isInteger(guiQaResult?.httpStatus) ? guiQaResult.httpStatus >= 200 && guiQaResult.httpStatus < 300 : true;
+  const pageCrash = Array.isArray(guiQaResult?.pageErrors) && guiQaResult.pageErrors.length > 0;
+  const bodyEmpty = Number(guiQaResult?.bodyTextLength || 0) <= 0;
+  const guiStatus = String(guiQaResult?.status || "").trim().toLowerCase();
+
+  if (validation?.status !== "passed") {
+    next.verdict = "manual_review";
+    next.summary = "Build verification did not pass. Manual review required.";
+  } else if (["failed", "error"].includes(guiStatus) || pageCrash || !httpOk || bodyEmpty) {
+    next.verdict = repeatedFailures.length > 0 ? "manual_review" : "needs_patch";
+    next.summary = pageCrash || !httpOk
+      ? "Playwright found a deterministic blocker."
+      : "GUI smoke test did not pass cleanly.";
+  }
+
+  return next;
+}
+
+async function buildQualityLoopFileSummary(root) {
+  const project = await backend.buildProjectTree(root, { ensureSandboxFolder: false });
+  const files = Array.isArray(project?.files) ? project.files.slice(0, 120).map((file) => file.path) : [];
+  return trimText(files.join("\n"), 2400);
+}
+
+async function collectQualityChangedFiles(root) {
+  const runState = await backend.runState.loadRunState(root).catch(() => null);
+  const ledger = await backend.artifactLedger.loadArtifactLedger(root).catch(() => null);
+  return uniqueStrings([
+    ...(runState?.changedFiles || []),
+    ...((ledger?.filesWritten || []).map((entry) => entry.path).filter(Boolean))
+  ]).slice(0, 30);
+}
+
+async function readRelevantQualityFiles(root, paths = []) {
+  const excerpts = [];
+  for (const relPath of (paths || []).slice(0, 8)) {
+    try {
+      const absPath = resolveProjectRelativePath(root, relPath);
+      const raw = await fs.readFile(absPath, "utf8");
+      excerpts.push(`FILE: ${relPath}\n${trimText(raw, 1200)}`);
+    } catch {}
+  }
+  return excerpts.join("\n\n");
+}
+
+function extractAcceptanceCriteria(reportText = "") {
+  const text = String(reportText || "");
+  const matches = text.match(/^- .+/gm) || [];
+  return matches.slice(0, 12).map((line) => line.replace(/^- /, "").trim()).filter(Boolean);
+}
+
+async function runTerminalCommand(payload = {}) {
+  const root = await normalizeCommandRoot(payload.projectRoot);
+  const command = normalizeSuggestedCommand(payload.command);
+  if (!command) {
+    throw new Error("Command is empty.");
+  }
+
+  const terminalDir = await ensureTerminalDir(root);
+  const validation = validateTerminalCommand(command, root);
+  if (!validation.allowed) {
+    const blockedSession = await createTerminalSessionRecord({
+      root,
+      terminalDir,
+      command,
+      status: "blocked",
+      exitCode: null,
+      outputPreview: "Command blocked by safety policy.",
+      warning: validation.warning || "",
+      note: validation.note || "",
+      blockedReason: validation.reason || "Command blocked by safety policy."
+    });
+    return {
+      session: blockedSession,
+      message: "Command blocked by safety policy."
+    };
+  }
+
+  const session = await createTerminalSessionRecord({
+    root,
+    terminalDir,
+    command,
+    status: "running",
+    exitCode: null,
+    outputPreview: "",
+    warning: validation.warning || "",
+    note: validation.note || ""
+  });
+  const stdoutPath = path.join(root, session.stdoutLog);
+  const stderrPath = path.join(root, session.stderrLog);
+  const spawnSpec = buildTerminalSpawnSpec(command);
+
+  let child;
+  try {
+    child = spawn(spawnSpec.executable, spawnSpec.args, {
+      cwd: root,
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch (error) {
+    session.status = "failed";
+    session.finishedAt = new Date().toISOString();
+    session.outputPreview = trimText(error?.message || "Could not start command.", 8000);
+    session.exitCode = 1;
+    await persistTerminalSession(root, session);
+    return {
+      session,
+      message: session.outputPreview
+    };
+  }
+
+  session.pid = child.pid || 0;
+  await persistTerminalSession(root, session);
+  terminalSessions.set(session.sessionId, {
+    root,
+    child,
+    session,
+    outputPreview: ""
+  });
+
+  const appendChunk = async (targetPath, chunk, streamKey) => {
+    const text = chunk.toString();
+    await fs.appendFile(targetPath, text, "utf8");
+    const active = terminalSessions.get(session.sessionId);
+    if (!active) {
+      return;
+    }
+    active.outputPreview = trimText(`${active.outputPreview || ""}${text}`, 8000);
+    active.session.outputPreview = active.outputPreview;
+    active.session[streamKey] = session[streamKey];
+    await persistTerminalSession(root, active.session);
+  };
+
+  child.stdout?.on("data", (chunk) => {
+    void appendChunk(stdoutPath, chunk, "stdoutLog");
+  });
+  child.stderr?.on("data", (chunk) => {
+    void appendChunk(stderrPath, chunk, "stderrLog");
+  });
+  child.on("error", (error) => {
+    void finalizeTerminalSession(session.sessionId, {
+      status: "failed",
+      exitCode: 1,
+      appendedText: error?.message || "Terminal command failed to start."
+    });
+  });
+  child.on("close", (exitCode) => {
+    void finalizeTerminalSession(session.sessionId, {
+      status: exitCode === 0 ? "passed" : "failed",
+      exitCode: Number.isInteger(exitCode) ? exitCode : 0
+    });
+  });
+
+  return {
+    session,
+    message: validation.warning || validation.note || ""
+  };
+}
+
+async function stopTerminalCommand(payload = {}) {
+  const root = await normalizeCommandRoot(payload.projectRoot);
+  const sessionId = String(payload.sessionId || "").trim();
+  if (!sessionId) {
+    throw new Error("Terminal session id is missing.");
+  }
+
+  const active = terminalSessions.get(sessionId);
+  if (!active || active.root !== root) {
+    const existing = await readTerminalSession(root, sessionId);
+    if (!existing) {
+      throw new Error("Terminal session was not found.");
+    }
+    return existing;
+  }
+
+  active.session.status = "stopped";
+  active.session.finishedAt = new Date().toISOString();
+  await persistTerminalSession(root, active.session);
+  await terminateProcessTree(active.child?.pid || active.session.pid || 0);
+  return finalizeTerminalSession(sessionId, {
+    status: "stopped",
+    exitCode: active.session.exitCode
+  });
+}
+
+async function getTerminalHistory(payload = {}) {
+  const root = await normalizeCommandRoot(payload.projectRoot);
+  const terminalDir = await ensureTerminalDir(root);
+  const entries = await fs.readdir(terminalDir, { withFileTypes: true }).catch(() => []);
+  const sessionFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => path.join(terminalDir, entry.name));
+
+  const sessions = (await Promise.all(sessionFiles.map((filePath) => readJsonFile(filePath, null))))
+    .filter(Boolean)
+    .sort((left, right) => String(right.startedAt || "").localeCompare(String(left.startedAt || "")));
+
+  const history = await Promise.all(sessions.map(async (session) => {
+    const stdoutPath = path.join(root, session.stdoutLog || "");
+    const stderrPath = path.join(root, session.stderrLog || "");
+    const [stdout, stderr] = await Promise.all([
+      readTextIfExists(stdoutPath),
+      readTextIfExists(stderrPath)
+    ]);
+    return {
+      ...session,
+      output: trimText([stdout, stderr].filter(Boolean).join("\n"), 16000)
+    };
+  }));
+
+  return {
+    projectRoot: root,
+    sessions: history
+  };
+}
+
+function validateTerminalCommand(command, root) {
+  const normalized = normalizeSuggestedCommand(command);
+  if (!normalized) {
+    return {
+      allowed: false,
+      reason: "Command blocked by safety policy."
+    };
+  }
+
+  const lower = normalized.toLowerCase();
+  if (/[|;&<>`$]/.test(normalized)) {
+    return {
+      allowed: false,
+      reason: "Command blocked by safety policy."
+    };
+  }
+  const blockedPatterns = [
+    /\brm\s+-rf\b/i,
+    /\bdel\s+\/s\b/i,
+    /\bformat\b/i,
+    /\bshutdown\b/i,
+    /\breg\s+delete\b/i,
+    /\btaskkill\s+\/f\s+\/im\s+\*/i,
+    /\brd\s+\/s\b/i,
+    /\brmdir\s+\/s\b/i
+  ];
+  if (blockedPatterns.some((pattern) => pattern.test(lower))) {
+    return {
+      allowed: false,
+      reason: "Command blocked by safety policy."
+    };
+  }
+
+  const parts = splitCommand(normalized);
+  const [bin, first, second, third] = parts;
+  const allowed =
+    (bin === "npm" && (
+      first === "install"
+      || first === "--version"
+      || first === "-v"
+      || (first === "run" && ["build", "dev", "preview", "test"].includes(second))
+      || (first === "exec" && Boolean(second))
+    )) ||
+    (bin === "npx" && first === "playwright" && (
+      (second === "install" && third === "chromium")
+      || second === "test"
+    ));
+
+  if (!allowed) {
+    return {
+      allowed: false,
+      reason: "Command blocked by safety policy."
+    };
+  }
+
+  for (const arg of parts.slice(1)) {
+    if (arg.includes("..") || path.isAbsolute(arg)) {
+      return {
+        allowed: false,
+        reason: "Command blocked by safety policy."
+      };
+    }
+  }
+
+  const response = {
+    allowed: true,
+    reason: "",
+    warning: "",
+    note: ""
+  };
+  if (bin === "npm" && first === "run" && second === "dev") {
+    response.note = "For dev servers, Run Project is recommended because it detects healthUrl for Open App and GUI QA.";
+  }
+  if ((bin === "npm" && first === "install" && parts.includes("@playwright/test"))
+    || (bin === "npx" && first === "playwright" && second === "install" && third === "chromium")) {
+    response.warning = "After installation, run GUI QA capability check again.";
+  }
+
+  return response;
+}
+
+function buildTerminalSpawnSpec(commandText) {
+  if (process.platform === "win32") {
+    return {
+      executable: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", commandText]
+    };
+  }
+
+  return {
+    executable: "sh",
+    args: ["-lc", commandText]
+  };
+}
+
+async function createTerminalSessionRecord({
+  root,
+  terminalDir,
+  command,
+  status,
+  exitCode,
+  outputPreview,
+  warning = "",
+  note = "",
+  blockedReason = ""
+}) {
+  const sessionId = `term-${Date.now()}`;
+  const startedAt = new Date().toISOString();
+  const stdoutPath = path.join(terminalDir, `${sessionId}.stdout.log`);
+  const stderrPath = path.join(terminalDir, `${sessionId}.stderr.log`);
+  await fs.writeFile(stdoutPath, "", "utf8");
+  await fs.writeFile(stderrPath, "", "utf8");
+  const session = {
+    sessionId,
+    pid: 0,
+    command,
+    cwd: root,
+    status,
+    exitCode,
+    startedAt,
+    finishedAt: status === "running" ? "" : startedAt,
+    stdoutLog: toProjectRelativePath(root, stdoutPath),
+    stderrLog: toProjectRelativePath(root, stderrPath),
+    outputPreview: trimText(outputPreview || "", 8000),
+    warning,
+    note,
+    blockedReason
+  };
+  await persistTerminalSession(root, session);
+  return session;
+}
+
+async function finalizeTerminalSession(sessionId, patch = {}) {
+  const active = terminalSessions.get(sessionId);
+  if (!active) {
+    return null;
+  }
+
+  const session = active.session;
+  session.status = patch.status || session.status || "failed";
+  session.exitCode = patch.exitCode ?? session.exitCode ?? null;
+  session.finishedAt = new Date().toISOString();
+  if (patch.appendedText) {
+    active.outputPreview = trimText(`${active.outputPreview || ""}${patch.appendedText}`, 8000);
+  }
+  session.outputPreview = trimText(active.outputPreview || session.outputPreview || "", 8000);
+  await persistTerminalSession(active.root, session);
+  terminalSessions.delete(sessionId);
+  return session;
+}
+
+async function ensureTerminalDir(root) {
+  const ledgerDir = await initializeAutonomyLedger(root);
+  const dir = path.join(ledgerDir, TERMINAL_DIR_NAME);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+async function persistTerminalSession(root, session) {
+  const terminalDir = await ensureTerminalDir(root);
+  const filePath = path.join(terminalDir, `${session.sessionId}.json`);
+  await writeJsonFile(filePath, session);
+}
+
+async function readTerminalSession(root, sessionId) {
+  const terminalDir = await ensureTerminalDir(root);
+  return readJsonFile(path.join(terminalDir, `${sessionId}.json`), null);
+}
+
+async function readTextIfExists(filePath) {
+  if (!filePath) {
+    return "";
+  }
+
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return "";
+    }
+    throw error;
+  }
+}
+
 function collectReviewLogEntries(raw, runId = "") {
   const entries = String(raw || "")
     .split(/\r?\n/)
@@ -3930,6 +5375,15 @@ async function fileExists(targetPath) {
   try {
     const stat = await fs.stat(targetPath);
     return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
   } catch {
     return false;
   }
@@ -4103,6 +5557,624 @@ function appendProjectLog(logs, entry) {
       ...entry
     }
   ].slice(-80);
+}
+
+async function ensureAutonomyRunbookRoot(rootPath) {
+  const root = await normalizeExistingProjectRoot(rootPath);
+  const baseDir = path.join(root, AUTONOMY_DIR_NAME, AUTONOMY_RUNBOOK_DIR_NAME);
+  const runsDir = path.join(baseDir, AUTONOMY_RUNS_DIR_NAME);
+  await fs.mkdir(runsDir, { recursive: true });
+  return { root, baseDir, runsDir };
+}
+
+function buildDefaultRunbook(root, payload = {}) {
+  const now = new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    runId: String(payload.runId || ""),
+    projectRoot: root,
+    projectName: String(payload.projectName || path.basename(root)),
+    mode: String(payload.mode || "normal_autonomy"),
+    status: String(payload.status || "idle"),
+    createdAt: payload.createdAt || now,
+    updatedAt: now,
+    userGoal: String(payload.userGoal || ""),
+    currentStage: String(payload.currentStage || "idle"),
+    currentRound: Number(payload.currentRound || 0),
+    maxRounds: Number(payload.maxRounds || 3),
+    models: {
+      pm: {
+        available: Boolean(payload.models?.pm?.available),
+        model: String(payload.models?.pm?.model || ""),
+        endpoint: String(payload.models?.pm?.endpoint || "")
+      },
+      dev: {
+        available: Boolean(payload.models?.dev?.available),
+        model: String(payload.models?.dev?.model || ""),
+        endpoint: String(payload.models?.dev?.endpoint || "")
+      },
+      qa: {
+        available: Boolean(payload.models?.qa?.available),
+        model: String(payload.models?.qa?.model || ""),
+        endpoint: String(payload.models?.qa?.endpoint || "")
+      }
+    },
+    stages: Array.isArray(payload.stages) ? payload.stages : [],
+    latestEvidence: payload.latestEvidence && typeof payload.latestEvidence === "object" ? payload.latestEvidence : {},
+    latestQaVerdict: payload.latestQaVerdict ?? null,
+    latestDevPatch: payload.latestDevPatch ?? null,
+    latestPmFinal: payload.latestPmFinal ?? null,
+    stopReason: String(payload.stopReason || ""),
+    nextAction: normalizeRunbookNextAction(payload.nextAction)
+  };
+}
+
+function normalizeRunbookNextAction(value = {}) {
+  const action = value && typeof value === "object" ? value : {};
+  return {
+    type: String(action.type || "none"),
+    label: String(action.label || ""),
+    safeToResume: Boolean(action.safeToResume),
+    requiresUser: Boolean(action.requiresUser),
+    requiresModels: Array.isArray(action.requiresModels) ? action.requiresModels.map((item) => String(item || "").trim()).filter(Boolean) : [],
+    suggestedCommands: Array.isArray(action.suggestedCommands) ? action.suggestedCommands.map((item) => String(item || "").trim()).filter(Boolean) : []
+  };
+}
+
+function normalizeRunbookStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (["queued", "running", "stopping"].includes(normalized)) return "running";
+  if (["stopped"].includes(normalized)) return "stopped";
+  if (["completed", "quality_loop_passed", "qa_evidence_ready"].includes(normalized)) return "completed";
+  if (["needs_review", "quality_loop_needs_review", "blocked_missing_health_url", "gui_qa_skipped_missing_playwright", "gui_qa_failed"].includes(normalized)) return "needs_review";
+  if (["failed", "quality_loop_failed", "timed_out"].includes(normalized)) return "failed";
+  return normalized || "idle";
+}
+
+async function getRunbookPaths(rootPath, runId) {
+  const { root, baseDir, runsDir } = await ensureAutonomyRunbookRoot(rootPath);
+  const safeRunId = String(runId || "").trim();
+  if (!safeRunId) {
+    throw new Error("Runbook runId is missing.");
+  }
+  const runDir = path.join(runsDir, safeRunId);
+  return {
+    root,
+    baseDir,
+    runsDir,
+    runDir,
+    latestRunPath: path.join(baseDir, AUTONOMY_LATEST_RUN_FILE),
+    runbookPath: path.join(runDir, RUNBOOK_FILE),
+    timelinePath: path.join(runDir, RUNBOOK_TIMELINE_FILE),
+    latestStatePath: path.join(runDir, RUNBOOK_LATEST_STATE_FILE),
+    nextActionPath: path.join(runDir, RUNBOOK_NEXT_ACTION_FILE),
+    artifactsIndexPath: path.join(runDir, RUNBOOK_ARTIFACTS_INDEX_FILE)
+  };
+}
+
+async function loadRunbook(rootPath, runId) {
+  const paths = await getRunbookPaths(rootPath, runId);
+  const runbook = await readJsonFile(paths.runbookPath, null);
+  return runbook && typeof runbook === "object" ? runbook : null;
+}
+
+function deriveRunbookNextAction(runbook = {}) {
+  const mode = String(runbook.mode || "");
+  const status = String(runbook.status || "").toLowerCase();
+  const stopReason = String(runbook.stopReason || "").toLowerCase();
+  const evidence = runbook.latestEvidence || {};
+  const models = runbook.models || {};
+  const qaVerdict = String(runbook.latestQaVerdict?.verdict || "").toLowerCase();
+
+  if (String(evidence.playwrightStatus || "").toLowerCase() === "package_missing" || String(evidence.playwrightStatus || "").toLowerCase() === "browsers_missing") {
+    return normalizeRunbookNextAction({
+      type: "install_playwright",
+      label: "Install Playwright and Chromium",
+      safeToResume: false,
+      requiresUser: true,
+      suggestedCommands: [
+        "npm install -D @playwright/test",
+        "npx playwright install chromium"
+      ]
+    });
+  }
+
+  if (stopReason.includes("healthurl") || !String(evidence.healthUrl || "").trim()) {
+    return normalizeRunbookNextAction({
+      type: "start_project",
+      label: "Start the project dev server",
+      safeToResume: true,
+      requiresUser: false
+    });
+  }
+
+  if (status === "stopped" || stopReason.includes("stop requested")) {
+    return normalizeRunbookNextAction({
+      type: mode === "evidence_only" ? "resume_gui_qa_only" : "resume_quality_loop",
+      label: mode === "evidence_only" ? "Resume GUI QA Only" : "Resume Quality Loop",
+      safeToResume: true,
+      requiresUser: true
+    });
+  }
+
+  if (status === "quality_loop_needs_review" && !models.qa?.available && mode === "full_quality_loop") {
+    return normalizeRunbookNextAction({
+      type: "manual_review",
+      label: "QA unavailable. Review GUI QA evidence manually.",
+      safeToResume: false,
+      requiresUser: true,
+      requiresModels: ["qa"]
+    });
+  }
+
+  if (qaVerdict === "needs_patch" && !models.dev?.available) {
+    return normalizeRunbookNextAction({
+      type: "resume_dev_patch",
+      label: "Resume DEV patch from latest QA verdict.",
+      safeToResume: true,
+      requiresUser: false,
+      requiresModels: ["dev"]
+    });
+  }
+
+  if (qaVerdict === "pass" && !models.pm?.available) {
+    return normalizeRunbookNextAction({
+      type: "resume_pm_finalize",
+      label: "Resume PM finalization when PM is available.",
+      safeToResume: true,
+      requiresUser: false,
+      requiresModels: ["pm"]
+    });
+  }
+
+  if (status === "qa_evidence_ready") {
+    return normalizeRunbookNextAction({
+      type: "manual_review",
+      label: "GUI QA evidence is ready for manual review.",
+      safeToResume: false,
+      requiresUser: true
+    });
+  }
+
+  if (status === "completed" || status === "quality_loop_passed") {
+    return normalizeRunbookNextAction({
+      type: "none",
+      label: "No further action required.",
+      safeToResume: false,
+      requiresUser: false
+    });
+  }
+
+  if (status === "running") {
+    return normalizeRunbookNextAction({
+      type: "none",
+      label: "Run in progress.",
+      safeToResume: false,
+      requiresUser: false
+    });
+  }
+
+  return normalizeRunbookNextAction({
+    type: mode === "evidence_only" ? "resume_gui_qa_only" : "resume_quality_loop",
+    label: mode === "evidence_only" ? "Resume GUI QA Only" : "Resume Quality Loop",
+    safeToResume: true,
+    requiresUser: false
+  });
+}
+
+function toRunbookEventType(event) {
+  const map = {
+    "quality-loop-start": "run-started",
+    "quality-loop-round-start": "preflight-started",
+    "quality-loop-build-start": "build-started",
+    "quality-loop-build-result": "build-passed",
+    "quality-loop-run-project-start": "dev-server-started",
+    "quality-loop-run-project-result": "dev-server-started",
+    "quality-loop-health-url-detected": "health-url-detected",
+    "quality-loop-gui-qa-start": "gui-qa-started",
+    "quality-loop-gui-qa-result": "gui-qa-passed",
+    "quality-loop-qa-start": "qa-review-started",
+    "quality-loop-qa-result": "qa-review-passed",
+    "quality-loop-dev-patch-start": "dev-patch-started",
+    "quality-loop-dev-patch-result": "dev-patch-applied",
+    "quality-loop-finalize-start": "pm-finalize-started",
+    "quality-loop-finalize-result": "pm-finalize-completed",
+    "quality-loop-stop-reason": "manual-review-required"
+  };
+  return map[event] || event;
+}
+
+function createRunbookStageSnapshot(runbook, eventType, message = "") {
+  const stages = Array.isArray(runbook.stages) ? runbook.stages : [];
+  const nextStage = {
+    at: new Date().toISOString(),
+    name: String(runbook.currentStage || eventType || "idle"),
+    status: String(runbook.status || "idle"),
+    message: String(message || "")
+  };
+  return [...stages, nextStage].slice(-60);
+}
+
+async function writeRunbookFiles(paths, runbook, timelineEntry = null, latestState = null, nextAction = null, artifactsIndex = null) {
+  await fs.mkdir(paths.runDir, { recursive: true });
+  await writeJsonFile(paths.runbookPath, runbook);
+  await writeJsonFile(paths.latestStatePath, latestState || {
+    runId: runbook.runId,
+    status: runbook.status,
+    currentStage: runbook.currentStage,
+    currentRound: runbook.currentRound,
+    stopReason: runbook.stopReason,
+    nextAction: runbook.nextAction,
+    updatedAt: runbook.updatedAt
+  });
+  await writeJsonFile(paths.nextActionPath, nextAction || runbook.nextAction);
+  await writeJsonFile(paths.artifactsIndexPath, artifactsIndex || {});
+  if (timelineEntry) {
+    await fs.appendFile(paths.timelinePath, `${JSON.stringify(timelineEntry)}\n`, "utf8");
+  } else {
+    await ensureFile(paths.timelinePath, "");
+  }
+  await writeJsonFile(paths.latestRunPath, {
+    runId: runbook.runId,
+    projectRoot: runbook.projectRoot,
+    projectName: runbook.projectName,
+    status: runbook.status,
+    mode: runbook.mode,
+    updatedAt: runbook.updatedAt,
+    runDir: paths.runDir
+  });
+}
+
+async function buildRunbookArtifactsIndex(rootPath, runbook = {}) {
+  const root = await normalizeExistingProjectRoot(rootPath);
+  const { dir: guiQaDir } = await getGuiQaArtifactPaths(root);
+  const reviewData = await readProjectReviewData(root).catch(() => null);
+  const latestResultPath = String(runbook.latestEvidence?.guiQaResultPath || "");
+  const latestScreenshotPath = String(runbook.latestEvidence?.guiQaScreenshotPath || "");
+  const latestQaVerdictPath = String(runbook.latestEvidence?.qaVerdictPath || "");
+  const roundResults = await collectRunbookRoundArtifacts(guiQaDir);
+  const candidatePaths = [
+    path.join(root, AUTONOMY_DIR_NAME, "final-report.md"),
+    latestResultPath,
+    latestScreenshotPath,
+    latestQaVerdictPath,
+    String(runbook.latestEvidence?.buildLogPath || "")
+  ].filter(Boolean);
+  const existingArtifacts = [];
+  for (const candidate of candidatePaths) {
+    const exists = await pathExists(candidate);
+    if (exists) {
+      existingArtifacts.push(candidate);
+    }
+  }
+  return {
+    runId: runbook.runId,
+    projectRoot: root,
+    finalReport: await pathExists(path.join(root, AUTONOMY_DIR_NAME, "final-report.md")) ? path.join(root, AUTONOMY_DIR_NAME, "final-report.md") : "",
+    guiQaLatestResult: latestResultPath,
+    guiQaScreenshot: latestScreenshotPath,
+    roundResultFiles: roundResults,
+    qaVerdicts: uniqueStrings([latestQaVerdictPath, ...(roundResults.filter((item) => item.endsWith("qa-verdict.json")))]),
+    devPatches: roundResults.filter((item) => item.endsWith("dev-patch.json")),
+    buildLogs: roundResults.filter((item) => item.endsWith("build-log.txt")),
+    processLogs: (reviewData?.runLogExcerpts || []).length > 0 ? [path.join(root, AUTONOMY_DIR_NAME, RUN_LOG_FILE)] : [],
+    exportedReviewData: [],
+    allExistingArtifacts: uniqueStrings(existingArtifacts.concat(roundResults))
+  };
+}
+
+async function collectRunbookRoundArtifacts(guiQaDir) {
+  const roundsDir = path.join(guiQaDir, GUI_QA_ROUNDS_DIR_NAME);
+  try {
+    const roundEntries = await fs.readdir(roundsDir, { withFileTypes: true });
+    const artifacts = [];
+    for (const roundEntry of roundEntries) {
+      if (!roundEntry.isDirectory()) {
+        continue;
+      }
+      const roundDir = path.join(roundsDir, roundEntry.name);
+      const files = await fs.readdir(roundDir, { withFileTypes: true });
+      for (const file of files) {
+        if (file.isFile()) {
+          artifacts.push(path.join(roundDir, file.name));
+        }
+      }
+    }
+    return artifacts;
+  } catch {
+    return [];
+  }
+}
+
+async function upsertPersistentRunbook(rootPath, runbookPatch = {}, event = null) {
+  const root = await normalizeExistingProjectRoot(rootPath);
+  const runId = String(runbookPatch.runId || "").trim();
+  if (!runId) {
+    throw new Error("Runbook runId is missing.");
+  }
+  const paths = await getRunbookPaths(root, runId);
+  const existing = await readJsonFile(paths.runbookPath, null);
+  const next = {
+    ...(existing || buildDefaultRunbook(root, runbookPatch)),
+    ...stripUndefined(runbookPatch),
+    projectRoot: root,
+    projectName: runbookPatch.projectName || existing?.projectName || path.basename(root),
+    status: normalizeRunbookStatus(runbookPatch.status ?? existing?.status ?? "idle"),
+    models: {
+      pm: {
+        ...(existing?.models?.pm || {}),
+        ...(runbookPatch.models?.pm || {})
+      },
+      dev: {
+        ...(existing?.models?.dev || {}),
+        ...(runbookPatch.models?.dev || {})
+      },
+      qa: {
+        ...(existing?.models?.qa || {}),
+        ...(runbookPatch.models?.qa || {})
+      }
+    },
+    latestEvidence: {
+      ...(existing?.latestEvidence || {}),
+      ...(runbookPatch.latestEvidence || {})
+    },
+    updatedAt: new Date().toISOString()
+  };
+  next.stages = event ? createRunbookStageSnapshot(next, event.type, event.message || "") : (Array.isArray(next.stages) ? next.stages : []);
+  next.nextAction = deriveRunbookNextAction(next);
+  const artifactsIndex = await buildRunbookArtifactsIndex(root, next);
+  const timelineEntry = event ? {
+    at: new Date().toISOString(),
+    runId: next.runId,
+    round: Number(next.currentRound || 0),
+    type: String(event.type || "error"),
+    status: String(event.status || next.status || "idle"),
+    message: String(event.message || ""),
+    data: event.data && typeof event.data === "object" ? event.data : {}
+  } : null;
+  await writeRunbookFiles(paths, next, timelineEntry, null, next.nextAction, artifactsIndex);
+  return {
+    ...next,
+    artifactIndexPath: paths.artifactsIndexPath,
+    nextActionPath: paths.nextActionPath,
+    latestStatePath: paths.latestStatePath,
+    timelinePath: paths.timelinePath,
+    runDir: paths.runDir
+  };
+}
+
+async function getLatestRunbook(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const { baseDir } = await ensureAutonomyRunbookRoot(root);
+  const latest = await readJsonFile(path.join(baseDir, AUTONOMY_LATEST_RUN_FILE), null);
+  if (!latest?.runId) {
+    return null;
+  }
+  const runbook = await loadRunbook(root, latest.runId);
+  if (!runbook) {
+    return null;
+  }
+  const paths = await getRunbookPaths(root, latest.runId);
+  const nextAction = await readJsonFile(paths.nextActionPath, runbook.nextAction || normalizeRunbookNextAction());
+  const artifactsIndex = await readJsonFile(paths.artifactsIndexPath, {});
+  return {
+    ...runbook,
+    nextAction: normalizeRunbookNextAction(nextAction),
+    artifactsIndex,
+    runDir: paths.runDir
+  };
+}
+
+async function listRunbooks(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const { runsDir } = await ensureAutonomyRunbookRoot(root);
+  const entries = await fs.readdir(runsDir, { withFileTypes: true }).catch(() => []);
+  const runbooks = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const runbook = await readJsonFile(path.join(runsDir, entry.name, RUNBOOK_FILE), null);
+    if (runbook?.runId) {
+      runbooks.push({
+        runId: runbook.runId,
+        status: runbook.status,
+        mode: runbook.mode,
+        currentStage: runbook.currentStage,
+        updatedAt: runbook.updatedAt,
+        stopReason: runbook.stopReason || "",
+        runDir: path.join(runsDir, entry.name)
+      });
+    }
+  }
+  return runbooks.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+}
+
+async function openRunbookFolder(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const targetRunId = String(payload.runId || "").trim();
+  if (targetRunId) {
+    const paths = await getRunbookPaths(root, targetRunId);
+    const result = await shell.openPath(paths.runDir);
+    return result === "";
+  }
+  const latest = await getLatestRunbook({ projectRoot: root });
+  if (!latest?.runId) {
+    return false;
+  }
+  const paths = await getRunbookPaths(root, latest.runId);
+  const result = await shell.openPath(paths.runDir);
+  return result === "";
+}
+
+async function markManualReviewComplete(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const latest = payload.runId ? await loadRunbook(root, payload.runId) : await getLatestRunbook({ projectRoot: root });
+  if (!latest?.runId) {
+    return null;
+  }
+  return upsertPersistentRunbook(root, {
+    runId: latest.runId,
+    status: "completed",
+    stopReason: "",
+    currentStage: "manual_review_completed"
+  }, {
+    type: "manual-review-completed",
+    status: "completed",
+    message: "Manual review marked complete."
+  });
+}
+
+async function resumeRunbook(payload = {}) {
+  const root = await normalizeExistingProjectRoot(payload.projectRoot);
+  const latest = payload.runId ? await loadRunbook(root, payload.runId) : await getLatestRunbook({ projectRoot: root });
+  if (!latest?.runId) {
+    throw new Error("No runbook available to resume.");
+  }
+  const action = normalizeRunbookNextAction(latest.nextAction || deriveRunbookNextAction(latest));
+  const reviewData = await readProjectReviewData(root).catch(() => null);
+  const originalRequest = String(latest.userGoal || reviewData?.runState?.taskInput || "").trim();
+  const missingModels = (action.requiresModels || []).filter((modelName) => latest.models?.[modelName]?.available === false);
+
+  await upsertPersistentRunbook(root, {
+    runId: latest.runId,
+    status: "running",
+    currentStage: "resume_requested",
+    stopReason: ""
+  }, {
+    type: "run-resumed",
+    status: "running",
+    message: action.label || "Runbook resume requested.",
+    data: { nextActionType: action.type }
+  });
+
+  if (!action.safeToResume) {
+    return {
+      resumed: false,
+      blocked: true,
+      runId: latest.runId,
+      nextAction: action,
+      message: action.label || "Runbook cannot be resumed automatically."
+    };
+  }
+
+  if (missingModels.length > 0) {
+    return {
+      resumed: false,
+      blocked: true,
+      runId: latest.runId,
+      nextAction: action,
+      message: `${action.label || "Resume blocked."} Missing models: ${missingModels.join(", ")}.`
+    };
+  }
+
+  if (["resume_gui_qa_only", "resume_quality_loop", "resume_dev_patch", "resume_pm_finalize", "start_project"].includes(action.type)) {
+    const mode = latest.mode === "evidence_only" ? "evidence_only" : "full_ai_loop";
+    const state = await startQualityLoop({
+      projectRoot: root,
+      mode,
+      originalRequest
+    });
+    return {
+      resumed: true,
+      runId: state?.runId || latest.runId,
+      nextAction: action,
+      state
+    };
+  }
+
+  return {
+    resumed: false,
+    blocked: true,
+    runId: latest.runId,
+    nextAction: action,
+    message: action.label || "Resume requires manual action."
+  };
+}
+
+async function syncQualityLoopRunbook(task, event, extra = {}) {
+  const health = await backend.getModelHealth().catch(() => ({}));
+  const eventType = toRunbookEventType(event);
+  let mappedType = eventType;
+  if (event === "quality-loop-build-result" && String(extra.buildStatus || "").toLowerCase() !== "passed") {
+    mappedType = "build-failed";
+  }
+  if (event === "quality-loop-gui-qa-result" && String(extra.resultStatus || "").toLowerCase() !== "passed") {
+    mappedType = "gui-qa-failed";
+  }
+  if (event === "quality-loop-qa-result") {
+    mappedType = extra.validFormat === false
+      ? "qa-review-invalid"
+      : String(extra.verdict || "").toLowerCase() === "needs_patch"
+        ? "qa-review-needs-patch"
+        : String(extra.verdict || "").toLowerCase() === "pass"
+          ? "qa-review-passed"
+          : "manual-review-required";
+  }
+  if (event === "quality-loop-dev-patch-result") {
+    mappedType = extra.validFormat === false ? "dev-patch-invalid" : "dev-patch-applied";
+  }
+  if (event === "quality-loop-stop-reason" && String(extra.reason || "").toLowerCase().includes("repeated failure")) {
+    mappedType = "repeated-failure-detected";
+  }
+  if (event === "quality-loop-stop-reason" && String(extra.reason || "").toLowerCase().includes("max rounds")) {
+    mappedType = "max-rounds-reached";
+  }
+
+  return upsertPersistentRunbook(task.projectRoot, {
+    runId: task.runId,
+    projectName: path.basename(task.projectRoot),
+    mode: task.mode === "evidence_only" ? "evidence_only" : "full_quality_loop",
+    status: task.status,
+    userGoal: String(task.originalRequest || ""),
+    currentStage: task.guiQaStatus || task.qaStatus || task.devPatchStatus || task.status,
+    currentRound: Number(task.currentRound || 0),
+    maxRounds: Number(task.maxRounds || DEFAULT_MAX_QUALITY_ROUNDS),
+    models: {
+      pm: {
+        available: Boolean(health?.architect?.online),
+        model: String(health?.architect?.model || ""),
+        endpoint: String(health?.architect?.endpoint || "")
+      },
+      dev: {
+        available: Boolean(health?.junior?.online),
+        model: String(health?.junior?.model || ""),
+        endpoint: String(health?.junior?.endpoint || "")
+      },
+      qa: {
+        available: Boolean(health?.supervisor?.online),
+        model: String(health?.supervisor?.model || ""),
+        endpoint: String(health?.supervisor?.endpoint || "")
+      }
+    },
+    latestEvidence: {
+      healthUrl: task.devServerUrl || "",
+      guiQaResultPath: task.latestResultPath || "",
+      guiQaScreenshotPath: task.latestScreenshotPath || "",
+      qaVerdictPath: task.latestQaVerdictPath || "",
+      buildLogPath: Number(task.currentRound || 0) > 0 ? path.join(task.artifactDirPath, GUI_QA_ROUNDS_DIR_NAME, `round-${String(task.currentRound).padStart(3, "0")}`, "build-log.txt") : "",
+      playwrightStatus: task.playwrightStatus || ""
+    },
+    latestQaVerdict: task.qaVerdict ? {
+      verdict: task.qaVerdict,
+      path: task.latestQaVerdictPath || "",
+      summary: task.lastKnownIssue || ""
+    } : null,
+    latestDevPatch: task.devPatchStatus && task.devPatchStatus !== "idle" ? {
+      status: task.devPatchStatus,
+      summary: task.lastKnownIssue || ""
+    } : null,
+    latestPmFinal: task.finalPmStatus && task.finalPmStatus !== "idle" ? {
+      status: task.finalPmStatus,
+      summary: task.message || ""
+    } : null,
+    stopReason: task.latestStopReason || ""
+  }, {
+    type: mappedType,
+    status: task.status,
+    message: task.message || extra.summary || extra.reason || "",
+    data: extra
+  });
 }
 
 async function initializeAutonomyLedger(rootPath, statePatch = {}) {

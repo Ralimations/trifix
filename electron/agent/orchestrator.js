@@ -67,6 +67,73 @@ export async function runAgentTest(payload) {
   };
 }
 
+export async function runGuiQaReview(payload = {}, onRequestStatus = null) {
+  const input = buildGuiQaReviewEvidence(payload);
+  const output = await callAgentWithBrain({
+    agent: AGENTS.supervisor,
+    systemPrompt: buildGuiQaReviewSystemPrompt(),
+    input,
+    brainSeed: [
+      payload?.originalRequest,
+      payload?.pmPlan,
+      JSON.stringify(payload?.guiQaResult || {})
+    ].filter(Boolean).join("\n\n"),
+    onRequestStatus
+  });
+  const parsed = extractJsonObject(output);
+  const normalized = normalizeGuiQaVerdict(parsed || {}, output);
+  return {
+    ...normalized,
+    rawOutput: output,
+    validFormat: isValidGuiQaVerdictShape(parsed)
+  };
+}
+
+export async function runGuiQaDevPatch(payload = {}, onRequestStatus = null) {
+  const input = buildGuiQaDevPatchEvidence(payload);
+  const output = await callAgentWithBrain({
+    agent: AGENTS.junior,
+    systemPrompt: buildGuiQaDevPatchSystemPrompt(),
+    input,
+    brainSeed: [
+      payload?.originalRequest,
+      JSON.stringify(payload?.qaVerdict || {}),
+      JSON.stringify(payload?.guiQaResult || {})
+    ].filter(Boolean).join("\n\n"),
+    onRequestStatus
+  });
+  const parsed = parseLeadOutput(String(output || ""), [], normalizePmArchitecture(null, payload?.originalRequest || "", null, ""));
+  return {
+    rawOutput: output,
+    summary: parsed.summary || "",
+    fileOperations: parsed.fileOperations || [],
+    commandRequests: parsed.commandRequests || [],
+    affectedFiles: parsed.affectedFiles || [],
+    validFormat: Array.isArray(parsed.fileOperations) && parsed.fileOperations.length > 0
+  };
+}
+
+export async function runGuiQaPmFinalization(payload = {}, onRequestStatus = null) {
+  const input = buildGuiQaPmFinalizationEvidence(payload);
+  const output = await callAgentWithBrain({
+    agent: AGENTS.architect,
+    systemPrompt: buildGuiQaPmFinalizationSystemPrompt(),
+    input,
+    brainSeed: [
+      payload?.originalRequest,
+      payload?.pmPlan,
+      JSON.stringify(payload?.qaVerdict || {})
+    ].filter(Boolean).join("\n\n"),
+    onRequestStatus
+  });
+  const parsed = extractJsonObject(output) || {};
+  return {
+    summary: String(parsed.summary || "").trim() || trimForPrompt(output, 1200),
+    finalStatus: String(parsed.finalStatus || "").trim().toLowerCase() || "manual_review",
+    rawOutput: output
+  };
+}
+
 export async function runPipeline(payload, emitProgress = () => {}) {
   const input = String(payload?.input || "").trim();
   const language = String(payload?.language || "auto");
@@ -3247,6 +3314,124 @@ function buildPmDecisionContext({ compactContext, prd, pmPlan, qaInstructions, d
       "- concise change",
       "RECOMMENDATION:"
     ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildGuiQaReviewSystemPrompt() {
+  return [
+    "You are Senior Dev / QA reviewing deterministic GUI QA evidence.",
+    "Be evidence-first and conservative.",
+    "You must not pass if build failed, the app did not load, HTTP status is not 2xx, body text is empty, page errors exist, or the Playwright result status is failed/error.",
+    "Output strict JSON only.",
+    "{",
+    '  "verdict": "pass" | "needs_patch" | "manual_review",',
+    '  "summary": "...",',
+    '  "issues": [{"severity":"low|medium|high","source":"build|playwright|screenshot|console|acceptance","description":"...","suggestedFix":"..."}],',
+    '  "requiredFixes": ["..."],',
+    '  "confidence": 0.0',
+    "}"
+  ].join("\n");
+}
+
+function buildGuiQaReviewEvidence(payload = {}) {
+  return [
+    `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2500)}`,
+    payload?.pmPlan ? `PM_PLAN:\n${trimForPrompt(payload.pmPlan, 1800)}` : "",
+    payload?.acceptanceCriteria?.length ? `ACCEPTANCE_CRITERIA:\n${payload.acceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
+    payload?.currentFilesSummary ? `CURRENT_FILES_SUMMARY:\n${trimForPrompt(payload.currentFilesSummary, 2000)}` : "",
+    payload?.changedFiles?.length ? `CHANGED_FILES:\n${payload.changedFiles.map((item) => `- ${item}`).join("\n")}` : "",
+    payload?.buildEvidence ? `BUILD_EVIDENCE:\n${trimForPrompt(payload.buildEvidence, 2200)}` : "",
+    `GUI_QA_RESULT_JSON:\n${JSON.stringify(payload?.guiQaResult || {}, null, 2)}`,
+    payload?.screenshotPath ? `SCREENSHOT_PATH:\n${payload.screenshotPath}` : "",
+    payload?.previousAttempts?.length ? `PREVIOUS_ATTEMPTS:\n${JSON.stringify(payload.previousAttempts, null, 2).slice(0, 1800)}` : "",
+    payload?.repeatedFailures?.length ? `REPEATED_FAILURES:\n${payload.repeatedFailures.join("\n")}` : "",
+    [
+      "Decide whether GUI bugs exist.",
+      "If deterministic blockers exist, do not pass.",
+      "Prefer manual_review when evidence is insufficient or the same failure repeats."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+function normalizeGuiQaVerdict(parsed, rawOutput) {
+  const verdict = String(parsed?.verdict || "").trim().toLowerCase();
+  return {
+    verdict: ["pass", "needs_patch", "manual_review"].includes(verdict) ? verdict : "manual_review",
+    summary: String(parsed?.summary || trimForPrompt(rawOutput, 1000) || "GUI QA review completed.").trim(),
+    issues: Array.isArray(parsed?.issues)
+      ? parsed.issues.map((issue) => ({
+          severity: ["low", "medium", "high"].includes(String(issue?.severity || "").trim().toLowerCase()) ? String(issue.severity).trim().toLowerCase() : "medium",
+          source: ["build", "playwright", "screenshot", "console", "acceptance"].includes(String(issue?.source || "").trim().toLowerCase()) ? String(issue.source).trim().toLowerCase() : "playwright",
+          description: String(issue?.description || "").trim(),
+          suggestedFix: String(issue?.suggestedFix || "").trim()
+        })).filter((issue) => issue.description)
+      : [],
+    requiredFixes: Array.isArray(parsed?.requiredFixes) ? parsed.requiredFixes.map((item) => String(item || "").trim()).filter(Boolean) : [],
+    confidence: Number.isFinite(Number(parsed?.confidence)) ? Math.max(0, Math.min(1, Number(parsed.confidence))) : 0
+  };
+}
+
+function isValidGuiQaVerdictShape(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return false;
+  }
+
+  const verdict = String(parsed.verdict || "").trim().toLowerCase();
+  if (!["pass", "needs_patch", "manual_review"].includes(verdict)) {
+    return false;
+  }
+  if (typeof parsed.summary !== "string") {
+    return false;
+  }
+  if (!Array.isArray(parsed.issues) || !Array.isArray(parsed.requiredFixes)) {
+    return false;
+  }
+  if (!Number.isFinite(Number(parsed.confidence))) {
+    return false;
+  }
+  return true;
+}
+
+function buildGuiQaDevPatchSystemPrompt() {
+  return [
+    "You are Junior Dev applying the smallest patch needed to fix GUI QA issues.",
+    "Patch only necessary files.",
+    "Do not output advice-only text.",
+    "Do not include shell commands unless explicitly needed through commandRequests.",
+    "Return JSON only with top-level keys summary, fileOperations, and commandRequests."
+  ].join("\n");
+}
+
+function buildGuiQaDevPatchEvidence(payload = {}) {
+  return [
+    `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2200)}`,
+    `QA_VERDICT_JSON:\n${JSON.stringify(payload?.qaVerdict || {}, null, 2)}`,
+    `GUI_QA_RESULT_JSON:\n${JSON.stringify(payload?.guiQaResult || {}, null, 2)}`,
+    payload?.failedAcceptanceCriteria?.length ? `FAILED_ACCEPTANCE_CRITERIA:\n${payload.failedAcceptanceCriteria.map((item) => `- ${item}`).join("\n")}` : "",
+    payload?.relevantFileExcerpts ? `RELEVANT_FILE_EXCERPTS:\n${trimForPrompt(payload.relevantFileExcerpts, 3200)}` : "",
+    payload?.currentFileTree ? `CURRENT_FILE_TREE:\n${trimForPrompt(payload.currentFileTree, 1800)}` : "",
+    payload?.screenshotPath ? `SCREENSHOT_PATH:\n${payload.screenshotPath}` : "",
+    "Return machine-readable fileOperations only for changed files."
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildGuiQaPmFinalizationSystemPrompt() {
+  return [
+    "You are Supervisor / PM finalizing a GUI QA quality loop outcome.",
+    "Do not override deterministic failures.",
+    "Output strict JSON only with keys summary and finalStatus.",
+    'finalStatus must be one of "quality_loop_passed" or "quality_loop_needs_review".'
+  ].join("\n");
+}
+
+function buildGuiQaPmFinalizationEvidence(payload = {}) {
+  return [
+    `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2000)}`,
+    payload?.pmPlan ? `PM_PLAN:\n${trimForPrompt(payload.pmPlan, 1600)}` : "",
+    `QA_VERDICT_JSON:\n${JSON.stringify(payload?.qaVerdict || {}, null, 2)}`,
+    payload?.guiQaResult ? `GUI_QA_RESULT_JSON:\n${JSON.stringify(payload.guiQaResult, null, 2)}` : "",
+    payload?.buildEvidence ? `BUILD_EVIDENCE:\n${trimForPrompt(payload.buildEvidence, 1800)}` : "",
+    "Summarize the final outcome without optimism beyond the evidence."
   ].filter(Boolean).join("\n\n");
 }
 

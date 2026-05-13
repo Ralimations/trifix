@@ -22,6 +22,11 @@ contextBridge.exposeInMainWorld("trifix", {
   startAutonomyRun: (payload) => ipcRenderer.invoke("autonomy:start", payload),
   getAutonomyStatus: (runId) => ipcRenderer.invoke("autonomy:status", runId),
   stopAutonomyRun: (runId) => ipcRenderer.invoke("autonomy:stop", runId),
+  getLatestRunbook: (payload) => ipcRenderer.invoke("autonomy:get-latest-runbook", payload),
+  listRunbooks: (payload) => ipcRenderer.invoke("autonomy:list-runbooks", payload),
+  resumeRunbook: (payload) => ipcRenderer.invoke("autonomy:resume-runbook", payload),
+  openRunbookFolder: (payload) => ipcRenderer.invoke("autonomy:open-runbook-folder", payload),
+  markManualReviewComplete: (payload) => ipcRenderer.invoke("autonomy:mark-manual-review-complete", payload),
   testAgent: (payload) => ipcRenderer.invoke("pipeline:test-agent", payload),
   getLastResult: () => ipcRenderer.invoke("pipeline:last"),
   getSettings: () => ipcRenderer.invoke("app:settings"),
@@ -29,7 +34,14 @@ contextBridge.exposeInMainWorld("trifix", {
   saveDialogue: (dialogue) => ipcRenderer.invoke("app:dialogue:save", dialogue),
   saveGuiQaSettings: (payload) => ipcRenderer.invoke("app:gui-qa:save", payload),
   checkGuiQaCapability: (payload) => ipcRenderer.invoke("guiQa:check-capability", payload),
+  getLatestGuiQaResult: (payload) => ipcRenderer.invoke("guiQa:get-latest-result", payload),
   runGuiSmokeTest: (payload) => ipcRenderer.invoke("guiQa:run-smoke-test", payload),
+  runQualityLoop: (payload) => ipcRenderer.invoke("qualityLoop:run", payload),
+  stopQualityLoop: (payload) => ipcRenderer.invoke("qualityLoop:stop", payload),
+  getQualityLoopStatus: (payload) => ipcRenderer.invoke("qualityLoop:status", payload),
+  runTerminalCommand: (payload) => ipcRenderer.invoke("terminal:run-command", payload),
+  stopTerminalCommand: (payload) => ipcRenderer.invoke("terminal:stop-command", payload),
+  getTerminalHistory: (payload) => ipcRenderer.invoke("terminal:get-history", payload),
   checkPlaywrightCapability: (payload) => ipcRenderer.invoke("app:playwright:capability", payload),
   listProjects: () => ipcRenderer.invoke("projects:list"),
   removeProject: (id) => ipcRenderer.invoke("projects:remove", id),
@@ -49,5 +61,10 @@ contextBridge.exposeInMainWorld("trifix", {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("autonomy:progress", listener);
     return () => ipcRenderer.removeListener("autonomy:progress", listener);
+  },
+  onQualityLoopProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("qualityLoop:progress", listener);
+    return () => ipcRenderer.removeListener("qualityLoop:progress", listener);
   }
 });
