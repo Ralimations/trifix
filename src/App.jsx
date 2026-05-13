@@ -1196,14 +1196,24 @@ export function App() {
   }
 
   function requestNavigation(action, options = {}) {
+    const targetView = String(options.targetView || "").trim().toLowerCase();
     const hideWorkspace = options.hideWorkspace !== false;
     const targetProjectRoot = String(options.targetProjectRoot || "").trim();
     const activeRoot = String(activeWorkSummary?.projectRoot || "").trim();
+    const currentProjectRoot = String(project?.rootPath || resultProject?.rootPath || "").trim();
+    const safeInternalView = ["office", "reports", "commands", "settings", "logs"].includes(targetView);
+    const sameProjectWorkspaceNavigation = safeInternalView
+      && Boolean(currentProjectRoot)
+      && Boolean(activeRoot)
+      && currentProjectRoot === activeRoot;
     const returningToActiveProject = Boolean(options.opensWorkspace) && Boolean(targetProjectRoot) && Boolean(activeRoot) && targetProjectRoot === activeRoot;
     const switchingAwayFromActiveProject = Boolean(targetProjectRoot)
       && Boolean(activeRoot)
       && targetProjectRoot !== activeRoot;
-    const shouldGuard = hasActiveWork && !returningToActiveProject && (hideWorkspace || switchingAwayFromActiveProject);
+    const shouldGuard = hasActiveWork
+      && !sameProjectWorkspaceNavigation
+      && !returningToActiveProject
+      && (hideWorkspace || switchingAwayFromActiveProject);
     if (!shouldGuard) {
       action?.();
       return;
@@ -3040,31 +3050,31 @@ export function App() {
               active={activeView === "landing"}
               icon={<Plus size={18} />}
               label="Home"
-              onClick={() => requestNavigation(() => navigateDirect("landing"), { hideWorkspace: true })}
+              onClick={() => requestNavigation(() => navigateDirect("landing"), { targetView: "landing", hideWorkspace: true })}
             />
             <SidebarButton
               active={activeView === "office"}
               icon={<BriefcaseBusiness size={18} />}
               label="Workspace"
-              onClick={() => requestNavigation(() => navigateDirect("office"), { hideWorkspace: false })}
+              onClick={() => requestNavigation(() => navigateDirect("office"), { targetView: "office", hideWorkspace: false })}
             />
             <SidebarButton
               active={activeView === "reports"}
               icon={<History size={18} />}
               label="Reports"
-              onClick={() => requestNavigation(() => navigateDirect("reports"), { hideWorkspace: true })}
+              onClick={() => requestNavigation(() => navigateDirect("reports"), { targetView: "reports", hideWorkspace: false })}
             />
             <SidebarButton
               active={activeView === "commands"}
               icon={<Code2 size={18} />}
               label="Commands"
-              onClick={() => requestNavigation(() => navigateDirect("commands"), { hideWorkspace: true })}
+              onClick={() => requestNavigation(() => navigateDirect("commands"), { targetView: "commands", hideWorkspace: false })}
             />
             <SidebarButton
               active={activeView === "settings"}
               icon={<Settings size={18} />}
               label="Settings"
-              onClick={() => requestNavigation(() => navigateDirect("settings"), { hideWorkspace: true })}
+              onClick={() => requestNavigation(() => navigateDirect("settings"), { targetView: "settings", hideWorkspace: false })}
             />
           </nav>
 
