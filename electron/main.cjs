@@ -11,6 +11,7 @@ let mainWindow = null;
 let backend = null;
 let settingsFilePath = null;
 let projectsFilePath = null;
+let activeWorkPointerFilePath = null;
 let projectsWriteQueue = Promise.resolve();
 const autonomyQueue = [];
 const autonomyRuns = new Map();
@@ -89,6 +90,7 @@ const DEFAULT_AGENT_TOOL_POLICY = Object.freeze({
   requireApprovalBeforeDependencyInstall: true,
   requireApprovalBeforeTerminalCommand: true
 });
+const ACTIVE_WORK_POINTER_FILE = "active-work-pointer.json";
 
 function logRunLock(event, payload = {}) {
   logStartupError(event, JSON.stringify(payload));
@@ -167,6 +169,7 @@ app.whenReady().then(async () => {
   logStartupError("timeout-policy", JSON.stringify(backend.TIMEOUT_POLICY || {}));
   settingsFilePath = path.join(app.getPath("userData"), "trifix-settings.json");
   projectsFilePath = path.join(app.getPath("userData"), "trifix-projects.json");
+  activeWorkPointerFilePath = path.join(app.getPath("userData"), ACTIVE_WORK_POINTER_FILE);
   registerIpc();
   await createWindow();
 
@@ -480,6 +483,13 @@ function registerIpc() {
   ipcMain.handle("projects:list", async () => listProjects());
   ipcMain.handle("projects:remove", async (_event, id) => removeTrackedProject(id));
   ipcMain.handle("projects:update", async (_event, payload) => updateTrackedProject(payload?.id, payload));
+  ipcMain.handle("activeWork:get", async () => getActiveWorkState());
+  ipcMain.handle("activeWork:stop", async (_event, payload = {}) =>
+    stopActiveWork(payload)
+  );
+  ipcMain.handle("activeWork:archive", async (_event, payload = {}) =>
+    archiveRecoveryItem(payload)
+  );
 
   ipcMain.handle("app:settings", async () => buildAppSettings());
   ipcMain.handle("app:model-health", async () => backend.getModelHealth());
@@ -609,6 +619,16 @@ function registerIpc() {
         logs: existingTrackedEntry?.logs || [],
         commandHistory: existingTrackedEntry?.commandHistory || []
       });
+      await persistActiveWorkPointer({
+        projectRoot: payload?.projectRoot || "",
+        projectName: payload?.projectName || path.basename(payload?.projectRoot || "TriFix Task"),
+        runId,
+        type: "generation",
+        status: "running",
+        message: "Generation run started.",
+        returnView: "workspace",
+        source: "pipeline:start"
+      }).catch(() => {});
       if (payload?.projectRoot) {
         await initializeAutonomyLedger(payload.projectRoot, {
           runId,
@@ -677,6 +697,16 @@ function registerIpc() {
               requestStatus: progress.requestStatus?.displayText || ""
             });
           }
+          void persistActiveWorkPointer({
+            projectRoot: progressRoot || payload?.projectRoot || "",
+            projectName: payload?.projectName || path.basename(progressRoot || payload?.projectRoot || "TriFix Task"),
+            runId,
+            type: "generation",
+            status: "running",
+            message: progress.requestStatus?.displayText || progress.stage || progress.agent || "Generation in progress.",
+            returnView: "workspace",
+            source: "pipeline:progress"
+          }).catch(() => {});
           void updateTrackedProject(trackedEntry?.id, {
             status: "In progress",
             loopCount: Number(progress?.partialResult?.workflow?.loopCount ?? payload?.loopCount ?? 0),
@@ -857,6 +887,16 @@ function registerIpc() {
           projectId: activeTrackedEntry?.id || ""
         }
       };
+      await persistActiveWorkPointer({
+        projectRoot: generatedProject.rootPath,
+        projectName: generatedProject.projectName || path.basename(generatedProject.rootPath),
+        runId,
+        type: "generation",
+        status: "running",
+        message: "Generated project created. Review state is updating.",
+        returnView: "workspace",
+        source: "pipeline:generated-project"
+      }).catch(() => {});
       event.sender.send("pipeline:progress", {
         runId: payload?.runId,
         agent: "junior",
@@ -922,9 +962,31 @@ function registerIpc() {
         changedFiles,
         summary: result?.decision?.summary || ""
       });
+      await persistActiveWorkPointer({
+        projectRoot: resultRoot,
+        projectName: result?.project?.projectName || path.basename(resultRoot),
+        runId,
+        type: "generation",
+        status: "needs_review",
+        message: result?.decision?.summary || "Generation finished. Review is ready.",
+        returnView: "workspace",
+        source: "pipeline:complete"
+      }).catch(() => {});
     }
 
       return result;
+    } catch (error) {
+      await persistActiveWorkPointer({
+        projectRoot: payload?.projectRoot || "",
+        projectName: payload?.projectName || path.basename(payload?.projectRoot || "TriFix Task"),
+        runId,
+        type: "generation",
+        status: "failed",
+        message: error?.message || "Generation run failed.",
+        returnView: "workspace",
+        source: "pipeline:error"
+      }).catch(() => {});
+      throw error;
     } finally {
       releaseActiveRunLock(runId, "pipeline:run terminal");
     }
@@ -1041,6 +1103,16 @@ async function startAutonomyRun(payload = {}) {
         message: "Runbook created for autonomy run."
       });
     }
+    await persistActiveWorkPointer({
+      projectRoot: task.projectRoot,
+      projectName: payload?.projectName || path.basename(task.projectRoot || "TriFix Task"),
+      runId,
+      type: "autonomy",
+      status: "queued",
+      message: "Autonomy run queued.",
+      returnView: "workspace",
+      source: "autonomy:start"
+    }).catch(() => {});
     await persistAutonomyQueueState(task);
     processAutonomyQueue();
     return summarizeAutonomyTask(task);
@@ -1091,6 +1163,16 @@ async function stopAutonomyRun(runId = "") {
       message: "Stop requested."
     }).catch(() => {});
   }
+  await persistActiveWorkPointer({
+    projectRoot: task.projectRoot,
+    projectName: task.payload?.projectName || path.basename(task.projectRoot || "TriFix Task"),
+    runId: task.runId,
+    type: "autonomy",
+    status: task.status === "stopping" ? "stopped" : task.status,
+    message: "Stop requested.",
+    returnView: "workspace",
+    source: "autonomy:stop"
+  }).catch(() => {});
   releaseActiveRunLock(task.runId, task.status);
   return summarizeAutonomyTask(task);
 }
@@ -1410,6 +1492,16 @@ async function persistAutonomyQueueState(task, statePatch = {}) {
     type: statePatch.currentStage === "autonomy-runner" ? "run-started" : "preflight-result",
     status: mapRunStatus(task.status),
     message: statePatch.currentTask || task.error || ""
+  }).catch(() => {});
+  await persistActiveWorkPointer({
+    projectRoot: task.projectRoot,
+    projectName: task.payload?.projectName || path.basename(task.projectRoot),
+    runId: task.runId,
+    type: "autonomy",
+    status: mapRunStatus(task.status),
+    message: statePatch.currentTask || task.error || "",
+    returnView: "workspace",
+    source: "autonomy-state"
   }).catch(() => {});
 }
 
@@ -2037,6 +2129,18 @@ async function startManagedProjectProcess(root, command, startedAt = new Date().
   });
   await persistProcessRecord(root, record);
   await syncActiveProcessState(root);
+  if (["running", "starting"].includes(String(record.status || "").toLowerCase())) {
+    await persistActiveWorkPointer({
+      projectRoot: root,
+      projectName: path.basename(root),
+      runId: record.id,
+      type: "managed_process",
+      status: record.status,
+      message: record.healthUrl || `Managed process running: ${record.command}`,
+      returnView: "workspace",
+      source: "project-command"
+    }).catch(() => {});
+  }
   return { ...record };
 }
 
@@ -2080,6 +2184,16 @@ async function stopManagedProjectProcess(payload = {}) {
     pid,
     command: record.command
   });
+  await persistActiveWorkPointer({
+    projectRoot: root,
+    projectName: path.basename(root),
+    runId: processId,
+    type: "managed_process",
+    status: "stopped",
+    message: `${record.command || "Managed process"} stopped.`,
+    returnView: "workspace",
+    source: "project-process-stop"
+  }).catch(() => {});
 
   return stoppedRecord;
 }
@@ -4525,6 +4639,16 @@ async function runDesignPolishPass(payload = {}) {
   if (!healthUrl) {
     throw new Error("healthUrl is required for Design Polish Pass.");
   }
+  const persistDesignPolishPointer = (status, message) => persistActiveWorkPointer({
+    projectRoot: root,
+    projectName: path.basename(root),
+    runId: String(payload.runId || "").trim(),
+    type: "design_polish",
+    status,
+    message,
+    returnView: "workspace",
+    source: "design-polish"
+  }).catch(() => {});
   const agentToolPolicy = await getAgentToolPolicy();
   const toolRunbook = await ensureAgentToolRunbook(root, payload.runId || "");
   const inputs = await resolveUiQualityInputs(root, payload);
@@ -4540,6 +4664,7 @@ async function runDesignPolishPass(payload = {}) {
     });
   }
   await appendDesignRunbookEvent(root, "design-polish-started", "Design polish pass started.");
+  await persistDesignPolishPointer("running", "Design polish pass started.");
   let latestQuality = await runUiQualityCheck({
     projectRoot: root,
     healthUrl,
@@ -4558,6 +4683,7 @@ async function runDesignPolishPass(payload = {}) {
       message: "QA unavailable. UI quality evidence is ready for manual review."
     });
     await appendDesignRunbookEvent(root, "design-polish-needs-review", "QA unavailable. UI quality evidence is ready for manual review.");
+    await persistDesignPolishPointer("needs_manual_review", "QA unavailable. UI quality evidence is ready for manual review.");
     return getLatestUiQuality({ projectRoot: root });
   }
 
@@ -4597,6 +4723,7 @@ async function runDesignPolishPass(payload = {}) {
         message: "QA returned invalid design review format."
       });
       await appendDesignRunbookEvent(root, "design-polish-needs-review", "QA returned invalid design review format.");
+      await persistDesignPolishPointer("needs_manual_review", "QA returned invalid design review format.");
       return getLatestUiQuality({ projectRoot: root });
     }
     const qaToolResults = await executeAgentToolRequestsBatch({
@@ -4622,6 +4749,7 @@ async function runDesignPolishPass(payload = {}) {
         status: "needs_manual_review",
         message: "Agent tool approval is required before design polish can continue."
       });
+      await persistDesignPolishPointer("needs_manual_review", "Agent tool approval is required before design polish can continue.");
       return getLatestUiQuality({ projectRoot: root });
     }
     verdict = convertDesignQaVerdict(qaOutput.parsed, qaOutput.rawOutput);
@@ -4645,6 +4773,7 @@ async function runDesignPolishPass(payload = {}) {
         message: verdict.summary
       });
       await appendDesignRunbookEvent(root, verdict.verdict === "pass" ? "design-polish-passed" : "design-polish-needs-review", verdict.summary || "Design polish finished.");
+      await persistDesignPolishPointer(verdict.verdict === "pass" ? "passed" : "needs_manual_review", verdict.summary || "Design polish finished.");
       return getLatestUiQuality({ projectRoot: root });
     }
 
@@ -4656,6 +4785,7 @@ async function runDesignPolishPass(payload = {}) {
         message: "DEV unavailable. Design patch cannot be generated."
       });
       await appendDesignRunbookEvent(root, "design-polish-needs-review", "DEV unavailable. Design patch cannot be generated.");
+      await persistDesignPolishPointer("needs_manual_review", "DEV unavailable. Design patch cannot be generated.");
       return getLatestUiQuality({ projectRoot: root });
     }
 
@@ -4678,6 +4808,7 @@ async function runDesignPolishPass(payload = {}) {
         message: "DEV unavailable or returned no valid UI patch."
       });
       await appendDesignRunbookEvent(root, "design-polish-needs-review", "DEV returned no valid UI patch.");
+      await persistDesignPolishPointer("needs_manual_review", "DEV unavailable or returned no valid UI patch.");
       return getLatestUiQuality({ projectRoot: root });
     }
     const devToolResults = await executeAgentToolRequestsBatch({
@@ -4703,6 +4834,7 @@ async function runDesignPolishPass(payload = {}) {
         status: "needs_manual_review",
         message: "Agent tool approval is required before DEV can continue."
       });
+      await persistDesignPolishPointer("needs_manual_review", "Agent tool approval is required before DEV can continue.");
       return getLatestUiQuality({ projectRoot: root });
     }
     const validation = validateQualityLoopFileOperations(root, devPatch.fileOperations);
@@ -4714,6 +4846,7 @@ async function runDesignPolishPass(payload = {}) {
         message: validation.message
       });
       await appendDesignRunbookEvent(root, "design-polish-needs-review", validation.message);
+      await persistDesignPolishPointer("needs_manual_review", validation.message);
       return getLatestUiQuality({ projectRoot: root });
     }
     const patchApply = await applyFileOperationsToExistingProject(root, {
@@ -4730,13 +4863,14 @@ async function runDesignPolishPass(payload = {}) {
           schemaVersion: 1,
           updatedAt: new Date().toISOString(),
           status: "needs_manual_review",
-          message: buildResult.error || buildResult.result?.outputPreview || "Build failed after design patch."
-        });
-        await appendDesignRunbookEvent(root, "agent-tool-failed", "Build failed after design polish patch.", {
-          tool: "run_build"
-        });
-        return getLatestUiQuality({ projectRoot: root });
-      }
+        message: buildResult.error || buildResult.result?.outputPreview || "Build failed after design patch."
+      });
+      await appendDesignRunbookEvent(root, "agent-tool-failed", "Build failed after design polish patch.", {
+        tool: "run_build"
+      });
+      await persistDesignPolishPointer("needs_manual_review", buildResult.error || buildResult.result?.outputPreview || "Build failed after design patch.");
+      return getLatestUiQuality({ projectRoot: root });
+    }
     }
     if (agentToolPolicy.allowRunGuiQa) {
       await runGuiQaSmokeTest({
@@ -4761,6 +4895,7 @@ async function runDesignPolishPass(payload = {}) {
     message: "Design polish reached max rounds."
   });
   await appendDesignRunbookEvent(root, "design-polish-needs-review", "Design polish reached max rounds.");
+  await persistDesignPolishPointer("needs_manual_review", "Design polish reached max rounds.");
   return getLatestUiQuality({ projectRoot: root });
 }
 
@@ -5602,6 +5737,16 @@ async function startQualityLoop(payload = {}) {
     lastFailureSignature: ""
   };
   qualityLoops.set(runId, task);
+  await persistActiveWorkPointer({
+    projectRoot,
+    projectName: path.basename(projectRoot),
+    runId,
+    type: "quality_loop",
+    status: task.status,
+    message: "Quality loop queued.",
+    returnView: "workspace",
+    source: "qualityLoop:start"
+  }).catch(() => {});
   await upsertPersistentRunbook(projectRoot, {
     runId,
     projectName: path.basename(projectRoot),
@@ -5645,6 +5790,16 @@ async function stopQualityLoop(payload = {}) {
     currentStage: "stopped",
     nextAction: "manual_review",
     lastError: task.message
+  }).catch(() => {});
+  await persistActiveWorkPointer({
+    projectRoot: task.projectRoot,
+    projectName: path.basename(task.projectRoot),
+    runId: task.runId,
+    type: "quality_loop",
+    status: "stopped",
+    message: task.message,
+    returnView: "workspace",
+    source: "qualityLoop:stop"
   }).catch(() => {});
   sendQualityLoopProgress(task, { message: task.message });
   return summarizeQualityLoop(task);
@@ -6282,6 +6437,16 @@ function summarizeQualityLoop(task) {
 
 function sendQualityLoopProgress(task, patch = {}) {
   Object.assign(task, patch);
+  void persistActiveWorkPointer({
+    projectRoot: task.projectRoot,
+    projectName: path.basename(task.projectRoot),
+    runId: task.runId,
+    type: "quality_loop",
+    status: task.status || patch.status || task.guiQaStatus || task.qaStatus || task.devPatchStatus || "running",
+    message: patch.message || task.message || "",
+    returnView: "workspace",
+    source: "qualityLoop:progress"
+  }).catch(() => {});
   mainWindow?.webContents?.send("qualityLoop:progress", summarizeQualityLoop(task));
 }
 
@@ -6556,6 +6721,16 @@ async function runTerminalCommand(payload = {}) {
     session,
     outputPreview: ""
   });
+  await persistActiveWorkPointer({
+    projectRoot: root,
+    projectName: path.basename(root),
+    runId: session.sessionId,
+    type: "terminal",
+    status: "running",
+    message: `Terminal command running: ${command}`,
+    returnView: "workspace",
+    source: "terminal-command"
+  }).catch(() => {});
 
   const appendChunk = async (targetPath, chunk, streamKey) => {
     const text = chunk.toString();
@@ -6616,6 +6791,16 @@ async function stopTerminalCommand(payload = {}) {
   active.session.finishedAt = new Date().toISOString();
   await persistTerminalSession(root, active.session);
   await terminateProcessTree(active.child?.pid || active.session.pid || 0);
+  await persistActiveWorkPointer({
+    projectRoot: root,
+    projectName: path.basename(root),
+    runId: sessionId,
+    type: "terminal",
+    status: "stopped",
+    message: `Terminal command stopped: ${active.session.command || sessionId}`,
+    returnView: "workspace",
+    source: "terminal-command-stop"
+  }).catch(() => {});
   return finalizeTerminalSession(sessionId, {
     status: "stopped",
     exitCode: active.session.exitCode
@@ -8676,6 +8861,378 @@ async function listProjects() {
     }))
   );
   return enriched.sort((left, right) => String(right.lastUpdated || "").localeCompare(String(left.lastUpdated || "")));
+}
+
+function normalizeActiveWorkPointer(value = {}) {
+  const candidate = value && typeof value === "object" ? value : {};
+  return {
+    projectRoot: String(candidate.projectRoot || "").trim(),
+    projectName: String(candidate.projectName || "").trim(),
+    runId: String(candidate.runId || "").trim(),
+    type: String(candidate.type || "unknown").trim().toLowerCase() || "unknown",
+    status: String(candidate.status || "idle").trim().toLowerCase() || "idle",
+    message: String(candidate.message || "").trim(),
+    updatedAt: String(candidate.updatedAt || "").trim(),
+    returnView: String(candidate.returnView || "workspace").trim().toLowerCase() || "workspace",
+    source: String(candidate.source || "").trim(),
+    latestRunbookPath: String(candidate.latestRunbookPath || "").trim()
+  };
+}
+
+async function readActiveWorkPointer() {
+  if (!activeWorkPointerFilePath) {
+    return null;
+  }
+  const pointer = await readJsonFile(activeWorkPointerFilePath, null);
+  if (!pointer || typeof pointer !== "object") {
+    return null;
+  }
+  return normalizeActiveWorkPointer(pointer);
+}
+
+async function writeActiveWorkPointer(pointer) {
+  if (!activeWorkPointerFilePath) {
+    return null;
+  }
+  const nextPointer = normalizeActiveWorkPointer({
+    ...(pointer || {}),
+    updatedAt: pointer?.updatedAt || new Date().toISOString()
+  });
+  await writeJsonFile(activeWorkPointerFilePath, nextPointer);
+  return nextPointer;
+}
+
+async function clearActiveWorkPointer() {
+  if (!activeWorkPointerFilePath) {
+    return false;
+  }
+  try {
+    await fs.unlink(activeWorkPointerFilePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function persistActiveWorkPointer(patch = {}) {
+  const current = await readActiveWorkPointer().catch(() => null);
+  return writeActiveWorkPointer({
+    ...(current || {}),
+    ...(patch || {}),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function isActiveWorkTerminalStatus(status) {
+  return [
+    "completed",
+    "done",
+    "passed",
+    "failed",
+    "stopped",
+    "idle",
+    "manual_review",
+    "needs_review",
+    "manual_review_required",
+    "quality_loop_passed",
+    "quality_loop_failed",
+    "quality_loop_needs_review",
+    "gui_qa_failed",
+    "qa_evidence_ready",
+    "gui_qa_skipped_missing_playwright",
+    "blocked_missing_health_url",
+    "pass_candidate"
+  ].includes(String(status || "").trim().toLowerCase());
+}
+
+function isTrackedProjectArchived(entry) {
+  return String(entry?.status || "").trim().toLowerCase() === "archived";
+}
+
+function isTrackedProjectCompleted(entry) {
+  const status = String(entry?.status || "").trim().toLowerCase();
+  const decisionStatus = String(entry?.decisionStatus || "").trim().toLowerCase();
+  return status === "archived"
+    || ["ready for next prompt", "workflow complete", "completed"].includes(status)
+    || decisionStatus === "acknowledged";
+}
+
+async function findRecentSandboxTaskProjects(limit = 8) {
+  const tasksRoot = path.join(app.getPath("documents"), backend.DEFAULT_SANDBOX_PROJECT_NAME, "sandbox", "tasks");
+  const entries = await fs.readdir(tasksRoot, { withFileTypes: true }).catch(() => []);
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const rootPath = path.join(tasksRoot, entry.name);
+    const stat = await fs.stat(rootPath).catch(() => null);
+    if (!stat?.isDirectory()) {
+      continue;
+    }
+    const trifixDir = path.join(rootPath, AUTONOMY_DIR_NAME);
+    if (!(await directoryExists(trifixDir))) {
+      continue;
+    }
+    candidates.push({
+      rootPath,
+      name: entry.name,
+      updatedAt: stat.mtime.toISOString()
+    });
+  }
+  candidates.sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
+  return candidates.slice(0, Math.max(1, limit));
+}
+
+async function buildRecoveryCandidateFromRoot(rootPath, overrides = {}) {
+  if (!rootPath) {
+    return null;
+  }
+
+  try {
+    const normalizedRoot = await normalizeExistingProjectRoot(rootPath);
+    const tracked = await findTrackedProjectByPath(normalizedRoot).catch(() => null);
+    const latestRunbook = await getLatestRunbook({ projectRoot: normalizedRoot }).catch(() => null);
+    const processRecords = await refreshProcessRecords(normalizedRoot).catch(() => []);
+    const activeProcess = Array.isArray(processRecords)
+      ? processRecords.find((record) => ["running", "starting"].includes(String(record?.status || "").toLowerCase())) || null
+      : null;
+    const qualityLoop = Array.from(qualityLoops.values()).find((task) => task.projectRoot === normalizedRoot) || null;
+    const latestUiQuality = await getLatestUiQuality({ projectRoot: normalizedRoot }).catch(() => null);
+    const status = String(
+      overrides.status
+      || latestRunbook?.status
+      || latestUiQuality?.polishState?.status
+      || qualityLoop?.status
+      || activeProcess?.status
+      || tracked?.status
+      || "idle"
+    ).trim();
+    return {
+      id: overrides.id || tracked?.id || createTrackedProjectId(normalizedRoot),
+      name: overrides.name || tracked?.name || path.basename(normalizedRoot),
+      path: normalizedRoot,
+      type: overrides.type || tracked?.type || inferProjectType(normalizedRoot),
+      status,
+      decisionStatus: overrides.decisionStatus || tracked?.decisionStatus || "pending",
+      lastUpdated: overrides.lastUpdated || tracked?.lastUpdated || latestRunbook?.updatedAt || latestUiQuality?.designReview?.checkedAt || new Date().toISOString(),
+      runId: overrides.runId || latestRunbook?.runId || "",
+      latestRunbook,
+      activeProcess,
+      qualityLoopState: qualityLoop ? summarizeQualityLoop(qualityLoop) : null,
+      designPolishState: latestUiQuality?.polishState || null,
+      source: overrides.source || (tracked ? "tracked-projects" : "sandbox-scan")
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getActiveWorkState() {
+  const pointer = await readActiveWorkPointer().catch(() => null);
+  const trackedProjects = await listProjects().catch(() => []);
+  const sandboxCandidates = await findRecentSandboxTaskProjects().catch(() => []);
+
+  let activePointer = pointer;
+  let pointerCandidate = null;
+  if (pointer?.projectRoot) {
+    pointerCandidate = await buildRecoveryCandidateFromRoot(pointer.projectRoot, {
+      name: pointer.projectName || "",
+      runId: pointer.runId || "",
+      status: pointer.status || "",
+      source: "active-work-pointer"
+    });
+    if (pointerCandidate) {
+      activePointer = normalizeActiveWorkPointer({
+        ...pointer,
+        projectRoot: pointerCandidate.path,
+        projectName: pointerCandidate.name,
+        status: pointerCandidate.activeProcess?.status
+          || pointerCandidate.qualityLoopState?.status
+          || pointerCandidate.designPolishState?.status
+          || pointerCandidate.latestRunbook?.status
+          || pointer.status,
+        latestRunbookPath: pointerCandidate.latestRunbook?.runDir || pointer.latestRunbookPath || ""
+      });
+      await writeActiveWorkPointer(activePointer);
+    }
+  }
+
+  const recentCandidates = [];
+  const seenRoots = new Set();
+  if (pointerCandidate?.path) {
+    recentCandidates.push(pointerCandidate);
+    seenRoots.add(pointerCandidate.path);
+  }
+  for (const entry of trackedProjects) {
+    if (!entry?.path || isTrackedProjectArchived(entry) || seenRoots.has(entry.path)) {
+      continue;
+    }
+    const candidate = await buildRecoveryCandidateFromRoot(entry.path, {
+      id: entry.id,
+      name: entry.name,
+      type: entry.type,
+      status: entry.status,
+      decisionStatus: entry.decisionStatus,
+      lastUpdated: entry.lastUpdated,
+      source: "tracked-projects"
+    });
+    if (candidate) {
+      recentCandidates.push(candidate);
+      seenRoots.add(candidate.path);
+    }
+  }
+  for (const entry of sandboxCandidates) {
+    if (!entry?.rootPath || seenRoots.has(entry.rootPath)) {
+      continue;
+    }
+    const candidate = await buildRecoveryCandidateFromRoot(entry.rootPath, {
+      name: entry.name,
+      lastUpdated: entry.updatedAt,
+      source: "sandbox-scan"
+    });
+    if (candidate) {
+      recentCandidates.push(candidate);
+      seenRoots.add(candidate.path);
+    }
+  }
+
+  const recoveryItems = recentCandidates
+    .filter((candidate) => candidate && !isTrackedProjectArchived(candidate))
+    .sort((left, right) => String(right.lastUpdated || "").localeCompare(String(left.lastUpdated || "")))
+    .slice(0, 8);
+
+  const latestRecovery = recoveryItems.find((candidate) => !isTrackedProjectCompleted(candidate)) || recoveryItems[0] || null;
+  return {
+    pointerPath: activeWorkPointerFilePath || "",
+    activePointer,
+    latestRecovery,
+    recoveryItems
+  };
+}
+
+async function stopActiveWork(payload = {}) {
+  const pointer = normalizeActiveWorkPointer(payload.pointer || await readActiveWorkPointer().catch(() => null) || {});
+  const response = {
+    stopped: false,
+    status: "idle",
+    message: "No active TriFix work was found.",
+    pointer
+  };
+  const type = pointer.type;
+  const projectRoot = pointer.projectRoot;
+
+  if (!type || !projectRoot) {
+    return response;
+  }
+
+  if (type === "quality_loop" && pointer.runId) {
+    const stopped = await stopQualityLoop({ runId: pointer.runId });
+    const nextPointer = await writeActiveWorkPointer({
+      ...pointer,
+      status: "stopped",
+      message: stopped?.message || "Quality loop stopped."
+    });
+    return {
+      stopped: true,
+      status: "stopped",
+      message: stopped?.message || "Quality loop stopped.",
+      pointer: nextPointer
+    };
+  }
+
+  if (type === "autonomy" && pointer.runId) {
+    const stopped = await stopAutonomyRun(pointer.runId);
+    const nextPointer = await writeActiveWorkPointer({
+      ...pointer,
+      status: "stopped",
+      message: stopped?.message || "Autonomy run stopped."
+    });
+    return {
+      stopped: true,
+      status: "stopped",
+      message: stopped?.message || "Autonomy run stopped.",
+      pointer: nextPointer
+    };
+  }
+
+  if (type === "terminal") {
+    const history = await getTerminalHistory({ projectRoot }).catch(() => ({ sessions: [] }));
+    const runningSession = (history?.sessions || []).find((session) => String(session?.status || "").toLowerCase() === "running");
+    if (runningSession?.sessionId) {
+      await stopTerminalCommand({
+        projectRoot,
+        sessionId: runningSession.sessionId
+      });
+      const nextPointer = await writeActiveWorkPointer({
+        ...pointer,
+        status: "stopped",
+        message: "Terminal command stopped."
+      });
+      return {
+        stopped: true,
+        status: "stopped",
+        message: "Terminal command stopped.",
+        pointer: nextPointer
+      };
+    }
+  }
+
+  if (type === "managed_process") {
+    const processes = await listProjectProcesses({ projectRoot }).catch(() => []);
+    const activeProcess = (processes || []).find((process) => ["running", "starting"].includes(String(process?.status || "").toLowerCase()));
+    if (activeProcess?.id) {
+      await stopManagedProjectProcess({
+        projectRoot,
+        processId: activeProcess.id
+      });
+      const nextPointer = await writeActiveWorkPointer({
+        ...pointer,
+        status: "stopped",
+        message: "Managed project process stopped."
+      });
+      return {
+        stopped: true,
+        status: "stopped",
+        message: "Managed project process stopped.",
+        pointer: nextPointer
+      };
+    }
+  }
+
+  const nextPointer = await writeActiveWorkPointer({
+    ...pointer,
+    status: "stopped",
+    message: "This work type cannot be stopped safely from recovery yet."
+  });
+  return {
+    stopped: false,
+    status: "blocked",
+    message: "This run cannot be stopped safely from recovery yet.",
+    pointer: nextPointer
+  };
+}
+
+async function archiveRecoveryItem(payload = {}) {
+  const rootPath = String(payload.projectRoot || payload.path || "").trim();
+  if (!rootPath) {
+    return getActiveWorkState();
+  }
+  const normalizedRoot = await normalizeExistingProjectRoot(rootPath).catch(() => rootPath);
+  const tracked = await findTrackedProjectByPath(normalizedRoot).catch(() => null);
+  if (tracked?.id) {
+    await updateTrackedProject(tracked.id, {
+      status: "Archived"
+    });
+  }
+  const pointer = await readActiveWorkPointer().catch(() => null);
+  if (pointer?.projectRoot && pointer.projectRoot === normalizedRoot) {
+    await clearActiveWorkPointer().catch(() => {});
+  }
+  return getActiveWorkState();
 }
 
 async function readAutonomyStateForProject(rootPath) {

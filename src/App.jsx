@@ -166,6 +166,43 @@ function normalizeCapabilityState(capability, fallbackRoot = "") {
   };
 }
 
+const ACTIVE_AUTONOMY_STATUSES = new Set(["running", "queued", "planning", "building", "reviewing", "patching"]);
+const ACTIVE_QUALITY_LOOP_STATUSES = new Set(["running", "gui_qa_pending", "gui_qa_running", "qa_reviewing_gui_evidence", "dev_patching_gui_issue", "qa_reviewing", "dev_patching"]);
+const ACTIVE_DESIGN_POLISH_STATUSES = new Set(["running", "checking", "reviewing", "patching"]);
+
+function isActiveAutonomyWork(status) {
+  return ACTIVE_AUTONOMY_STATUSES.has(String(status || "").trim().toLowerCase());
+}
+
+function isActiveQualityLoopWork(status) {
+  return ACTIVE_QUALITY_LOOP_STATUSES.has(String(status || "").trim().toLowerCase());
+}
+
+function isActiveDesignPolishWork(status) {
+  return ACTIVE_DESIGN_POLISH_STATUSES.has(String(status || "").trim().toLowerCase());
+}
+
+function normalizeRecoveryItem(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  return {
+    id: String(item.id || "").trim(),
+    name: String(item.name || item.projectName || "").trim(),
+    path: String(item.path || item.projectRoot || "").trim(),
+    type: String(item.type || "project").trim().toLowerCase() || "project",
+    status: String(item.status || "").trim(),
+    decisionStatus: String(item.decisionStatus || "pending").trim(),
+    lastUpdated: String(item.lastUpdated || item.updatedAt || "").trim(),
+    runId: String(item.runId || item.latestRunbook?.runId || "").trim(),
+    source: String(item.source || "").trim(),
+    latestRunbook: item.latestRunbook || null,
+    activeProcess: item.activeProcess || null,
+    qualityLoopState: item.qualityLoopState || null,
+    designPolishState: item.designPolishState || null
+  };
+}
+
 export function App() {
   const [activeView, setActiveView] = useState("landing");
   const [activeTab, setActiveTab] = useState("architect");
@@ -185,6 +222,10 @@ export function App() {
   const [isAutonomyRunning, setIsAutonomyRunning] = useState(false);
   const [settings, setSettings] = useState(null);
   const [trackedProjects, setTrackedProjects] = useState([]);
+  const [activeWorkState, setActiveWorkState] = useState(null);
+  const [activeWorkNotice, setActiveWorkNotice] = useState("");
+  const [navigationGuard, setNavigationGuard] = useState(null);
+  const [isStoppingActiveWork, setIsStoppingActiveWork] = useState(false);
   const [workflow, setWorkflow] = useState({
     folderLoaded: false,
     contextReady: false,
@@ -230,6 +271,7 @@ export function App() {
   const [reviewFinishedState, setReviewFinishedState] = useState(null);
   const [notifications, setNotifications] = useState([]);
   const [isRunStarting, setIsRunStarting] = useState(false);
+  const pendingNavigationRef = useRef(null);
   const currentRunRef = useRef(null);
   const ignoredRunIdsRef = useRef(new Set());
   const runStartPendingRef = useRef(false);
@@ -261,6 +303,94 @@ export function App() {
     () => terminalSessions.find((session) => session.status === "running") || null,
     [terminalSessions]
   );
+  const recoveryItems = useMemo(
+    () => (activeWorkState?.recoveryItems || []).map((item) => normalizeRecoveryItem(item)).filter(Boolean),
+    [activeWorkState]
+  );
+  const latestRecoveryItem = useMemo(
+    () => normalizeRecoveryItem(activeWorkState?.latestRecovery),
+    [activeWorkState]
+  );
+  const activeWorkSummary = useMemo(() => {
+    if (isActiveAutonomyWork(autonomyRun?.status) || isAutonomyRunning) {
+      return {
+        type: "generation",
+        projectName: project?.name || resultProject?.name || taskTitle || activeWorkState?.activePointer?.projectName || "TriFix Task",
+        projectRoot: project?.rootPath || resultProject?.rootPath || activeWorkState?.activePointer?.projectRoot || "",
+        runId: autonomyRun?.runId || currentRunRef.current || activeWorkState?.activePointer?.runId || "",
+        status: autonomyRun?.status || "running",
+        message: autonomyRun?.message || "Autonomy run in progress."
+      };
+    }
+    if (isRunning) {
+      return {
+        type: "generation",
+        projectName: project?.name || resultProject?.name || taskTitle || activeWorkState?.activePointer?.projectName || "TriFix Task",
+        projectRoot: project?.rootPath || resultProject?.rootPath || activeWorkState?.activePointer?.projectRoot || "",
+        runId: currentRunRef.current || activeWorkState?.activePointer?.runId || "",
+        status: workflow?.currentStage || "running",
+        message: decisionMessage || "Generation is in progress."
+      };
+    }
+    if (isActiveQualityLoopWork(qualityLoopState?.status)) {
+      return {
+        type: "quality_loop",
+        projectName: project?.name || resultProject?.name || activeWorkState?.activePointer?.projectName || "TriFix Task",
+        projectRoot: project?.rootPath || resultProject?.rootPath || qualityLoopState?.projectRoot || activeWorkState?.activePointer?.projectRoot || "",
+        runId: qualityLoopState?.runId || activeWorkState?.activePointer?.runId || "",
+        status: qualityLoopState?.status || "running",
+        message: qualityLoopState?.message || "Quality loop is running."
+      };
+    }
+    if (runningTerminalSession?.sessionId) {
+      return {
+        type: "terminal",
+        projectName: project?.name || resultProject?.name || activeWorkState?.activePointer?.projectName || "TriFix Task",
+        projectRoot: project?.rootPath || resultProject?.rootPath || activeWorkState?.activePointer?.projectRoot || "",
+        runId: runningTerminalSession.sessionId,
+        status: runningTerminalSession.status || "running",
+        message: runningTerminalSession.command || "Terminal command is running."
+      };
+    }
+    if (["running", "starting"].includes(String(activeProjectProcess?.status || "").toLowerCase())) {
+      return {
+        type: "managed_process",
+        projectName: project?.name || resultProject?.name || activeWorkState?.activePointer?.projectName || "TriFix Task",
+        projectRoot: project?.rootPath || resultProject?.rootPath || activeWorkState?.activePointer?.projectRoot || "",
+        runId: activeProjectProcess?.id || activeWorkState?.activePointer?.runId || "",
+        status: activeProjectProcess?.status || "running",
+        message: activeProjectProcess?.healthUrl || activeProjectProcess?.outputPreview || "Managed project process is running."
+      };
+    }
+    const pointer = activeWorkState?.activePointer || null;
+    if (pointer && !["idle", "completed", "failed", "stopped", "needs_manual_review", "manual_review", "needs_review", "pass_candidate"].includes(String(pointer.status || "").trim().toLowerCase())) {
+      return {
+        type: pointer.type || "generation",
+        projectName: pointer.projectName || latestRecoveryItem?.name || "TriFix Task",
+        projectRoot: pointer.projectRoot || latestRecoveryItem?.path || "",
+        runId: pointer.runId || latestRecoveryItem?.runId || "",
+        status: pointer.status || "running",
+        message: pointer.message || "TriFix work is in progress."
+      };
+    }
+    return null;
+  }, [
+    activeProjectProcess,
+    activeWorkState,
+    autonomyRun,
+    currentRunRef,
+    decisionMessage,
+    isAutonomyRunning,
+    isRunning,
+    latestRecoveryItem,
+    project,
+    qualityLoopState,
+    resultProject,
+    runningTerminalSession,
+    taskTitle,
+    workflow?.currentStage
+  ]);
+  const hasActiveWork = Boolean(activeWorkSummary);
   const canRun =
     !isRunning &&
     !isRunStarting &&
@@ -383,6 +513,7 @@ export function App() {
       if (!nextSession?.sessionId && sessions[0]?.sessionId) {
         setTerminalSelectedSessionId(sessions[0].sessionId);
       }
+      await refreshActiveWorkState(true);
     } catch (runError) {
       setTerminalError(runError?.message || "Could not run command.");
     } finally {
@@ -406,6 +537,7 @@ export function App() {
         projectRoot: project.rootPath
       });
       setTerminalSessions(history?.sessions || []);
+      await refreshActiveWorkState(true);
     } catch (stopError) {
       setTerminalError(stopError?.message || "Could not stop command.");
     }
@@ -437,6 +569,10 @@ export function App() {
       .listProjects()
       .then((items) => setTrackedProjects(items || []))
       .catch(() => { });
+    bridge
+      .getActiveWorkState?.()
+      .then((state) => setActiveWorkState(state || null))
+      .catch(() => {});
 
     const unsubscribePipeline = bridge.onPipelineProgress((progress) => {
     if (ignoredRunIdsRef.current.has(progress.runId) || progress.runId !== currentRunRef.current) {
@@ -596,6 +732,22 @@ export function App() {
   }, [project?.rootPath]);
 
   useEffect(() => {
+    void refreshActiveWorkState(true);
+  }, [project?.rootPath]);
+
+  useEffect(() => {
+    if (!hasActiveWork) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshActiveWorkState(true);
+    }, 3000);
+
+    return () => window.clearInterval(timer);
+  }, [hasActiveWork]);
+
+  useEffect(() => {
     if (!project?.rootPath || !window.trifix?.getQualityLoopStatus) {
       activeQualityLoopRunId = "";
       ignoredQualityLoopRunIds.clear();
@@ -612,6 +764,20 @@ export function App() {
       })
       .catch(() => {});
   }, [project?.rootPath]);
+
+  useEffect(() => {
+    if (!activeWorkState?.latestRecovery || activeWorkNotice) {
+      return;
+    }
+    const pointerStatus = String(activeWorkState?.activePointer?.status || activeWorkState.latestRecovery.status || "").trim().toLowerCase();
+    if (["running", "queued", "gui_qa_pending", "gui_qa_running"].includes(pointerStatus)) {
+      setActiveWorkNotice("This run was still active when you left.");
+      return;
+    }
+    if (["stopped", "failed"].includes(pointerStatus)) {
+      setActiveWorkNotice("This run stopped while you were away.");
+    }
+  }, [activeWorkNotice, activeWorkState]);
 
   useEffect(() => {
     if (!settings?.agents) {
@@ -1000,7 +1166,105 @@ export function App() {
     try {
       const items = await window.trifix.listProjects();
       setTrackedProjects(items || []);
+      await refreshActiveWorkState(true);
     } catch { }
+  }
+
+  async function refreshActiveWorkState(silent = false) {
+    if (!window.trifix?.getActiveWorkState) {
+      return null;
+    }
+    try {
+      const state = await window.trifix.getActiveWorkState();
+      setActiveWorkState(state || null);
+      return state || null;
+    } catch (loadError) {
+      if (!silent) {
+        setError(loadError?.message || "Could not load active work recovery state.");
+      }
+      return null;
+    }
+  }
+
+  function navigateDirect(nextView) {
+    setActiveView(nextView);
+  }
+
+  function closeNavigationGuard() {
+    pendingNavigationRef.current = null;
+    setNavigationGuard(null);
+  }
+
+  function requestNavigation(action, options = {}) {
+    const hideWorkspace = options.hideWorkspace !== false;
+    const targetProjectRoot = String(options.targetProjectRoot || "").trim();
+    const activeRoot = String(activeWorkSummary?.projectRoot || "").trim();
+    const returningToActiveProject = Boolean(options.opensWorkspace) && Boolean(targetProjectRoot) && Boolean(activeRoot) && targetProjectRoot === activeRoot;
+    const switchingAwayFromActiveProject = Boolean(targetProjectRoot)
+      && Boolean(activeRoot)
+      && targetProjectRoot !== activeRoot;
+    const shouldGuard = hasActiveWork && !returningToActiveProject && (hideWorkspace || switchingAwayFromActiveProject);
+    if (!shouldGuard) {
+      action?.();
+      return;
+    }
+
+    pendingNavigationRef.current = action;
+    setNavigationGuard({
+      title: "Active TriFix run in progress",
+      message: `TriFix is currently working on ${activeWorkSummary?.projectName || "this project"}. Leaving this view will not stop the run, but you may lose live progress context. Do you want to continue?`
+    });
+  }
+
+  async function stopActiveWorkAndGoHome() {
+    if (!window.trifix?.stopActiveWork) {
+      closeNavigationGuard();
+      return;
+    }
+    setIsStoppingActiveWork(true);
+    try {
+      const response = await window.trifix.stopActiveWork({
+        pointer: activeWorkState?.activePointer || activeWorkSummary || null
+      });
+      const message = response?.message || "Active work stop requested.";
+      setActiveWorkNotice(message);
+      pushNotification({
+        type: response?.stopped ? "info" : "error",
+        title: response?.stopped ? "Active work stopped" : "Stop blocked",
+        message
+      });
+      await refreshActiveWorkState(true);
+      closeNavigationGuard();
+      if (response?.stopped) {
+        setIsRunning(false);
+        setIsAutonomyRunning(false);
+        setQualityLoopState((current) => current ? { ...current, status: "stopped", message } : current);
+        navigateDirect("landing");
+      }
+    } catch (stopError) {
+      pushNotification({
+        type: "error",
+        title: "Stop failed",
+        message: stopError?.message || "Could not stop active work."
+      });
+    } finally {
+      setIsStoppingActiveWork(false);
+    }
+  }
+
+  async function returnToActiveProject() {
+    const target = normalizeRecoveryItem({
+      ...(latestRecoveryItem || {}),
+      path: activeWorkSummary?.projectRoot || latestRecoveryItem?.path || "",
+      name: activeWorkSummary?.projectName || latestRecoveryItem?.name || "",
+      runId: activeWorkSummary?.runId || latestRecoveryItem?.runId || ""
+    });
+    if (target?.path) {
+      await continueTrackedProject(target);
+      setActiveWorkNotice("This run was still active when you left.");
+      return;
+    }
+    setActiveView("office");
   }
 
   function handleTypewriterComplete() {
@@ -1597,24 +1861,39 @@ export function App() {
     }
   }
 
-  function beginNewProjectFlow() {
+  async function beginNewProjectFlow() {
     resetTaskState({ clearProjectSelection: true });
-    setProject(null);
-    setResultProject(null);
-    setSelectedFiles([]);
-    setContextDocuments([]);
-    setCommandLog([]);
-    setProjectProcesses([]);
-    setProcessLogView(null);
-    setTaskTitle(draftProjectName.trim());
-    setCodeInput("");
-    setActiveView("office");
-    setWorkflow((current) => ({
-      ...current,
-      folderLoaded: false,
-      contextReady: false,
-      currentStage: "task-ready"
-    }));
+    try {
+      const sandboxProject = await window.trifix.openSandboxProject();
+      if (sandboxProject?.projectId && draftProjectName.trim()) {
+        await window.trifix.updateProject({
+          id: sandboxProject.projectId,
+          name: draftProjectName.trim()
+        });
+      }
+      const nextProject = draftProjectName.trim()
+        ? { ...sandboxProject, name: draftProjectName.trim() }
+        : sandboxProject;
+      setProject(nextProject || null);
+      setResultProject(null);
+      setSelectedFiles(nextProject?.defaultSelectedFiles || []);
+      setContextDocuments(nextProject?.fsd?.documents || []);
+      setCommandLog(nextProject?.commandHistory || []);
+      setProjectProcesses(nextProject?.processes || []);
+      setProcessLogView(null);
+      setTaskTitle(draftProjectName.trim() || nextProject?.name || "");
+      setCodeInput("");
+      setActiveView("office");
+      setWorkflow((current) => ({
+        ...current,
+        folderLoaded: Boolean(nextProject?.rootPath),
+        contextReady: false,
+        currentStage: "task-ready"
+      }));
+      await refreshTrackedProjects();
+    } catch (beginError) {
+      setError(beginError?.message || "Could not create a new sandbox project.");
+    }
   }
 
   async function runOffice(nextLoopCount = workflow.loopCount, feedback = "") {
@@ -2510,6 +2789,14 @@ export function App() {
         autonomyState: persistedAutonomy,
         reviewData
       }));
+      if (entry?.latestRunbook?.runId || entry?.runId) {
+        const latestStatus = String(entry?.latestRunbook?.status || entry?.status || "").trim().toLowerCase();
+        setActiveWorkNotice(
+          ["running", "queued", "gui_qa_pending", "gui_qa_running"].includes(latestStatus)
+            ? "This run was still active when you left."
+            : "Recovered latest runbook for this project."
+        );
+      }
       setTaskTitle(reopened.projectSlug || reopened.name || "");
       setActiveView("office");
       await refreshTrackedProjects();
@@ -2753,31 +3040,31 @@ export function App() {
               active={activeView === "landing"}
               icon={<Plus size={18} />}
               label="Home"
-              onClick={() => setActiveView("landing")}
+              onClick={() => requestNavigation(() => navigateDirect("landing"), { hideWorkspace: true })}
             />
             <SidebarButton
               active={activeView === "office"}
               icon={<BriefcaseBusiness size={18} />}
               label="Workspace"
-              onClick={() => setActiveView("office")}
+              onClick={() => requestNavigation(() => navigateDirect("office"), { hideWorkspace: false })}
             />
             <SidebarButton
               active={activeView === "reports"}
               icon={<History size={18} />}
               label="Reports"
-              onClick={() => setActiveView("reports")}
+              onClick={() => requestNavigation(() => navigateDirect("reports"), { hideWorkspace: true })}
             />
             <SidebarButton
               active={activeView === "commands"}
               icon={<Code2 size={18} />}
               label="Commands"
-              onClick={() => setActiveView("commands")}
+              onClick={() => requestNavigation(() => navigateDirect("commands"), { hideWorkspace: true })}
             />
             <SidebarButton
               active={activeView === "settings"}
               icon={<Settings size={18} />}
               label="Settings"
-              onClick={() => setActiveView("settings")}
+              onClick={() => requestNavigation(() => navigateDirect("settings"), { hideWorkspace: true })}
             />
           </nav>
 
@@ -2789,14 +3076,82 @@ export function App() {
       )}
 
       <main className="main-view">
+        {hasActiveWork ? (
+          <div className="active-work-banner" role="status" aria-live="polite">
+            <div className="active-work-banner-copy">
+              <span className="active-work-banner-label">Active TriFix Work</span>
+              <strong>{activeWorkSummary?.projectName || "TriFix Task"}</strong>
+              <span>
+                {activeWorkSummary?.status || "running"}
+                {activeWorkSummary?.runId ? ` | ${activeWorkSummary.runId}` : ""}
+              </span>
+              <p>{activeWorkSummary?.message || "TriFix is still working in the background."}</p>
+            </div>
+            <div className="active-work-banner-actions">
+              <button className="secondary-button" type="button" onClick={() => void returnToActiveProject()}>
+                Return to active project
+              </button>
+              <button className="secondary-button danger" type="button" onClick={() => void stopActiveWorkAndGoHome()} disabled={isStoppingActiveWork}>
+                {isStoppingActiveWork ? <Loader2 size={18} className="spin" /> : <XCircle size={18} />}
+                Stop run
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => window.trifix.openRunbookFolder({
+                  projectRoot: activeWorkSummary?.projectRoot || "",
+                  runId: activeWorkSummary?.runId || ""
+                })}
+                disabled={!activeWorkSummary?.projectRoot}
+              >
+                Open runbook folder
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {activeWorkNotice && activeView !== "landing" ? (
+          <div className="context-banner">{activeWorkNotice}</div>
+        ) : null}
         {activeView === "landing" ? (
           <LandingView
             entries={trackedProjects}
+            recoveryItem={latestRecoveryItem}
+            activeWorkSummary={activeWorkSummary}
+            activeWorkNotice={activeWorkNotice}
             draftProjectName={draftProjectName}
             onDraftProjectName={setDraftProjectName}
-            onCreateNewProject={beginNewProjectFlow}
-            onOpenProject={openProject}
-            onContinue={continueTrackedProject}
+            onCreateNewProject={() => requestNavigation(() => beginNewProjectFlow(), { hideWorkspace: true })}
+            onOpenProject={() => requestNavigation(() => openProject(), { hideWorkspace: true })}
+            onContinue={(entry) => requestNavigation(() => continueTrackedProject(entry), {
+              hideWorkspace: true,
+              targetProjectRoot: entry?.path || entry?.rootPath || "",
+              opensWorkspace: true
+            })}
+            onOpenRecoveryProject={() => latestRecoveryItem ? continueTrackedProject(latestRecoveryItem) : Promise.resolve()}
+            onResumeRecovery={async (entry) => {
+              if (!entry?.path || !window.trifix?.resumeRunbook) {
+                return;
+              }
+              const resumed = await window.trifix.resumeRunbook({
+                projectRoot: entry.path,
+                runId: entry.runId || ""
+              });
+              setActiveWorkNotice(
+                resumed?.message
+                  || (resumed?.resumed ? "Recovered latest runbook for this project." : "This run stopped while you were away.")
+              );
+              await continueTrackedProject(entry);
+              await refreshActiveWorkState(true);
+            }}
+            onArchiveRecovery={async (entry) => {
+              await window.trifix.archiveActiveWork({
+                projectRoot: entry?.path || ""
+              });
+              if (activeWorkSummary?.projectRoot && entry?.path === activeWorkSummary.projectRoot) {
+                setActiveWorkNotice("Recovery item archived.");
+              }
+              await refreshTrackedProjects();
+            }}
             onOpenFolder={(folderPath) => window.trifix.openFolderPath(folderPath)}
             onRefresh={refreshTrackedProjects}
             onRename={renameTrackedProject}
@@ -2837,7 +3192,7 @@ export function App() {
               runPreflight={runPreflight}
               isDecisionBusy={isDecisionBusy}
               messageByAgent={messageByAgent}
-              onOpenProject={openProject}
+              onOpenProject={() => requestNavigation(() => openProject(), { hideWorkspace: true })}
               onRefreshProject={refreshProject}
               onCheckGraphify={checkGraphifyStatus}
               onBuildGraphify={buildGraphifyIndex}
@@ -2851,8 +3206,10 @@ export function App() {
               onConfirmPreflightStart={confirmPreflightStart}
               onRecheckPreflight={runModelPreflight}
               onBackFromPreflight={() => {
-                clearRunPreflight();
-                setActiveView("landing");
+                requestNavigation(() => {
+                  clearRunPreflight();
+                  navigateDirect("landing");
+                }, { hideWorkspace: true });
               }}
               onStopAutonomy={stopAutonomousRun}
               onRunProject={() => runProjectControl("run")}
@@ -2939,6 +3296,45 @@ export function App() {
         ) : null}
         {scene ? <SceneOverlay scene={scene} /> : null}
       </main>
+      {navigationGuard ? (
+        <div className="navigation-guard-overlay" role="presentation" onMouseDown={closeNavigationGuard}>
+          <div
+            className="navigation-guard-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={navigationGuard.title}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Navigation Guard</p>
+                <h2>{navigationGuard.title}</h2>
+              </div>
+            </div>
+            <p>{navigationGuard.message}</p>
+            <div className="button-row">
+              <button className="primary-button" type="button" onClick={closeNavigationGuard}>
+                Stay here
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => {
+                  const pending = pendingNavigationRef.current;
+                  closeNavigationGuard();
+                  pending?.();
+                }}
+              >
+                Go anyway
+              </button>
+              <button className="secondary-button danger" type="button" onClick={() => void stopActiveWorkAndGoHome()} disabled={isStoppingActiveWork}>
+                {isStoppingActiveWork ? <Loader2 size={18} className="spin" /> : <XCircle size={18} />}
+                Stop run and go home
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <NotificationStack notifications={notifications} onDismiss={removeNotification} />
     </div>
   );
@@ -4796,11 +5192,17 @@ function ReportsView({ result, project, workflow, autonomyRun, testerResult, onE
 
 function LandingView({
   entries,
+  recoveryItem,
+  activeWorkSummary,
+  activeWorkNotice,
   draftProjectName,
   onDraftProjectName,
   onCreateNewProject,
   onOpenProject,
   onContinue,
+  onOpenRecoveryProject,
+  onResumeRecovery,
+  onArchiveRecovery,
   onOpenFolder,
   onRefresh,
   onRename,
@@ -4917,6 +5319,48 @@ function LandingView({
 
       <div className="landing-grid">
         <aside className="landing-rail">
+          {recoveryItem ? (
+            <div className="landing-panel landing-panel-recovery">
+              <div className="landing-panel-header">
+                <div>
+                  <p className="eyebrow">Recover Recent TriFix Work</p>
+                  <h2>{recoveryItem.name || "Recent project"}</h2>
+                </div>
+                <span className={`landing-status-chip ${toLandingStatusKey(recoveryItem.status, recoveryItem.decisionStatus)}`}>
+                  {recoveryItem.status || "Unknown"}
+                </span>
+              </div>
+              <div className="project-path" title={recoveryItem.path}>{recoveryItem.path}</div>
+              <p className="muted">
+                Updated: {formatTimestamp(recoveryItem.lastUpdated)}
+                {recoveryItem.runId ? ` | Run: ${recoveryItem.runId}` : ""}
+              </p>
+              {activeWorkNotice ? <div className="context-banner">{activeWorkNotice}</div> : null}
+              {activeWorkSummary?.projectRoot && recoveryItem.path === activeWorkSummary.projectRoot ? (
+                <p className="muted">This run was still active when you left.</p>
+              ) : null}
+              <div className="landing-rail-actions">
+                <button className="primary-button landing-primary-button" type="button" onClick={() => onOpenRecoveryProject?.(recoveryItem)}>
+                  <FolderOpen size={16} />
+                  Open Project
+                </button>
+                <button className="secondary-button landing-open-folder-button" type="button" onClick={() => onResumeRecovery?.(recoveryItem)}>
+                  <History size={16} />
+                  Resume From Runbook
+                </button>
+              </div>
+              <div className="landing-rail-actions">
+                <button className="secondary-button landing-open-folder-button" type="button" onClick={() => onOpenFolder(recoveryItem.path)}>
+                  <FolderOpen size={16} />
+                  Open Folder
+                </button>
+                <button className="secondary-button danger" type="button" onClick={() => onArchiveRecovery?.(recoveryItem)}>
+                  <XCircle size={16} />
+                  Mark as Archived
+                </button>
+              </div>
+            </div>
+          ) : null}
           <div className="landing-panel landing-panel-intro">
             <div className="landing-panel-icon">
               <Box size={32} />
