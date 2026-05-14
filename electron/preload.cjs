@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld("trifix", {
   getLatestUiQuality: (payload) => ipcRenderer.invoke("designQuality:get-latest", payload),
   runUiQualityCheck: (payload) => ipcRenderer.invoke("designQuality:run-check", payload),
   runDesignPolishPass: (payload) => ipcRenderer.invoke("designQuality:run-polish-pass", payload),
+  runDesignImprovementLoop: (payload) => ipcRenderer.invoke("designQuality:run-improvement-loop", payload),
   openDesignFolder: (payload) => ipcRenderer.invoke("designQuality:open-folder", payload),
   generateUiStackRecommendation: (payload) => ipcRenderer.invoke("designQuality:generate-ui-stack", payload),
   createDependencyPlan: (payload) => ipcRenderer.invoke("designQuality:create-dependency-plan", payload),

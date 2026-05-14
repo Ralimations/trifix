@@ -6317,25 +6317,27 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   }
 
   async function runDesignPolishPassAction() {
-    if (!project?.rootPath || !window.trifix?.runDesignPolishPass) {
+    if (!project?.rootPath || !(window.trifix?.runDesignImprovementLoop || window.trifix?.runDesignPolishPass)) {
       return;
     }
     setIsUiQualityBusy(true);
     setUiQualityError("");
     try {
       await checkPlaywrightCapability({ silent: true });
-      await window.trifix.runDesignPolishPass({
+      const runDesignLoop = window.trifix.runDesignImprovementLoop || window.trifix.runDesignPolishPass;
+      await runDesignLoop({
         projectRoot: project.rootPath,
         processId: activeProcess?.id || "",
         healthUrl: detectedTargetUrl,
-        guiQa: normalizeGuiQaDraft(guiQaDraft)
+        guiQa: normalizeGuiQaDraft(guiQaDraft),
+        maxRounds: Math.max(1, Number(agentToolPolicyDraft.maxDesignPolishRounds) || 2)
       });
       await refreshUiQuality(project.rootPath, true);
       await refreshAgentTools(project.rootPath, true);
       await refreshGuiQaResult(project.rootPath);
       await refreshRunbook(project.rootPath, true);
     } catch (error) {
-      setUiQualityError(error?.message || "Could not run design polish pass.");
+      setUiQualityError(error?.message || "Could not run design improvement loop.");
     } finally {
       setIsUiQualityBusy(false);
     }
@@ -6367,6 +6369,28 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
       });
     } catch (error) {
       setUiQualityError(error?.message || "Could not open design folder.");
+    }
+  }
+
+  async function openLatestDesignLoopFolder() {
+    if (!project?.rootPath) {
+      return;
+    }
+    setUiQualityError("");
+    try {
+      if (designLoop?.artifactFolder && window.trifix?.openFolderPath) {
+        await window.trifix.openFolderPath(designLoop.artifactFolder);
+        return;
+      }
+      if (!window.trifix?.openDesignFolder) {
+        return;
+      }
+      await window.trifix.openDesignFolder({
+        projectRoot: project.rootPath,
+        target: "latest-loop"
+      });
+    } catch (error) {
+      setUiQualityError(error?.message || "Could not open design loop folder.");
     }
   }
 
@@ -6469,6 +6493,7 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   const domAudit = uiQualityState?.domAudit || null;
   const designReview = uiQualityState?.designReview || null;
   const polishState = uiQualityState?.polishState || null;
+  const designLoop = uiQualityState?.designLoop || null;
   const installCommands = Array.isArray(uiQualityState?.installCommands) ? uiQualityState.installCommands.filter(Boolean) : [];
   const designIssues = Array.isArray(designReview?.issues) ? designReview.issues : [];
   const pendingApprovals = Array.isArray(agentToolState?.pendingApprovals) ? agentToolState.pendingApprovals : [];
@@ -6482,6 +6507,14 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
   ].filter(Boolean);
   const canRunUiQualityCheck = Boolean(project?.rootPath) && Boolean(detectedTargetUrl) && playwrightCapability?.status === "available" && !isUiQualityBusy;
   const canRunDesignPolishPass = canRunUiQualityCheck && !qualityLoopBusy;
+  const latestDesignLoopIssueCount = Number.isFinite(Number(designLoop?.latestIssueCount))
+    ? Number(designLoop.latestIssueCount)
+    : (Array.isArray(designLoop?.latestQaVerdict?.issues) ? designLoop.latestQaVerdict.issues.length : 0);
+  const designLoopWarnings = [
+    !detectedTargetUrl ? "Start or run the project first. A local healthUrl is required for GUI/design checks." : "",
+    qaUnavailable ? "QA model unavailable. Design evidence was collected, but AI design review cannot continue." : "",
+    devUnavailable ? "DEV model unavailable. QA found issues, but patch generation cannot continue." : ""
+  ].filter(Boolean);
 
   return (
     <section className="simple-view">
@@ -7030,10 +7063,77 @@ function SettingsView({ settings, project, activeProcess, qualityLoopState, onQu
             </button>
             <button className="primary-button" type="button" onClick={runDesignPolishPassAction} disabled={!canRunDesignPolishPass}>
               {isUiQualityBusy ? <Loader2 size={18} className="spin" /> : <Sparkles size={18} />}
-              Improve UI / Design Polish Pass
+              Run Design Improvement Loop
+            </button>
+            <button className="secondary-button" type="button" onClick={() => refreshUiQuality()} disabled={!project?.rootPath || isUiQualityRefreshing || isUiQualityBusy}>
+              {isUiQualityRefreshing ? <Loader2 size={18} className="spin" /> : <RefreshCw size={18} />}
+              Refresh Design Loop Result
+            </button>
+            <button className="secondary-button" type="button" onClick={openLatestDesignLoopFolder} disabled={!project?.rootPath}>
+              <FolderOpen size={18} />
+              Open Design Loop Folder
             </button>
           </div>
         </div>
+        <div className="settings-grid">
+          <div className="settings-row">
+            <span>Loop mode</span>
+            <code>{designLoop?.mode || "design_improvement_loop"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Current round</span>
+            <code>{Number.isFinite(Number(designLoop?.currentRound)) ? Number(designLoop.currentRound) : 0}</code>
+          </div>
+          <div className="settings-row">
+            <span>Max rounds</span>
+            <code>{Number.isFinite(Number(designLoop?.maxRounds)) ? Number(designLoop.maxRounds) : Math.max(1, Number(agentToolPolicyDraft.maxDesignPolishRounds) || 2)}</code>
+          </div>
+          <div className="settings-row">
+            <span>Current stage</span>
+            <code>{designLoop?.currentStage || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Loop status</span>
+            <code>{designLoop?.status || polishState?.status || "idle"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest build result</span>
+            <code>{designLoop?.latestBuildResult?.summary || designLoop?.latestBuildResult?.status || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest GUI QA result</span>
+            <code>{designLoop?.latestGuiQaResult?.summary || designLoop?.latestGuiQaResult?.status || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest UI Quality result</span>
+            <code>{designLoop?.latestUiQualityResult?.summary || designLoop?.latestUiQualityResult?.status || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest QA verdict</span>
+            <code>{designLoop?.latestQaVerdict?.summary || designLoop?.latestQaVerdict?.verdict || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest issue count</span>
+            <code>{latestDesignLoopIssueCount}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest patch summary</span>
+            <code>{designLoop?.latestDevPatch?.summary || designLoop?.latestDevPatch?.status || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Latest design recommendation</span>
+            <code>{designLoop?.latestDesignReview?.recommendation || designReview?.recommendation || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Stop reason</span>
+            <code>{designLoop?.stopReason || "Not recorded"}</code>
+          </div>
+          <div className="settings-row">
+            <span>Artifact folder</span>
+            <code>{designLoop?.artifactFolder || uiQualityState?.designAssets?.loopsDir || "Not available"}</code>
+          </div>
+        </div>
+        {designLoopWarnings.map((warning) => <p className="muted" key={`design-loop:${warning}`}>{warning}</p>)}
         <div className="settings-grid">
           <div className="settings-row">
             <span>Page title</span>

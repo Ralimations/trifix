@@ -173,15 +173,18 @@ export async function runDesignDevPatch(payload = {}, onRequestStatus = null) {
     ].filter(Boolean).join("\n\n"),
     onRequestStatus
   });
-  const parsed = parseLeadOutput(String(output || ""), [], normalizePmArchitecture(null, payload?.originalRequest || "", null, ""));
+  const parsed = extractJsonObject(output) || null;
   return {
     rawOutput: output,
-    summary: parsed.summary || "",
-    fileOperations: parsed.fileOperations || [],
-    commandRequests: parsed.commandRequests || [],
-    toolRequests: parsed.toolRequests || [],
-    affectedFiles: parsed.affectedFiles || [],
-    validFormat: Array.isArray(parsed.fileOperations) && parsed.fileOperations.length > 0
+    parsed,
+    summary: String(parsed?.summary || "").trim(),
+    fileOperations: Array.isArray(parsed?.fileOperations) ? parsed.fileOperations : [],
+    notes: Array.isArray(parsed?.notes) ? parsed.notes.map((item) => String(item || "").trim()).filter(Boolean) : [],
+    toolRequests: normalizeToolRequests(parsed?.toolRequests),
+    affectedFiles: Array.isArray(parsed?.fileOperations)
+      ? parsed.fileOperations.map((entry) => String(entry?.path || "").trim()).filter(Boolean)
+      : [],
+    validFormat: isValidDesignDevPatchShape(parsed)
   };
 }
 
@@ -1922,7 +1925,7 @@ function extractJsonObject(output) {
 function buildToolRequestPrompt(role = "pm") {
   const normalized = String(role || "pm").trim().toLowerCase();
   const roleTools = normalized === "qa"
-    ? ["run_gui_qa", "run_ui_quality_check", "create_dependency_plan", "request_dev_patch"]
+    ? ["run_gui_qa", "run_ui_quality_check", "create_dependency_plan", "generate_ui_stack_recommendation", "request_dev_patch"]
     : normalized === "dev"
       ? ["create_dependency_plan", "request_dependency_install", "run_build", "run_gui_qa", "run_ui_quality_check"]
       : ["refresh_runbook", "run_gui_qa", "run_ui_quality_check", "create_ui_quality_contract", "generate_ui_stack_recommendation"];
@@ -3586,18 +3589,20 @@ function buildGuiQaPmFinalizationEvidence(payload = {}) {
 function buildDesignQaReviewSystemPrompt() {
   return [
     "You are Senior Dev / QA reviewing frontend UI quality evidence.",
-    "Reject works-but-basic UI.",
-    "Judge layout, spacing, hierarchy, typography, color, accessibility, interactivity, and polish.",
-    "Use the UI quality contract, selected stack, DOM audit, and screenshot evidence.",
-    "If visual quality is uncertain, use manual_review.",
+    "Reject works-but-basic, plain, tutorial, or generic dashboard UI.",
+    "Require cards, clear hierarchy, search or filter controls, status badges, activity or table or list sections, and responsive structure when the project type is dashboard/admin UI.",
+    "Prefer custom CSS polish when dependencies are unavailable or approval is missing.",
+    "Do not request dependency installs unless absolutely necessary.",
+    "Do not hallucinate screenshot findings. If you only received screenshot paths, say evidence is limited.",
+    "Use manual_review when evidence is insufficient.",
     "Output strict JSON only.",
     "{",
-    '  "verdict": "pass" | "needs_patch" | "manual_review",',
-    '  "summary": "...",',
-    '  "scores": { "layout": 0, "spacing": 0, "hierarchy": 0, "typography": 0, "color": 0, "accessibility": 0, "interactivity": 0, "polish": 0 },',
-    '  "designIssues": [{"severity":"low|medium|high","category":"layout|spacing|hierarchy|typography|color|accessibility|interactivity|polish","description":"...","suggestedFix":"..."}],',
-    '  "requiredFixes": ["..."],',
+    '  "verdict": "pass_candidate" | "needs_patch" | "manual_review",',
     '  "confidence": 0.0,',
+    '  "summary": "...",',
+    '  "issues": [{"severity":"critical|major|minor","area":"layout|visual_hierarchy|responsiveness|interactivity|accessibility|content|polish","message":"...","suggestedFix":"..."}],',
+    '  "mustFix": ["..."],',
+    '  "niceToHave": ["..."],',
     '  "toolRequests": []',
     "}",
     buildToolRequestPrompt("qa")
@@ -3608,12 +3613,19 @@ function buildDesignQaReviewEvidence(payload = {}) {
   return [
     `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2200)}`,
     payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1400)}` : "",
+    payload?.projectType ? `PROJECT_TYPE:\n${payload.projectType}` : "",
+    payload?.currentRound ? `CURRENT_ROUND:\n${payload.currentRound}` : "",
+    payload?.maxRounds ? `MAX_ROUNDS:\n${payload.maxRounds}` : "",
+    "KNOWN_CONSTRAINTS:\n- no auto-install\n- custom CSS fallback allowed\n- do not claim screenshots were seen if only paths were provided",
     payload?.currentFilesSummary ? `CURRENT_FILES_SUMMARY:\n${trimForPrompt(payload.currentFilesSummary, 1800)}` : "",
     payload?.changedFiles?.length ? `CHANGED_FILES:\n${payload.changedFiles.map((item) => `- ${item}`).join("\n")}` : "",
+    payload?.uiQualityContract ? `UI_QUALITY_CONTRACT_JSON:\n${JSON.stringify(payload.uiQualityContract, null, 2)}` : "",
+    payload?.uiStackRecommendation ? `UI_STACK_RECOMMENDATION_JSON:\n${JSON.stringify(payload.uiStackRecommendation, null, 2)}` : "",
     `DOM_AUDIT_JSON:\n${JSON.stringify(payload?.domAudit || {}, null, 2)}`,
     `DESIGN_REVIEW_JSON:\n${JSON.stringify(payload?.designReview || {}, null, 2)}`,
+    payload?.guiQaResult ? `GUI_QA_RESULT_JSON:\n${JSON.stringify(payload.guiQaResult, null, 2)}` : "",
     `DEPENDENCY_PLAN_JSON:\n${JSON.stringify(payload?.dependencyPlan || {}, null, 2)}`,
-    payload?.screenshotPath ? `SCREENSHOT_PATH:\n${payload.screenshotPath}` : "",
+    payload?.screenshotPaths?.length ? `SCREENSHOT_PATHS:\n${payload.screenshotPaths.join("\n")}` : "",
     [
       "Reject tutorial-grade dashboards.",
       "If the chosen stack is inconsistent or the DOM structure is too weak, use needs_patch.",
@@ -3625,10 +3637,13 @@ function buildDesignQaReviewEvidence(payload = {}) {
 function buildDesignDevPatchSystemPrompt() {
   return [
     "You are Junior Dev applying a UI-only design polish patch.",
-    "Patch relevant UI files only: CSS, layout, component structure, mock data, interaction affordances, and selected UI library usage when already installed or clearly allowed.",
+    "Patch the existing UI. Do not create a new project.",
+    "Preserve working functionality and buildability.",
+    "Use custom CSS fallback when dependencies are unavailable or approval is missing.",
+    "Do not add dependencies unless already approved.",
+    "Keep changes focused to src/App.jsx, src/styles.css, and small existing src support files when needed.",
     "Do not redesign unrelated functionality.",
-    "Do not add unnecessary dependencies.",
-    "Return JSON only with summary, fileOperations, commandRequests, and optional toolRequests.",
+    "Return strict JSON only with summary, fileOperations, notes, and optional toolRequests.",
     buildToolRequestPrompt("dev")
   ].join("\n");
 }
@@ -3637,13 +3652,16 @@ function buildDesignDevPatchEvidence(payload = {}) {
   return [
     `ORIGINAL_REQUEST:\n${trimForPrompt(payload?.originalRequest || "", 2200)}`,
     payload?.uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(payload.uiQualitySummary, 1400)}` : "",
+    "KNOWN_CONSTRAINTS:\n- patch existing UI only\n- no auto-install\n- custom CSS fallback allowed\n- preserve buildability",
     `QA_VERDICT_JSON:\n${JSON.stringify(payload?.qaVerdict || {}, null, 2)}`,
+    payload?.uiQualityContract ? `UI_QUALITY_CONTRACT_JSON:\n${JSON.stringify(payload.uiQualityContract, null, 2)}` : "",
+    payload?.uiStackRecommendation ? `UI_STACK_RECOMMENDATION_JSON:\n${JSON.stringify(payload.uiStackRecommendation, null, 2)}` : "",
     `DOM_AUDIT_JSON:\n${JSON.stringify(payload?.domAudit || {}, null, 2)}`,
     `DESIGN_REVIEW_JSON:\n${JSON.stringify(payload?.designReview || {}, null, 2)}`,
     `DEPENDENCY_PLAN_JSON:\n${JSON.stringify(payload?.dependencyPlan || {}, null, 2)}`,
     payload?.relevantFileExcerpts ? `RELEVANT_FILE_EXCERPTS:\n${trimForPrompt(payload.relevantFileExcerpts, 3200)}` : "",
     payload?.currentFileTree ? `CURRENT_FILE_TREE:\n${trimForPrompt(payload.currentFileTree, 1800)}` : "",
-    payload?.screenshotPath ? `SCREENSHOT_PATH:\n${payload.screenshotPath}` : "",
+    payload?.screenshotPaths?.length ? `SCREENSHOT_PATHS:\n${payload.screenshotPaths.join("\n")}` : "",
     "Return machine-readable fileOperations only for changed UI files."
   ].filter(Boolean).join("\n\n");
 }
@@ -3653,19 +3671,32 @@ function isValidDesignQaVerdictShape(parsed) {
     return false;
   }
   const verdict = String(parsed?.verdict || "").trim().toLowerCase();
-  if (!["pass", "needs_patch", "manual_review"].includes(verdict)) {
+  if (!["pass_candidate", "needs_patch", "manual_review"].includes(verdict)) {
     return false;
   }
   if (typeof parsed?.summary !== "string") {
     return false;
   }
-  if (!parsed?.scores || typeof parsed.scores !== "object") {
-    return false;
-  }
-  if (!Array.isArray(parsed?.designIssues) || !Array.isArray(parsed?.requiredFixes)) {
+  if (!Array.isArray(parsed?.issues) || !Array.isArray(parsed?.mustFix) || !Array.isArray(parsed?.niceToHave)) {
     return false;
   }
   return Number.isFinite(Number(parsed?.confidence));
+}
+
+function isValidDesignDevPatchShape(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return false;
+  }
+  if (typeof parsed?.summary !== "string") {
+    return false;
+  }
+  if (!Array.isArray(parsed?.fileOperations) || parsed.fileOperations.length === 0) {
+    return false;
+  }
+  if (parsed?.notes !== undefined && !Array.isArray(parsed.notes)) {
+    return false;
+  }
+  return true;
 }
 
 function buildAgentTestPrompt(agent, scenario) {
