@@ -31,6 +31,7 @@ const REQUEST_TIMEOUT_MS = 1800000;
 const SPEAKING_DELAY_MS = 800;
 const MAX_DEV_HANDOFF_CHARS = 2200;
 const REQUEST_STATUS_INTERVAL_MS = 15000;
+const DEV_JSON_REPAIR_TIMEOUT_MS = 3 * 60 * 1000;
 let lastResult = null;
 
 export function getLastResult() {
@@ -96,6 +97,8 @@ export async function runGuiQaDevPatch(payload = {}, onRequestStatus = null) {
     agent: AGENTS.junior,
     systemPrompt: buildGuiQaDevPatchSystemPrompt(),
     input,
+    requestOptions: buildDevRequestOptions(),
+    debugLabel: "junior gui patch",
     brainSeed: [
       payload?.originalRequest,
       JSON.stringify(payload?.qaVerdict || {}),
@@ -165,6 +168,8 @@ export async function runDesignDevPatch(payload = {}, onRequestStatus = null) {
     agent: AGENTS.junior,
     systemPrompt: buildDesignDevPatchSystemPrompt(),
     input,
+    requestOptions: buildDevRequestOptions(),
+    debugLabel: "junior design patch",
     brainSeed: [
       payload?.originalRequest,
       payload?.uiQualitySummary,
@@ -204,6 +209,13 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   const runMode = payload?.mode === "autonomous" || payload?.autonomy ? "autonomous" : "manual";
   const executionMode = String(payload?.executionMode || payload?.preflight?.runMode || "normal").trim().toLowerCase();
   const developerOnlyMode = executionMode === "degraded_developer_only";
+  const projectIntent = analyzeProjectIntent(input);
+  const onPmStageStarting = typeof payload?.onPmStageStarting === "function" ? payload.onPmStageStarting : null;
+  const onPmRequestStarting = typeof payload?.onPmRequestStarting === "function" ? payload.onPmRequestStarting : null;
+  const onPmRequestSent = typeof payload?.onPmRequestSent === "function" ? payload.onPmRequestSent : null;
+  const onPmResponseReceived = typeof payload?.onPmResponseReceived === "function" ? payload.onPmResponseReceived : null;
+  const onPmRequestFailed = typeof payload?.onPmRequestFailed === "function" ? payload.onPmRequestFailed : null;
+  const onRunPathResolved = typeof payload?.onRunPathResolved === "function" ? payload.onRunPathResolved : null;
   let pipelineRunPath = String(payload?.runPath || payload?.projectRoot || "").trim();
   debugPipeline("runPipeline start", { runId, runMode, executionMode, hasProjectRoot: Boolean(projectRoot) });
 
@@ -284,6 +296,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     pmArchitecture = normalizePmArchitecture(null, input, null, pmPlan);
     addParallelLog("PM planning skipped because developer-only degraded mode was selected");
   } else {
+    await onPmStageStarting?.();
     emitStage({ agent: "architect", stage: "supervisor-spec", status: "thinking" });
     const pmBrainSeed = [input, compactContext, feedback, revisionBrief].filter(Boolean).join("\n\n");
     debugPipeline("pm call start", {
@@ -295,14 +308,26 @@ export async function runPipeline(payload, emitProgress = () => {}) {
       timeoutMs: AGENTS.architect.timeoutMs,
       timeoutSource: AGENTS.architect.timeoutSource || "default"
     });
-    pmPlan = await callAgentWithBrain({
-      agent: AGENTS.architect,
-      systemPrompt: buildSupervisorSpecSystemPrompt(),
-      input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest, uiQualitySummary }),
-      brainSeed: pmBrainSeed,
-      onRequestStatus: (requestStatus) =>
-        emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount })
-    });
+    try {
+      pmPlan = await callAgentWithBrain({
+        agent: AGENTS.architect,
+        systemPrompt: buildSupervisorSpecSystemPrompt(),
+        input: buildSupervisorSpecContext({ compactContext, feedback, revisionBrief, loopCount, isExistingProjectRequest, uiQualitySummary }),
+        brainSeed: pmBrainSeed,
+        onRequestStatus: (requestStatus) => {
+          if (requestStatus?.phase === "prompt-sent") {
+            void onPmRequestSent?.();
+          } else {
+            void onPmRequestStarting?.();
+          }
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "architect", stage: "supervisor-spec", status: "thinking", requestStatus, loopCount });
+        }
+      });
+      await onPmResponseReceived?.();
+    } catch (error) {
+      await onPmRequestFailed?.(error);
+      throw error;
+    }
     debugPipeline("pm call end", { runId });
     addParallelLog("Supervisor spec created");
     pmArchitecture = normalizePmArchitecture(extractJsonObject(pmPlan), input, null, pmPlan);
@@ -318,6 +343,7 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   if (!pipelineRunPath) {
     pipelineRunPath = buildPlannedRunPath(payload?.sandboxParentPath, pmArchitecture?.projectSlug);
     if (pipelineRunPath) {
+      await onRunPathResolved?.(pipelineRunPath, pmArchitecture);
       await initializePipelineRunState({
         runPath: pipelineRunPath,
         runId,
@@ -398,29 +424,6 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   let qaHealth = { online: false, error: "" };
   let qaEndpointOnline = false;
   let qaUnavailableReason = "QA skipped in developer-only degraded mode.";
-  if (!developerOnlyMode) {
-    debugPipeline("qa health check start", { runId });
-    qaHealth = await getQaHealthSnapshot();
-    debugPipeline("qa health check end", { runId, qaOnline: qaHealth.online, qaError: qaHealth.error || "" });
-    qaEndpointOnline = qaHealth.online;
-    qaUnavailableReason = qaEndpointOnline
-      ? ""
-      : `QA unavailable. Continuing with deterministic verification. ${qaHealth.error || "QA endpoint is offline."}`.trim();
-    emitStage({
-      agent: "supervisor",
-      stage: "senior-parallel-review",
-      status: "thinking",
-      projectPlan,
-      partialResult: {
-        supervisor: qaInstructionResult,
-        critique: qaDevHandoff.trim(),
-        qa: {
-          structureReview: qaStructureReview,
-          instructions: qaDevHandoff.trim()
-        }
-      }
-    });
-  }
 
   addParallelLog("Junior Dev started");
   if (pipelineRunPath) {
@@ -464,17 +467,27 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   
   debugPipeline("junior payload details", {
     runId,
+    agent: AGENTS.junior.name,
     endpoint: AGENTS.junior.endpoint,
     model: AGENTS.junior.model,
+    requestedMaxOutputTokens: resolveRequestedMaxOutputTokens(buildDevRequestOptions()),
+    outputBudgetSource: resolveOutputBudgetSource(buildDevRequestOptions()),
     systemPromptLength: juniorSystemPrompt.length,
     inputLength: juniorInput.length,
-    totalPayloadSize: juniorSystemPrompt.length + juniorInput.length
+    totalPayloadSize: Buffer.byteLength(JSON.stringify({
+      model: AGENTS.junior.model,
+      system_prompt: juniorSystemPrompt,
+      input: juniorInput,
+      ...buildDevRequestOptions()
+    }), "utf8")
   });
 
   const juniorInitialTask = trackAgentCall(callAgentWithBrain({
     agent: AGENTS.junior,
     systemPrompt: juniorSystemPrompt,
     input: juniorInput,
+    requestOptions: buildDevRequestOptions(),
+    debugLabel: "junior",
     brainSeed: [input, compactContext, pmPlan, JSON.stringify(pmArchitecture || {})].filter(Boolean).join("\n\n"),
     allowPartialResponse: singleFileHtmlMode,
     onRequestStatus: (requestStatus) =>
@@ -482,26 +495,6 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }));
 
   let seniorParallelTask = null;
-  if (qaEndpointOnline) {
-    addParallelLog("Senior Dev started");
-    debugPipeline("qa task create", { runId, skipped: false });
-  } else if (!developerOnlyMode) {
-    addParallelLog("Senior Dev skipped because QA endpoint is offline");
-    debugPipeline("qa skip branch", { runId, reason: qaUnavailableReason });
-  }
-  if (!developerOnlyMode) {
-    emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "testing", projectPlan });
-  }
-  if (qaEndpointOnline) {
-    seniorParallelTask = trackAgentCall(callAgentWithBrain({
-      agent: AGENTS.supervisor,
-      systemPrompt: buildSeniorParallelSystemPrompt(),
-      input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount, uiQualitySummary }),
-      brainSeed: [input, compactContext, pmPlan, JSON.stringify(pmArchitecture || {})].filter(Boolean).join("\n\n"),
-      onRequestStatus: (requestStatus) =>
-        emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
-    }));
-  }
 
   const juniorInitialSettled = await juniorInitialTask.promise;
   debugPipeline("junior call end", { runId, status: juniorInitialSettled.status });
@@ -515,8 +508,153 @@ export async function runPipeline(payload, emitProgress = () => {}) {
     throw new Error(`Junior Dev failed before producing file changes: ${errorMsg}`);
   }
 
-  const juniorInitialOutput = juniorInitialSettled.value;
-  const juniorInitialLeadResult = parseLeadOutput(juniorInitialOutput, filesAnalyzed, pmArchitecture);
+  let juniorInitialOutput = juniorInitialSettled.value;
+  await logDevOutputEvent(pipelineRunPath, "junior-raw-output-received", {
+    runId,
+    outputLength: juniorInitialOutput.length
+  });
+  await logDevOutputEvent(pipelineRunPath, "junior-json-extract-start", { runId });
+  let juniorInitialLeadResult = parseLeadOutput(juniorInitialOutput, filesAnalyzed, pmArchitecture);
+  await logDevOutputEvent(
+    pipelineRunPath,
+    juniorInitialLeadResult.parseMeta?.jsonExtracted ? "junior-json-extract-success" : "junior-json-extract-failed",
+    {
+      runId,
+      parseError: juniorInitialLeadResult.parseMeta?.jsonParseError || ""
+    }
+  );
+  await logDevOutputEvent(
+    pipelineRunPath,
+    juniorInitialLeadResult.parseMeta?.jsonParsed ? "junior-json-parse-success" : "junior-json-parse-failed",
+    {
+      runId,
+      parseError: juniorInitialLeadResult.parseMeta?.jsonParseError || ""
+    }
+  );
+  await logDevOutputEvent(pipelineRunPath, "junior-file-operations-count", {
+    runId,
+    accepted: juniorInitialLeadResult.fileOperations.length,
+    rejected: Array.isArray(juniorInitialLeadResult.parseMeta?.rejectedFileOperations) ? juniorInitialLeadResult.parseMeta.rejectedFileOperations.length : 0
+  });
+  for (const operation of juniorInitialLeadResult.fileOperations || []) {
+    await logDevOutputEvent(pipelineRunPath, "junior-file-operation-accepted", {
+      runId,
+      path: operation.path,
+      action: operation.action
+    });
+  }
+  for (const rejected of juniorInitialLeadResult.parseMeta?.rejectedFileOperations || []) {
+    await logDevOutputEvent(pipelineRunPath, "junior-file-operation-rejected", {
+      runId,
+      path: rejected.path || "",
+      action: rejected.action || "",
+      reason: rejected.reason || "invalid operation shape"
+    });
+  }
+  if (!juniorInitialLeadResult.parseMeta?.jsonParsed) {
+    const artifacts = await writeDevDebugArtifacts(pipelineRunPath, runId, juniorInitialOutput, null);
+    const repairAttempt = await attemptDevJsonRepair({
+      runPath: pipelineRunPath,
+      runId,
+      rawOutput: juniorInitialOutput,
+      parseError: juniorInitialLeadResult.parseMeta?.jsonParseError || "",
+      compactContext,
+      pmArchitecture,
+      projectIntent,
+      isExistingProjectRequest,
+      uiQualitySummary
+    });
+    if (repairAttempt?.success) {
+      juniorInitialOutput = repairAttempt.output;
+      juniorInitialLeadResult = repairAttempt.leadResult;
+      await logDevOutputEvent(pipelineRunPath, "junior-json-repair-success", {
+        runId,
+        outputLength: juniorInitialOutput.length
+      });
+    } else {
+      if (repairAttempt?.timedOut) {
+        const error = new Error("DEV JSON repair timed out. Raw output was saved for debugging.");
+        error.code = "EDEVJSONREPAIRTIMEOUT";
+        error.autonomyStatus = "dev_json_repair_timeout";
+        error.debugArtifactPath = artifacts.rawPath;
+        error.debugMetadata = buildDevInvalidJsonMetadata({
+          status: "dev_json_repair_timeout",
+          rawOutputPath: artifacts.rawPath,
+          repairRawOutputPath: repairAttempt?.rawPath || "",
+          outputLength: juniorInitialOutput.length,
+          parseError: repairAttempt.parseError || juniorInitialLeadResult.parseMeta?.jsonParseError || "",
+          parsePosition: extractJsonParsePosition(juniorInitialLeadResult.parseMeta?.jsonParseError || "")
+        });
+        throw error;
+      }
+      if (repairAttempt?.attempted) {
+        await logDevOutputEvent(pipelineRunPath, "junior-json-repair-failed", {
+          runId,
+          parseError: repairAttempt.parseError || ""
+        });
+      }
+      const error = new Error("DEV returned malformed JSON. Raw output was saved for debugging.");
+      error.code = "EDEVINVALIDJSON";
+      error.autonomyStatus = "dev_invalid_json";
+      error.debugArtifactPath = artifacts.rawPath;
+      error.debugMetadata = buildDevInvalidJsonMetadata({
+        status: "dev_invalid_json",
+        rawOutputPath: artifacts.rawPath,
+        repairRawOutputPath: repairAttempt?.rawPath || "",
+        outputLength: juniorInitialOutput.length,
+        parseError: juniorInitialLeadResult.parseMeta?.jsonParseError || "",
+        parsePosition: extractJsonParsePosition(juniorInitialLeadResult.parseMeta?.jsonParseError || "")
+      });
+      throw error;
+    }
+  }
+  if (!Array.isArray(juniorInitialLeadResult.fileOperations) || juniorInitialLeadResult.fileOperations.length === 0) {
+    const artifacts = await writeDevDebugArtifacts(pipelineRunPath, runId, juniorInitialOutput, juniorInitialLeadResult.parseMeta?.parsedJson || null);
+    const error = new Error("DEV completed but produced no valid file operations.");
+    error.code = "EDEVNOFILEOPS";
+    error.autonomyStatus = "dev_no_valid_file_operations";
+    error.debugArtifactPath = artifacts.rawPath;
+    throw error;
+  }
+  if (!developerOnlyMode) {
+    debugPipeline("qa health check start", { runId });
+    qaHealth = await getQaHealthSnapshot();
+    debugPipeline("qa health check end", { runId, qaOnline: qaHealth.online, qaError: qaHealth.error || "" });
+    qaEndpointOnline = qaHealth.online;
+    qaUnavailableReason = qaEndpointOnline
+      ? ""
+      : `QA unavailable. Continuing with deterministic verification. ${qaHealth.error || "QA endpoint is offline."}`.trim();
+    emitStage({
+      agent: "supervisor",
+      stage: "senior-parallel-review",
+      status: "thinking",
+      projectPlan,
+      partialResult: {
+        supervisor: qaInstructionResult,
+        critique: qaDevHandoff.trim(),
+        qa: {
+          structureReview: qaStructureReview,
+          instructions: qaDevHandoff.trim()
+        }
+      }
+    });
+    if (qaEndpointOnline) {
+      addParallelLog("Senior Dev started");
+      debugPipeline("qa task create", { runId, skipped: false });
+      emitStage({ agent: "supervisor", stage: "senior-parallel-review", status: "testing", projectPlan });
+      seniorParallelTask = trackAgentCall(callAgentWithBrain({
+        agent: AGENTS.supervisor,
+        systemPrompt: buildSeniorParallelSystemPrompt(),
+        input: buildSeniorParallelContext({ compactContext, prd, pmPlan, pmArchitecture, qaDevHandoff, feedback, revisionBrief, loopCount, uiQualitySummary }),
+        brainSeed: [input, compactContext, pmPlan, JSON.stringify(pmArchitecture || {})].filter(Boolean).join("\n\n"),
+        onRequestStatus: (requestStatus) =>
+          emitAgentRequestProgress({ emitProgress, runId, agentId: "supervisor", stage: "senior-parallel-review", status: "testing", requestStatus, loopCount, projectPlan })
+      }));
+    } else {
+      addParallelLog("Senior Dev skipped because QA endpoint is offline");
+      debugPipeline("qa skip branch", { runId, reason: qaUnavailableReason });
+    }
+  }
   const juniorInitialResult = buildJuniorResult(juniorInitialOutput);
   if (pipelineRunPath) {
     await trackProposedFiles(pipelineRunPath, juniorInitialLeadResult.fileOperations || []);
@@ -686,6 +824,8 @@ export async function runPipeline(payload, emitProgress = () => {}) {
           uiQualitySummary,
           isExistingProjectRequest
         }),
+        requestOptions: buildDevRequestOptions(),
+        debugLabel: "junior patch",
         brainSeed: [input, compactContext, pmPlan, seniorParallelReview, juniorInitialOutput].filter(Boolean).join("\n\n"),
         onRequestStatus: (requestStatus) =>
           emitAgentRequestProgress({ emitProgress, runId, agentId: "junior", stage: "junior-patch", status: "coding", requestStatus, loopCount, projectPlan })
@@ -701,6 +841,27 @@ export async function runPipeline(payload, emitProgress = () => {}) {
   }
 
   const finalDevOutput = [juniorInitialOutput, juniorPatchOutput].filter(Boolean).join("\n\nPATCH PASS:\n");
+  const requiredGeneratedFiles = !isExistingProjectRequest ? getRequiredGeneratedProjectFiles(projectIntent) : [];
+  const changedFilePaths = uniqueStrings((finalLeadResult.fileOperations || []).map((operation) => operation.path));
+  if (!isExistingProjectRequest && changedFilePaths.length === 0) {
+    const artifacts = await writeDevDebugArtifacts(pipelineRunPath, runId, finalDevOutput, finalLeadResult.parseMeta?.parsedJson || null);
+    const error = new Error("DEV completed but produced no valid file operations.");
+    error.code = "EDEVNOFILEOPS";
+    error.autonomyStatus = "dev_no_valid_file_operations";
+    error.debugArtifactPath = artifacts.rawPath;
+    throw error;
+  }
+  if (!isExistingProjectRequest && requiredGeneratedFiles.length > 0) {
+    const missingRequiredFiles = requiredGeneratedFiles.filter((filePath) => !changedFilePaths.includes(filePath));
+    if (missingRequiredFiles.length > 0) {
+      const artifacts = await writeDevDebugArtifacts(pipelineRunPath, runId, finalDevOutput, finalLeadResult.parseMeta?.parsedJson || null);
+      const error = new Error(`DEV did not create required project files: ${missingRequiredFiles.join(", ")}`);
+      error.code = "EDEVMISSINGFILES";
+      error.autonomyStatus = "dev_missing_required_project_files";
+      error.debugArtifactPath = artifacts.rawPath;
+      throw error;
+    }
+  }
   if (pipelineRunPath) {
     await trackProposedFiles(pipelineRunPath, finalLeadResult.fileOperations || []);
     await trackCommandRequests(pipelineRunPath, finalLeadResult.commandRequests || []);
@@ -1042,7 +1203,15 @@ function emitAgentRequestProgress({ emitProgress, runId, agentId, stage, status,
   });
 }
 
-async function callAgent({ agent, systemPrompt, input, onRequestStatus, allowPartialResponse = false }) {
+async function callAgent({
+  agent,
+  systemPrompt,
+  input,
+  onRequestStatus,
+  allowPartialResponse = false,
+  requestOptions = null,
+  debugLabel = ""
+}) {
   const requestTimeoutMs = agent.timeoutMs || REQUEST_TIMEOUT_MS;
   const endpoint = agent.endpoint || AI_ENDPOINT;
   const startedAt = Date.now();
@@ -1075,8 +1244,22 @@ async function callAgent({ agent, systemPrompt, input, onRequestStatus, allowPar
     const body = {
       model: agent.model,
       system_prompt: systemPrompt,
-      input
+      input,
+      ...(requestOptions && typeof requestOptions === "object" ? requestOptions : {})
     };
+
+    if (debugLabel) {
+      debugPipeline(`${debugLabel} payload details`, {
+        agent: agent.name,
+        endpoint,
+        model: agent.model,
+        requestedMaxOutputTokens: resolveRequestedMaxOutputTokens(requestOptions),
+        outputBudgetSource: resolveOutputBudgetSource(requestOptions),
+        systemPromptLength: systemPrompt.length,
+        inputLength: input.length,
+        totalPayloadSize: Buffer.byteLength(JSON.stringify(body), "utf8")
+      });
+    }
 
     emitRequestStatus("prompt-sent", "Prompt sent");
     startStatusTimer(() => emitRequestStatus("model-processing", "Model processing"), 1000);
@@ -1092,6 +1275,33 @@ async function callAgent({ agent, systemPrompt, input, onRequestStatus, allowPar
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
+      const serverError = parseServerError(body);
+      if (isInvalidRequestPayloadError(serverError)) {
+        const debugMetadata = buildInvalidPayloadMetadata({
+          serverError,
+          endpoint,
+          model: agent.model,
+          requestedMaxOutputTokens: resolveRequestedMaxOutputTokens(requestOptions),
+          outputBudgetSource: resolveOutputBudgetSource(requestOptions)
+        });
+        debugPipeline("model-request-invalid-payload", {
+          agent: agent.name,
+          endpoint,
+          model: agent.model,
+          type: debugMetadata.type,
+          code: debugMetadata.code,
+          rejectedKeys: debugMetadata.rejectedKeys,
+          requestedMaxOutputTokens: debugMetadata.requestedMaxOutputTokens,
+          outputBudgetSource: debugMetadata.outputBudgetSource
+        });
+        const error = new Error(
+          `${agent.name} request payload was rejected by the model backend.${debugMetadata.rejectedKeys.length > 0 ? ` Rejected keys: ${debugMetadata.rejectedKeys.join(", ")}.` : ""}`
+        );
+        error.code = "EINVALIDPAYLOAD";
+        error.autonomyStatus = "model_request_invalid_payload";
+        error.debugMetadata = debugMetadata;
+        throw error;
+      }
       throw new Error(formatAgentHttpError({ agent, endpoint, status: response.status, body }));
     }
 
@@ -1176,7 +1386,9 @@ async function callAgentWithBrain({
   input,
   onRequestStatus,
   allowPartialResponse = false,
-  brainSeed = ""
+  brainSeed = "",
+  requestOptions = null,
+  debugLabel = ""
 }) {
   const role = String(agent?.id || "").trim().toLowerCase();
   let finalInput = input;
@@ -1212,8 +1424,31 @@ async function callAgentWithBrain({
     systemPrompt,
     input: finalInput,
     onRequestStatus,
-    allowPartialResponse
+    allowPartialResponse,
+    requestOptions,
+    debugLabel
   });
+}
+
+function buildDevRequestOptions() {
+  return {};
+}
+
+function resolveRequestedMaxOutputTokens(requestOptions) {
+  if (!requestOptions || typeof requestOptions !== "object") {
+    return 0;
+  }
+  return Number(
+    requestOptions.max_tokens
+    || requestOptions.maxTokens
+    || requestOptions.max_new_tokens
+    || requestOptions.n_predict
+    || 0
+  );
+}
+
+function resolveOutputBudgetSource(requestOptions) {
+  return resolveRequestedMaxOutputTokens(requestOptions) > 0 ? "request-override" : "backend-default";
 }
 
 function postJson({ endpoint, headers, body, timeoutMs }) {
@@ -1689,18 +1924,57 @@ function parseServerError(body) {
   try {
     const parsed = JSON.parse(body);
     const error = parsed.error || parsed;
+    const message = error.message || parsed.message || "";
+    const rejectedKeys = extractRejectedKeys(message);
 
     return {
       code: error.code || parsed.code || "",
-      message: error.message || parsed.message || ""
+      type: error.type || parsed.type || "",
+      message,
+      rejectedKeys
     };
   } catch {
     return null;
   }
 }
 
+function extractRejectedKeys(message) {
+  const matches = Array.from(String(message || "").matchAll(/'([^']+)'/g));
+  return matches.map((match) => String(match?.[1] || "").trim()).filter(Boolean);
+}
+
+function isInvalidRequestPayloadError(serverError) {
+  const type = String(serverError?.type || "").trim().toLowerCase();
+  const code = String(serverError?.code || "").trim().toLowerCase();
+  const message = String(serverError?.message || "").trim().toLowerCase();
+  return type === "invalid_request"
+    || code === "unrecognized_keys"
+    || /unrecognized key/.test(message);
+}
+
+function buildInvalidPayloadMetadata({
+  serverError,
+  endpoint = "",
+  model = "",
+  requestedMaxOutputTokens = 0,
+  outputBudgetSource = "backend-default"
+} = {}) {
+  return {
+    status: "model_request_invalid_payload",
+    code: String(serverError?.code || ""),
+    type: String(serverError?.type || ""),
+    parseError: String(serverError?.message || ""),
+    rejectedKeys: Array.isArray(serverError?.rejectedKeys) ? serverError.rejectedKeys : [],
+    endpoint: String(endpoint || ""),
+    model: String(model || ""),
+    requestedMaxOutputTokens: Number(requestedMaxOutputTokens || 0),
+    outputBudgetSource: String(outputBudgetSource || "backend-default")
+  };
+}
+
 function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null) {
-  const parsedJson = extractJsonObject(output);
+  const jsonExtraction = extractJsonObjectDetailed(output);
+  const parsedJson = jsonExtraction.parsed;
   const nestedJson = findNestedOperationContainer(parsedJson);
   const summary = extractSection(output, "SUMMARY");
   const rationale = extractSection(output, "RATIONALE");
@@ -1716,7 +1990,7 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
   ];
   const fallbackCodeFence = output.match(/```[\w+-]*\n([\s\S]*?)```/);
   const htmlFallbackOperation = buildSingleFileHtmlFallback(output, expectedPaths);
-  const jsonFileOperations = mergeByPath(
+  const candidateJsonFileOperations = mergeByPath(
     normalizeFileOperations(parsedJson?.fileOperations),
     normalizeFileOperations(parsedJson?.operations),
     normalizeFileOperations(parsedJson?.patches),
@@ -1749,11 +2023,13 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
     ];
   }
 
-  const fileOperations = jsonFileOperations.length > 0
-    ? jsonFileOperations
+  const rawFileOperations = candidateJsonFileOperations.length > 0
+    ? candidateJsonFileOperations
     : htmlFallbackOperation
       ? [htmlFallbackOperation]
       : fileOperationsFromPatches(normalizedPatches);
+  const validatedFileOperations = validateLeadFileOperations(rawFileOperations, expectedArchitecture);
+  const fileOperations = validatedFileOperations.accepted;
   const normalizedPatchesForApply = normalizedPatches.length > 0
     ? normalizedPatches
     : fileOperations.map((operation) => ({
@@ -1784,8 +2060,17 @@ function parseLeadOutput(output, filesAnalyzed = [], expectedArchitecture = null
     patches: normalizedPatchesForApply,
     fileOperations,
     fixedCode: fileOperations[0]?.content || normalizedPatchesForApply[0]?.content || cleanCode(fallbackCodeFence?.[1] || output),
-    recommendation: parsedJson?.recommendation || recommendation || output.trim()
-  };
+    recommendation: parsedJson?.recommendation || recommendation || output.trim(),
+      parseMeta: {
+        rawOutputLength: String(output || "").length,
+        jsonExtracted: jsonExtraction.extracted,
+        jsonParsed: jsonExtraction.parsedSuccessfully,
+        jsonParseError: jsonExtraction.parseError || "",
+        parsedJson: jsonExtraction.parsedSuccessfully ? parsedJson : null,
+        rejectedFileOperations: validatedFileOperations.rejected,
+        acceptedFileOperations: fileOperations.length
+      }
+    };
 }
 
 function normalizeToolRequests(value) {
@@ -1893,10 +2178,15 @@ function findNestedOperationContainer(value) {
   return null;
 }
 
-function extractJsonObject(output) {
+function extractJsonObjectDetailed(output) {
   const text = String(output || "").trim();
   if (!text) {
-    return null;
+    return {
+      parsed: null,
+      extracted: false,
+      parsedSuccessfully: false,
+      parseError: "empty output"
+    };
   }
 
   const candidates = [];
@@ -1910,16 +2200,36 @@ function extractJsonObject(output) {
     candidates.push(text.slice(firstBrace, lastBrace + 1));
   }
 
+  let lastParseError = "";
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate.trim());
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed;
+        return {
+          parsed,
+          extracted: true,
+          parsedSuccessfully: true,
+          parseError: ""
+        };
       }
-    } catch {}
+    } catch (error) {
+      lastParseError = error?.message || "JSON parse failed";
+    }
   }
 
-  return null;
+  return {
+    parsed: null,
+    extracted: candidates.some((candidate) => {
+      const trimmed = String(candidate || "").trim();
+      return trimmed.startsWith("{") || trimmed.startsWith("[") || trimmed.includes("```");
+    }),
+    parsedSuccessfully: false,
+    parseError: lastParseError || "JSON parse failed"
+  };
+}
+
+function extractJsonObject(output) {
+  return extractJsonObjectDetailed(output).parsed;
 }
 
 function buildToolRequestPrompt(role = "pm") {
@@ -2127,7 +2437,7 @@ function defaultFileArchitectureForIntent(intent) {
       { path: "vite.config.js", purpose: "Vite config with React plugin" },
       { path: "src/main.jsx", purpose: "React entry point" },
       { path: "src/App.jsx", purpose: intent?.wantsDashboard ? "React dashboard UI" : "React app shell" },
-      { path: "src/index.css", purpose: "App styles" }
+      { path: "src/styles.css", purpose: "App styles" }
     ];
 
     if (!intent?.wantsShadcn) {
@@ -2145,6 +2455,20 @@ function defaultFileArchitectureForIntent(intent) {
   }
 
   return [{ path: "index.html", purpose: "Single-file app entry point" }];
+}
+
+function getRequiredGeneratedProjectFiles(intent) {
+  if (!isModernReactAppIntent(intent)) {
+    return [];
+  }
+  return [
+    "package.json",
+    "index.html",
+    "vite.config.js",
+    "src/main.jsx",
+    "src/App.jsx",
+    "src/styles.css"
+  ];
 }
 
 function defaultImplementationPlanForIntent(intent, fileArchitecture) {
@@ -2241,6 +2565,88 @@ function normalizeFileOperationAction(value) {
   }
 
   return action;
+}
+
+function validateLeadFileOperations(fileOperations, expectedArchitecture = null) {
+  if (!Array.isArray(fileOperations)) {
+    return { accepted: [], rejected: [] };
+  }
+
+  const accepted = [];
+  const rejected = [];
+  const projectSlug = sanitizeProjectSlug(expectedArchitecture?.projectSlug || "");
+  const projectNameSlug = sanitizeProjectSlug(expectedArchitecture?.projectName || "");
+
+  for (const operation of fileOperations) {
+    const candidate = operation && typeof operation === "object" ? operation : null;
+    const action = normalizeFileOperationAction(candidate?.action);
+    const filePath = toProjectPath(candidate?.path || "");
+    const content = typeof candidate?.content === "string" ? candidate.content : String(candidate?.content || "");
+    let reason = "";
+
+    if (!candidate) {
+      reason = "invalid operation shape";
+    } else if (!filePath) {
+      reason = "missing path";
+    } else if (action !== "write") {
+      reason = "unsupported action";
+    } else if (filePath.startsWith("../") || filePath.includes("/../") || path.isAbsolute(filePath)) {
+      reason = "outside project root";
+    } else if (isInvalidNestedProjectFolderPath(filePath, { projectSlug, projectNameSlug })) {
+      reason = "invalid_nested_project_folder";
+    } else if (/^(node_modules|\.git|dist|build)(\/|$)/i.test(filePath)) {
+      reason = "blocked path";
+    } else if (!("content" in candidate)) {
+      reason = "missing content";
+    } else if (!String(content).trim()) {
+      reason = "empty content";
+    }
+
+    if (reason) {
+      rejected.push({
+        action,
+        path: filePath,
+        reason
+      });
+      continue;
+    }
+
+    accepted.push({
+      action: "write",
+      path: filePath,
+      content
+    });
+  }
+
+  return {
+    accepted: mergeByPath(accepted),
+    rejected
+  };
+}
+
+function isInvalidNestedProjectFolderPath(filePath, { projectSlug = "", projectNameSlug = "" } = {}) {
+  const normalized = toProjectPath(filePath);
+  if (!normalized || !normalized.includes("/")) {
+    return false;
+  }
+  const [firstSegment] = normalized.split("/");
+  const lowerFirstSegment = String(firstSegment || "").trim().toLowerCase();
+  if (!lowerFirstSegment) {
+    return false;
+  }
+  if (lowerFirstSegment === "sandbox folder") {
+    return true;
+  }
+  if (["sandbox", "tasks"].includes(lowerFirstSegment)) {
+    return true;
+  }
+  if (projectSlug && lowerFirstSegment === projectSlug) {
+    return true;
+  }
+  if (projectNameSlug && lowerFirstSegment === projectNameSlug) {
+    return true;
+  }
+  return false;
 }
 
 function fileOperationsFromPatches(patches) {
@@ -2617,14 +3023,35 @@ function buildJuniorInitialSystemPrompt() {
     "Do not refuse.",
     "Do not give general suggestions or tutorial text.",
     "Do not mention Tailwind, routing, Jest, or React Testing Library unless the user explicitly requested them.",
-    "Return fileOperations JSON or path-tagged code blocks only.",
+    "Return strict JSON only.",
+    "Top-level JSON shape must be exactly: {\"summary\":\"...\",\"fileOperations\":[{\"action\":\"write\",\"path\":\"package.json\",\"content\":\"...\"}],\"notes\":[]}.",
+    "Do not use markdown fences.",
+    "Do not include prose before or after the JSON.",
+    "Do not include pathTag or any extra fields.",
+    "Each fileOperations item may contain only action, path, and content.",
+    "action must always be write.",
+    "Do not write into \"Sandbox folder\".",
+    "Do not create a nested project folder.",
+    "All paths must be relative to the current project root.",
+    "Do not output absolute paths.",
+    "Do not output ../ paths.",
+    "Do not output sandbox/ or tasks/ prefixes.",
+    "Do not request dependency installs.",
+    "Use custom CSS only.",
     "Do not think aloud.",
     "Do not output 'Thinking Process'.",
     "Do not output reasoning.",
     "Return final answer only.",
     "Do not return partial JSON.",
     "For new-project or FSD-only tasks, output the full file content needed for each write operation.",
-    "For Vite React projects, package.json must include react, react-dom, vite, and @vitejs/plugin-react when vite.config.js imports it."
+    "For Vite React projects, package.json must include react, react-dom, vite, and @vitejs/plugin-react when vite.config.js imports it.",
+    "For Vite React projects, create package.json, index.html, vite.config.js, src/main.jsx, src/App.jsx, and src/styles.css.",
+    "Keep src/App.jsx under 100 lines when possible.",
+    "Keep src/styles.css under 160 lines when possible.",
+    "Do not use long comments, large arrays, or inline SVG.",
+    "Use compact mock data.",
+    "Valid complete JSON is more important than visual polish.",
+    "If the JSON may be too long, simplify the UI. Do not risk malformed JSON."
   ].join("\n");
 }
 
@@ -2654,7 +3081,18 @@ function buildJuniorDeveloperOnlyContext({
       singleFileHtmlMode
         ? "Create exactly one full HTML document in index.html."
         : "If this is a Vite/React request, create a runnable multi-file Vite/React source structure.",
-      "Return fileOperations JSON or path-tagged code blocks only."
+      "Do not write into \"Sandbox folder\" or create a nested project folder.",
+      "All paths must be relative to the current project root.",
+      "Return strict JSON only with top-level keys summary, fileOperations, and notes.",
+      "Do not include pathTag, markdown fences, or prose outside the JSON.",
+      "Each fileOperations item may contain only action, path, and content.",
+      "action must always be write.",
+      "Use custom CSS only.",
+      "Do not request dependency installs.",
+      "Keep src/App.jsx under 100 lines and src/styles.css under 160 lines when generating Vite React dashboards.",
+      "Do not use long comments, large arrays, or inline SVG.",
+      "Valid complete JSON is more important than visual polish.",
+      "If the JSON may be too long, simplify the UI. Do not risk malformed JSON."
     ].join("\n")
   ].filter(Boolean).join("\n\n");
 }
@@ -2689,9 +3127,18 @@ function buildJuniorPatchSystemPrompt() {
     "Apply only necessary fixes.",
     "Do not rewrite completed work.",
     "Do not create new folders unless required.",
+    "Return strict JSON only with top-level keys summary, fileOperations, and notes.",
     "Return only changed files and concise summary.",
     "Return machine-readable fileOperations for changed files.",
-    "Max output: 700 tokens."
+    "Do not include pathTag or extra fields.",
+    "Each fileOperations item may contain only action, path, and content.",
+    "action must always be write.",
+    "Do not write into \"Sandbox folder\" or create a nested project folder.",
+    "All paths must be relative to the current project root.",
+    "Do not use markdown fences or prose outside the JSON.",
+    "Keep src/App.jsx under 100 lines and src/styles.css under 160 lines when possible.",
+    "Do not use long comments, large arrays, or inline SVG.",
+    "Valid complete JSON is more important than visual polish."
   ].join("\n");
 }
 
@@ -2808,6 +3255,197 @@ function debugPipeline(message, details = {}) {
   } catch {
     console.error(`[trifix-runPipeline] ${message}`);
   }
+}
+
+async function logDevOutputEvent(runPath, event, payload = {}) {
+  debugPipeline(event, payload);
+  if (!runPath) {
+    return;
+  }
+  await appendRunLog(runPath, {
+    type: "dev-output",
+    event,
+    ...payload
+  }).catch(() => {});
+}
+
+async function writeDevDebugArtifacts(runPath, runId, rawOutput, parsedJson = null, options = {}) {
+  if (!runPath || !runId) {
+    return { rawPath: "", parsedPath: "" };
+  }
+  const debugDir = path.join(runPath, ".trifix", "debug");
+  await fs.mkdir(debugDir, { recursive: true });
+  const rawPrefix = String(options?.rawPrefix || "dev-raw-output").trim() || "dev-raw-output";
+  const parsedPrefix = String(options?.parsedPrefix || "dev-parsed-output").trim() || "dev-parsed-output";
+  const rawPath = path.join(debugDir, `${rawPrefix}-${runId}.txt`);
+  await fs.writeFile(rawPath, String(rawOutput || ""), "utf8");
+  let parsedPath = "";
+  if (parsedJson && typeof parsedJson === "object") {
+    parsedPath = path.join(debugDir, `${parsedPrefix}-${runId}.json`);
+    await fs.writeFile(parsedPath, `${JSON.stringify(parsedJson, null, 2)}\n`, "utf8");
+  }
+  return { rawPath, parsedPath };
+}
+
+function extractJsonParsePosition(parseError) {
+  const match = String(parseError || "").match(/position\s+(\d+)/i);
+  return match ? Number(match[1]) : null;
+}
+
+function buildDevInvalidJsonMetadata({
+  status = "dev_invalid_json",
+  rawOutputPath = "",
+  repairRawOutputPath = "",
+  outputLength = 0,
+  parseError = "",
+  parsePosition = null
+} = {}) {
+  return {
+    status,
+    outputLength: Number(outputLength || 0),
+    rawOutputPath: String(rawOutputPath || ""),
+    repairRawOutputPath: String(repairRawOutputPath || ""),
+    parseError: String(parseError || ""),
+    parsePosition: Number.isFinite(parsePosition) ? parsePosition : null
+  };
+}
+
+function buildJuniorJsonRepairSystemPrompt() {
+  return [
+    "You are Junior Dev repairing malformed JSON output.",
+    "Return strict JSON only.",
+    "Use exactly this top-level shape: {\"summary\":\"...\",\"fileOperations\":[{\"action\":\"write\",\"path\":\"package.json\",\"content\":\"...\"}],\"notes\":[]}.",
+    "Do not use markdown fences.",
+    "Do not include prose before or after the JSON.",
+    "Do not add pathTag.",
+    "Do not add extra fields inside fileOperations.",
+    "Each fileOperations item may contain only action, path, and content.",
+    "action must always be write.",
+    "Do not create a nested project folder.",
+    "Do not write into \"Sandbox folder\".",
+    "All paths must be relative to the current project root.",
+    "Do not output absolute paths or ../ paths.",
+    "Do not request dependency installs.",
+    "Use custom CSS only.",
+    "For Vite React projects, write package.json, index.html, vite.config.js, src/main.jsx, src/App.jsx, and src/styles.css.",
+    "Repair the previous malformed JSON without changing scope.",
+    "Close all strings, braces, and arrays.",
+    "If the previous output was too long, reduce to the required files only.",
+    "App.jsx must stay under 100 lines when possible.",
+    "styles.css must stay under 160 lines when possible.",
+    "Return valid JSON only. Do not redesign."
+  ].join("\n");
+}
+
+function buildJuniorJsonRepairContext({
+  rawOutput,
+  parseError,
+  compactContext,
+  pmArchitecture,
+  projectIntent,
+  isExistingProjectRequest,
+  uiQualitySummary = ""
+}) {
+  const requiredGeneratedFiles = !isExistingProjectRequest ? getRequiredGeneratedProjectFiles(projectIntent) : [];
+  return [
+    trimForPrompt(compactContext, isExistingProjectRequest ? 2400 : 3400),
+    uiQualitySummary ? `UI_QUALITY_SUMMARY:\n${trimForPrompt(uiQualitySummary, 1200)}` : "",
+    `EXPECTED_ARCHITECTURE:\n${JSON.stringify(pmArchitecture || {}, null, 2)}`,
+    parseError ? `JSON_PARSE_ERROR:\n${parseError}` : "",
+    requiredGeneratedFiles.length > 0 ? `REQUIRED_FILES:\n${requiredGeneratedFiles.join("\n")}` : "",
+    `BROKEN_DEV_OUTPUT:\n${trimForPrompt(rawOutput, 12000)}`,
+    [
+      "Repair the malformed JSON into valid strict JSON only.",
+      "Keep the same intended files when possible.",
+      "Do not redesign the app.",
+      "Do not add pathTag.",
+      "Do not add markdown fences.",
+      "Do not explain.",
+      "Close all strings, braces, and arrays.",
+      "Return full replacement content for each write operation.",
+      "If a path is invalid, fix it to a root-relative path.",
+      "If the previous output was too long, reduce to a minimal dashboard with required files only.",
+      "Keep App.jsx under 100 lines.",
+      "Keep styles.css under 160 lines.",
+      "Valid complete JSON is more important than visual polish."
+    ].join("\n")
+  ].filter(Boolean).join("\n\n");
+}
+
+async function attemptDevJsonRepair({
+  runPath,
+  runId,
+  rawOutput,
+  parseError,
+  compactContext,
+  pmArchitecture,
+  projectIntent,
+  isExistingProjectRequest,
+  uiQualitySummary = ""
+}) {
+  await logDevOutputEvent(runPath, "junior-json-repair-start", {
+    runId,
+    parseError: String(parseError || "")
+  });
+  let repairOutput = "";
+  try {
+    repairOutput = await Promise.race([
+      callAgentWithBrain({
+        agent: AGENTS.junior,
+        systemPrompt: buildJuniorJsonRepairSystemPrompt(),
+        input: buildJuniorJsonRepairContext({
+          rawOutput,
+          parseError,
+          compactContext,
+          pmArchitecture,
+          projectIntent,
+          isExistingProjectRequest,
+          uiQualitySummary
+        }),
+        requestOptions: buildDevRequestOptions(),
+        debugLabel: "junior repair",
+        brainSeed: [compactContext, parseError, rawOutput].filter(Boolean).join("\n\n")
+      }),
+      delay(DEV_JSON_REPAIR_TIMEOUT_MS).then(() => {
+        const timeoutError = new Error(`DEV JSON repair timed out after ${formatDuration(DEV_JSON_REPAIR_TIMEOUT_MS)}.`);
+        timeoutError.code = "EDEVJSONREPAIRTIMEOUT";
+        throw timeoutError;
+      })
+    ]);
+  } catch (error) {
+    if (error?.code === "EDEVJSONREPAIRTIMEOUT") {
+      await logDevOutputEvent(runPath, "junior-json-repair-timeout", {
+        runId,
+        timeoutMs: DEV_JSON_REPAIR_TIMEOUT_MS
+      });
+      return {
+        attempted: true,
+        success: false,
+        timedOut: true,
+        parseError: error?.message || String(error),
+        rawPath: ""
+      };
+    }
+    return {
+      attempted: true,
+      success: false,
+      parseError: error?.message || String(error),
+      rawPath: ""
+    };
+  }
+
+  const repairArtifacts = await writeDevDebugArtifacts(runPath, runId, repairOutput, null, {
+    rawPrefix: "dev-repair-raw-output"
+  });
+  const repairedLeadResult = parseLeadOutput(repairOutput, [], pmArchitecture);
+  return {
+    attempted: true,
+    success: Boolean(repairedLeadResult.parseMeta?.jsonParsed),
+    output: repairOutput,
+    leadResult: repairedLeadResult,
+    rawPath: repairArtifacts.rawPath,
+    parseError: repairedLeadResult.parseMeta?.jsonParseError || ""
+  };
 }
 
 function mergeLeadResults(initialResult, patchResult) {
@@ -2977,15 +3615,25 @@ function buildJuniorInitialContext({
         ? "For shadcn/ui requests, implement reusable shadcn-style component files, utility helpers, and the dependency manifest needed for them."
         : "Create reusable components only if they materially help the request.",
       "Primary output format: valid parseable JSON only.",
-      "Use the exact top-level keys summary, fileOperations, and commandRequests.",
+      "Use the exact top-level keys summary, fileOperations, and notes.",
+      "Do not use pathTag, markdown fences, or prose outside the JSON.",
+      "Each fileOperations item may contain only action, path, and content.",
+      "action must always be write.",
+      "Do not create nested folders or Sandbox folder paths.",
+      "Do not request dependency installs.",
+      "Use custom CSS only.",
+      "Keep src/App.jsx under 100 lines and src/styles.css under 160 lines when possible.",
+      "Do not use long comments, large arrays, or inline SVG.",
+      "Use compact mock data.",
+      "Valid complete JSON is more important than visual polish.",
+      "If the JSON may be too long, simplify the UI. Do not risk malformed JSON.",
       "For a single-file HTML task, write the full HTML document into index.html.",
-      "If JSON is difficult, use only path-tagged code blocks such as ```file: package.json, ```jsx src/App.jsx, or ```css src/index.css.",
       "No apology. No general suggestions. No tutorial text.",
       "Return this exact shape:",
       "{",
       '  "summary": "Created the requested files.",',
       '  "fileOperations": [{ "action": "write", "path": "index.html", "content": "<!doctype html>..." }],',
-      '  "commandRequests": []',
+      '  "notes": []',
       "}"
     ].join("\n")
   ].filter(Boolean).join("\n\n");
@@ -3212,7 +3860,13 @@ function buildJuniorPatchContext({
       "If no fixes are needed, return an empty fileOperations array.",
       "When changing a file, return full replacement content for that file.",
       "If index.html starts with <doctype html>, replace it with <!doctype html>.",
-      "Return JSON only with summary, fileOperations, commands, recommendation."
+      "Return JSON only with summary, fileOperations, and notes.",
+      "Do not include pathTag, markdown fences, or prose outside the JSON.",
+      "Each fileOperations item may contain only action, path, and content.",
+      "action must always be write.",
+      "Keep src/App.jsx under 100 lines and src/styles.css under 160 lines when possible.",
+      "Do not use long comments, large arrays, or inline SVG.",
+      "Valid complete JSON is more important than visual polish."
     ].join("\n")
   ].filter(Boolean).join("\n\n");
 }

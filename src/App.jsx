@@ -167,6 +167,22 @@ function normalizeCapabilityState(capability, fallbackRoot = "") {
 }
 
 const ACTIVE_AUTONOMY_STATUSES = new Set(["running", "queued", "planning", "building", "reviewing", "patching"]);
+const AUTONOMY_START_FAILURE_STATUSES = new Set([
+  "autonomy_worker_start_timeout",
+  "pm_dispatch_timeout",
+  "autonomy-worker-start-failed",
+  "pre_pm_setup_timeout",
+  "pre_pm_setup_failed",
+  "dev_no_valid_file_operations",
+  "dev_invalid_json",
+  "dev_missing_required_project_files",
+  "dev_json_repair_timeout",
+  "model_request_invalid_payload",
+  "needs_dependency_install",
+  "dependency_install_timeout",
+  "generated_needs_manual_verification",
+  "build_failed"
+]);
 const ACTIVE_QUALITY_LOOP_STATUSES = new Set(["running", "gui_qa_pending", "gui_qa_running", "qa_reviewing_gui_evidence", "dev_patching_gui_issue", "qa_reviewing", "dev_patching"]);
 const ACTIVE_DESIGN_POLISH_STATUSES = new Set(["running", "checking", "reviewing", "patching"]);
 
@@ -626,7 +642,8 @@ export function App() {
         lastStage: progress.stage || current?.lastStage || "",
         lastStatus: progress.status || current?.lastStatus || "",
         message: progress.message || progress.requestStatus?.displayText || current?.message || "",
-        updatedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString(),
+        failureDetails: progress.failureDetails || current?.failureDetails || null
       }));
 
       if (progress.requestStatus?.displayText || progress.message) {
@@ -656,27 +673,9 @@ export function App() {
         );
       }
 
-      if (["autonomy-complete", "autonomy-error"].includes(progress.stage)) {
-        setIsRunning(false);
-        setIsAutonomyRunning(false);
-        setIsRunStarting(false);
-        runStartPendingRef.current = false;
-        const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
+      const terminalStatus = progress.queueStatus || progress.status || "";
+      if (["autonomy-complete", "autonomy-error", "autonomy-stopped"].includes(progress.stage) || isTerminalAutonomyStatus(terminalStatus)) {
         const nonFatal = hasUsefulOutput(progress.partialResult) || String(progress.status || "").toLowerCase() === "needs_review";
-        setAgents((currentAgents) =>
-          currentAgents.map((agent) => ({
-            ...agent,
-            status:
-              progress.stage === "autonomy-error" && !nonFatal
-                ? agent.id === "supervisor" && qaUnavailable
-                  ? "idle"
-                  : "error"
-                : mapTerminalAgentStatus(agent.id, progress.partialResult, {
-                  qaUnavailable,
-                  runStatus: progress.status || autonomyRun?.status || "needs_review"
-                })
-          }))
-        );
         const outputFiles = getResultOutputFiles(progress.partialResult);
         if (progress.partialResult) {
           const generatedProject = normalizeGeneratedProject(progress.partialResult, project);
@@ -687,14 +686,42 @@ export function App() {
             setCommandLog(generatedProject.commandHistory || []);
             setProjectProcesses(generatedProject.processes || []);
           }
-          updateActiveTab("decision");
+          if (String(terminalStatus || "").trim().toLowerCase() !== "stopped") {
+            updateActiveTab("decision");
+          }
           setActiveView("office");
         }
+        setAutonomyRun((current) => ({
+          ...(current || {}),
+          runId: progress.runId,
+          status: terminalStatus || current?.status || "stopped",
+          message: progress.stopReason || progress.message || current?.message || "",
+          updatedAt: new Date().toISOString(),
+          failureDetails: progress.failureDetails || current?.failureDetails || null
+        }));
+        finalizeAutonomyUi({
+          runId: progress.runId,
+          status: terminalStatus,
+          result: progress.partialResult || null,
+          message: progress.message || "",
+          stopReason: progress.stopReason || "",
+          failureDetails: progress.failureDetails || null
+        });
         pushNotification({
-          type: progress.stage === "autonomy-error" && !nonFatal ? "error" : "success",
-          title: progress.stage === "autonomy-error" && !nonFatal ? "Autonomy stopped" : "Task finished",
-          message: progress.stage === "autonomy-error" && !nonFatal
-            ? (progress.message || "The autonomous run needs review.")
+          type: String(terminalStatus || "").trim().toLowerCase() === "stopped"
+            ? "info"
+            : progress.stage === "autonomy-error" && !nonFatal
+              ? "error"
+              : "success",
+          title: String(terminalStatus || "").trim().toLowerCase() === "stopped"
+            ? "Autonomy stopped"
+            : progress.stage === "autonomy-error" && !nonFatal
+              ? "Autonomy stopped"
+              : "Task finished",
+          message: String(terminalStatus || "").trim().toLowerCase() === "stopped"
+            ? (progress.stopReason || progress.message || "Stop requested.")
+            : progress.stage === "autonomy-error" && !nonFatal
+              ? (progress.message || "The autonomous run needs review.")
             : `${outputFiles.length} file(s) changed. Output is ready for review.`
         });
         void refreshTrackedProjects();
@@ -1186,6 +1213,66 @@ export function App() {
     }
   }
 
+  function setAutonomyAgentsForTerminal(runStatus, result = null) {
+    const normalizedStatus = String(runStatus || "").trim().toLowerCase();
+    if (normalizedStatus === "stopped") {
+      setAgents((currentAgents) => currentAgents.map((agent) => ({ ...agent, status: "idle" })));
+      return;
+    }
+    const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
+    setAgents((currentAgents) =>
+      currentAgents.map((agent) => ({
+        ...agent,
+        status: mapTerminalAgentStatus(agent.id, result, {
+          qaUnavailable,
+          runStatus: normalizedStatus
+        })
+      }))
+    );
+  }
+
+  function finalizeAutonomyUi(snapshot = {}, options = {}) {
+    const normalizedStatus = String(snapshot?.status || autonomyRun?.status || "").trim().toLowerCase();
+    const terminalRunId = String(snapshot?.runId || currentRunRef.current || "").trim();
+    const stopReason = snapshot?.stopReason || snapshot?.message || "";
+    const failureDetails = snapshot?.failureDetails || autonomyRun?.failureDetails || null;
+
+    setIsRunning(false);
+    setIsAutonomyRunning(false);
+    setIsRunStarting(false);
+    runStartPendingRef.current = false;
+    if (terminalRunId) {
+      ignoredRunIdsRef.current.delete(terminalRunId);
+    }
+    if (isTerminalAutonomyStatus(normalizedStatus) || normalizedStatus === "manual_review") {
+      currentRunRef.current = "";
+    }
+
+    setAutonomyAgentsForTerminal(normalizedStatus, snapshot?.result || null);
+
+    if (normalizedStatus === "stopped") {
+      setWorkflow((current) => ({
+        ...current,
+        currentStage: "manual_review",
+        decisionStatus: current?.decisionStatus === "accepted" ? current.decisionStatus : "manual_review_required",
+        projectStatus: "Stopped"
+      }));
+      setDecisionMessage(stopReason || "Stop requested for autonomous run.");
+    } else if (AUTONOMY_START_FAILURE_STATUSES.has(normalizedStatus) || normalizedStatus === "failed") {
+      setWorkflow((current) => ({
+        ...current,
+        currentStage: "manual_review",
+        decisionStatus: current?.decisionStatus === "accepted" ? current.decisionStatus : "manual_review_required",
+        projectStatus: "Manual review required"
+      }));
+      setDecisionMessage(buildAutonomyFailureMessage(normalizedStatus, failureDetails, stopReason));
+    }
+
+    if (options.refreshActiveWork !== false) {
+      void refreshActiveWorkState(true);
+    }
+  }
+
   function navigateDirect(nextView) {
     setActiveView(nextView);
   }
@@ -1246,8 +1333,18 @@ export function App() {
       await refreshActiveWorkState(true);
       closeNavigationGuard();
       if (response?.stopped) {
-        setIsRunning(false);
-        setIsAutonomyRunning(false);
+        if (String(response?.pointer?.type || "").trim().toLowerCase() === "autonomy") {
+          finalizeAutonomyUi({
+            runId: response?.pointer?.runId || "",
+            status: response?.status || "stopped",
+            message
+          }, {
+            refreshActiveWork: false
+          });
+        } else {
+          setIsRunning(false);
+          setIsAutonomyRunning(false);
+        }
         setQualityLoopState((current) => current ? { ...current, status: "stopped", message } : current);
         navigateDirect("landing");
       }
@@ -1583,22 +1680,17 @@ export function App() {
     }
 
     if (terminal) {
-      setIsRunning(false);
-      setIsAutonomyRunning(false);
-      setIsRunStarting(false);
-      runStartPendingRef.current = false;
-      const qaUnavailable = isSupervisorUnavailable(modelAvailabilityRef.current);
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) => ({
-          ...agent,
-          status: mapTerminalAgentStatus(agent.id, snapshot.result, {
-            qaUnavailable,
-            runStatus: snapshot.status
-          })
-        }))
-      );
+      finalizeAutonomyUi({
+        runId: snapshot.runId,
+        status: snapshot.status,
+        result: snapshot.result || null,
+        message: snapshot.error || "",
+        stopReason: snapshot.stopReason || ""
+      });
       if (!options.silent) {
-        updateActiveTab("decision");
+        if (String(snapshot.status || "").trim().toLowerCase() !== "stopped") {
+          updateActiveTab("decision");
+        }
         setActiveView("office");
       }
     }
@@ -2103,6 +2195,13 @@ export function App() {
     const nextHealth = await window.trifix.getModelHealth();
     const availability = classifyModelAvailability(nextHealth);
     const nextPreflight = buildRunPreflight(availability);
+    if (["ready", "ready_with_warnings", "normal_qa_unavailable", "degraded_available"].includes(nextPreflight.state)) {
+      console.info("model-preflight-ok", {
+        state: nextPreflight.state,
+        selectedRunMode: nextPreflight.selectedRunMode,
+        note: "Health check passed. Real PM autonomy prompt has not been dispatched yet."
+      });
+    }
     console.info("preflight result", {
       state: nextPreflight.state,
       activeModels: nextPreflight.activeModels.map((entry) => entry.id),
@@ -2142,8 +2241,8 @@ export function App() {
     const runStartMessage = developerOnly
       ? "Developer-only autonomous run queued. The backend runner will generate output without PM planning."
       : runProject?.rootPath
-        ? "Autonomous run queued. The backend runner will work inside this sandbox."
-        : "Autonomous run queued. The backend runner will create output files inside a new sandbox.";
+        ? "Autonomous run queued. Model preflight passed; waiting for the real PM autonomy prompt to dispatch inside this sandbox."
+        : "Autonomous run queued. Model preflight passed; waiting for the real PM autonomy prompt to dispatch in a new sandbox.";
 
     console.info("selected run mode", selectedRunMode);
     setAutonomyRun({
@@ -2315,23 +2414,22 @@ export function App() {
     }
 
     try {
-      ignoredRunIdsRef.current.add(runId);
       const stopped = await window.trifix.stopAutonomyRun(runId);
+      const stopReason = stopped?.stopReason || "Stop requested.";
       setAutonomyRun((current) => ({
         ...(current || {}),
         ...(stopped || {}),
-        status: stopped?.status || "stopping",
-        message: "Stop requested for autonomous run."
+        status: stopped?.status || "stopped",
+        message: stopReason
       }));
-      setDecisionMessage("Stop requested for autonomous run.");
-      if (stopped?.status === "stopped") {
-        setIsRunning(false);
-        setIsAutonomyRunning(false);
-        setIsRunStarting(false);
-        runStartPendingRef.current = false;
-      }
+      finalizeAutonomyUi({
+        runId,
+        status: stopped?.status || "stopped",
+        result: stopped?.result || null,
+        message: stopReason,
+        stopReason
+      });
     } catch (stopError) {
-      ignoredRunIdsRef.current.delete(runId);
       setDecisionMessage(stopError?.message || "Could not stop autonomous run.");
     }
   }
@@ -8748,7 +8846,28 @@ function formatAvailabilityBadge(entry) {
 }
 
 function isTerminalAutonomyStatus(status) {
-  return ["completed", "needs_review", "failed", "stopped", "timed_out"].includes(String(status || "").trim().toLowerCase());
+  return [
+    "completed",
+    "needs_review",
+    "failed",
+    "stopped",
+    "timed_out",
+    "autonomy_worker_start_timeout",
+    "pm_dispatch_timeout",
+    "autonomy-worker-start-failed",
+    "pre_pm_setup_timeout",
+    "pre_pm_setup_failed",
+    "dev_no_valid_file_operations",
+    "dev_invalid_json",
+    "dev_missing_required_project_files",
+    "dev_json_repair_timeout",
+    "model_request_invalid_payload",
+    "needs_dependency_install",
+    "dependency_install_timeout",
+    "generated_needs_manual_verification",
+    "build_failed",
+    "build_passed"
+  ].includes(String(status || "").trim().toLowerCase());
 }
 
 function formatAutonomyStatus(status) {
@@ -8777,6 +8896,53 @@ function formatRunModeLabel(value) {
   if (normalized === "degraded_developer_only") return "Developer-only degraded mode";
   if (normalized === "blocked") return "Blocked";
   return normalized || "Unknown";
+}
+
+function buildAutonomyFailureMessage(status, failureDetails = null, fallbackMessage = "") {
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+  if (normalizedStatus === "dev_invalid_json") {
+    const parts = ["DEV returned malformed JSON. Raw output was saved for debugging."];
+    if (failureDetails?.parseError) {
+      parts.push(`Parse error: ${failureDetails.parseError}`);
+    }
+    if (failureDetails?.rawOutputPath) {
+      parts.push(`Raw output: ${failureDetails.rawOutputPath}`);
+    }
+    return parts.join(" ");
+  }
+  if (normalizedStatus === "model_request_invalid_payload") {
+    const parts = ["Model backend rejected the request payload. Retry after fixing the request format."];
+    if (Array.isArray(failureDetails?.rejectedKeys) && failureDetails.rejectedKeys.length > 0) {
+      parts.push(`Rejected keys: ${failureDetails.rejectedKeys.join(", ")}`);
+    }
+    if (failureDetails?.parseError) {
+      parts.push(`Backend error: ${failureDetails.parseError}`);
+    }
+    return parts.join(" ");
+  }
+  if (normalizedStatus === "dev_json_repair_timeout") {
+    const parts = ["DEV JSON repair timed out. Raw output was saved for debugging."];
+    if (failureDetails?.rawOutputPath) {
+      parts.push(`Raw output: ${failureDetails.rawOutputPath}`);
+    }
+    if (failureDetails?.repairRawOutputPath) {
+      parts.push(`Repair output: ${failureDetails.repairRawOutputPath}`);
+    }
+    return parts.join(" ");
+  }
+  if (normalizedStatus === "dependency_install_timeout") {
+    return "Files were generated successfully, but dependency installation timed out. Manual verification is required.";
+  }
+  if (normalizedStatus === "needs_dependency_install") {
+    return "Files were generated successfully, but dependencies must be installed before build verification can continue.";
+  }
+  if (normalizedStatus === "generated_needs_manual_verification") {
+    return "Files were generated successfully, but automatic verification could not complete. Manual verification is required.";
+  }
+  if (normalizedStatus === "build_failed") {
+    return fallbackMessage || "Generated files were applied, but the project build failed. Manual verification is required.";
+  }
+  return fallbackMessage || "Autonomous run failed before usable output was applied.";
 }
 
 function shouldShowExpandedPreflightPanel(preflight) {

@@ -68,6 +68,9 @@ const RUNBOOK_ARTIFACTS_INDEX_FILE = "artifacts-index.json";
 const TERMINAL_DIR_NAME = "terminal";
 const DEFAULT_AUTONOMY_RUNTIME_MS = 8 * 60 * 60 * 1000;
 const MAX_AUTONOMY_RUNTIME_MS = 12 * 60 * 60 * 1000;
+const AUTONOMY_WORKER_START_TIMEOUT_MS = 10 * 1000;
+const AUTONOMY_PRE_PM_SETUP_TIMEOUT_MS = 15 * 1000;
+const AUTONOMY_PM_DISPATCH_TIMEOUT_MS = 15 * 1000;
 const DEFAULT_MAX_GUI_QA_REPAIR_ATTEMPTS = 2;
 const DEFAULT_MAX_QUALITY_ROUNDS = 3;
 const DEFAULT_GUI_QA_SETTINGS = Object.freeze({
@@ -129,6 +132,50 @@ function releaseActiveRunLock(runId, reason) {
 
   logRunLock("active-run-lock released", { runId, reason });
   activeRunLock = null;
+}
+
+function clearAutonomyStartTimeouts(task) {
+  const workerStartTimer = task?.workerStartTimer || null;
+  const prePmSetupTimer = task?.prePmSetupTimer || null;
+  const pmDispatchTimer = task?.pmDispatchTimer || null;
+  if (workerStartTimer) {
+    clearTimeout(workerStartTimer);
+    task.workerStartTimer = null;
+  }
+  if (prePmSetupTimer) {
+    clearTimeout(prePmSetupTimer);
+    task.prePmSetupTimer = null;
+  }
+  if (pmDispatchTimer) {
+    clearTimeout(pmDispatchTimer);
+    task.pmDispatchTimer = null;
+  }
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveRequiredViteRootFiles(result = {}) {
+  const required = new Set([
+    "package.json",
+    "index.html",
+    "vite.config.js",
+    "src/main.jsx",
+    "src/App.jsx",
+    "src/styles.css"
+  ]);
+  const declared = [
+    ...(Array.isArray(result?.project?.requiredFiles) ? result.project.requiredFiles : []),
+    ...((result?.project?.fileArchitecture || []).map((entry) => entry?.path || entry))
+  ].map((entry) => String(entry || "").trim());
+  const looksLikeViteReact = declared.includes("vite.config.js") || declared.includes("src/main.jsx") || declared.includes("src/App.jsx");
+  return looksLikeViteReact ? [...required] : [];
 }
 
 function markRunStale(runId, reason) {
@@ -1064,6 +1111,238 @@ function registerIpc() {
   );
 }
 
+async function logAutonomyMilestone(task, event, payload = {}) {
+  logRunLock(event, {
+    runId: task?.runId || "",
+    ...payload
+  });
+  if (!task?.projectRoot) {
+    return;
+  }
+  await appendAutonomyLog(task.projectRoot, {
+    type: "autonomy-milestone",
+    runId: task.runId,
+    event,
+    ...payload
+  }).catch(() => {});
+}
+
+function shouldResetAutonomyWorkerFlag() {
+  if (!autonomyWorkerActive) {
+    return false;
+  }
+  const pendingCurrentRunTask = autonomyQueue.find((queuedTask) =>
+    queuedTask
+    && queuedTask.runId === (activeRunLock?.runId || "")
+    && !queuedTask.stopRequested
+    && queuedTask.status !== "stopped"
+    && !queuedTask.workerStartedAt
+  );
+  if (pendingCurrentRunTask) {
+    return true;
+  }
+  return Boolean(!activeRunLock?.runId && autonomyQueue.some((queuedTask) =>
+    queuedTask
+    && !queuedTask.stopRequested
+    && queuedTask.status !== "stopped"
+    && !queuedTask.workerStartedAt
+  ));
+}
+
+function scheduleAutonomyWorkerStartTimeout(task) {
+  clearAutonomyStartTimeouts(task);
+  const timer = setTimeout(() => {
+    if (!task || task.workerStartedAt || task.stopRequested || !isRunAuthoritative(task.runId)) {
+      return;
+    }
+    void failAutonomyTask(task, {
+      status: "autonomy_worker_start_timeout",
+      stage: "autonomy-error",
+      message: "Autonomy worker did not start after the run lock was acquired.",
+      logEvent: "autonomy-worker-start-timeout"
+    });
+  }, AUTONOMY_WORKER_START_TIMEOUT_MS);
+  timer.unref?.();
+  task.workerStartTimer = timer;
+}
+
+function schedulePmDispatchTimeout(task) {
+  if (!task || task.stopRequested) {
+    return;
+  }
+  if (task.pmRequestSentAt) {
+    return;
+  }
+  if (task.pmDispatchTimer) {
+    clearTimeout(task.pmDispatchTimer);
+  }
+  const timer = setTimeout(() => {
+    if (!task || task.pmRequestSentAt || task.stopRequested || !isRunAuthoritative(task.runId)) {
+      return;
+    }
+    void failAutonomyTask(task, {
+      status: "pm_dispatch_timeout",
+      stage: "pm_plan",
+      message: "PM model request was not dispatched. Check autonomy worker logs.",
+      logEvent: "pm-model-timeout"
+    });
+  }, AUTONOMY_PM_DISPATCH_TIMEOUT_MS);
+  timer.unref?.();
+  task.pmDispatchTimer = timer;
+}
+
+function buildPrePmStepContext(task) {
+  return {
+    lastStartedStep: task?.prePmLastStartedStep || "",
+    lastCompletedStep: task?.prePmLastCompletedStep || ""
+  };
+}
+
+function schedulePrePmSetupTimeout(task) {
+  if (!task || task.stopRequested || task.pmStageStartedAt) {
+    return;
+  }
+  if (task.prePmSetupTimer) {
+    clearTimeout(task.prePmSetupTimer);
+  }
+  const timer = setTimeout(() => {
+    if (!task || task.stopRequested || task.pmStageStartedAt || !isRunAuthoritative(task.runId)) {
+      return;
+    }
+    const stepContext = buildPrePmStepContext(task);
+    void failAutonomyTask(task, {
+      status: "pre_pm_setup_timeout",
+      stage: "pm_plan",
+      message: `Autonomy worker started, but PM setup did not complete before timeout. Last started step: ${stepContext.lastStartedStep || "unknown"}. Last completed step: ${stepContext.lastCompletedStep || "none"}.`,
+      logEvent: "pre-pm-setup-timeout"
+    });
+  }, AUTONOMY_PRE_PM_SETUP_TIMEOUT_MS);
+  timer.unref?.();
+  task.prePmSetupTimer = timer;
+}
+
+async function markPmStageStarting(task, options = {}) {
+  if (!task || task.pmStageStartedAt) {
+    return;
+  }
+  task.pmStageStartedAt = new Date().toISOString();
+  if (task.prePmSetupTimer) {
+    clearTimeout(task.prePmSetupTimer);
+    task.prePmSetupTimer = null;
+  }
+  await logAutonomyMilestone(task, "autonomy-stage-starting: pm_plan", {
+    stage: "pm_plan",
+    ...buildPrePmStepContext(task)
+  });
+  if (options.emitProgress !== false) {
+    sendAutonomyProgress(task, {
+      agent: "architect",
+      stage: "pm_plan",
+      status: "running",
+      message: "PM planning stage started."
+    });
+  }
+}
+
+async function runPrePmStep(task, stepName, action) {
+  task.prePmLastStartedStep = stepName;
+  await logAutonomyMilestone(task, "pre-pm-step-start", {
+    step: stepName,
+    ...buildPrePmStepContext(task)
+  });
+  try {
+    const result = await action();
+    task.prePmLastCompletedStep = stepName;
+    await logAutonomyMilestone(task, "pre-pm-step-done", {
+      step: stepName,
+      ...buildPrePmStepContext(task)
+    });
+    return result;
+  } catch (error) {
+    await logAutonomyMilestone(task, "pre-pm-step-failed", {
+      step: stepName,
+      message: error?.message || String(error),
+      ...buildPrePmStepContext(task)
+    });
+    throw error;
+  }
+}
+
+async function failAutonomyTask(task, {
+  status = "failed",
+  stage = "autonomy-error",
+  message = "Autonomy run failed.",
+  logEvent = "autonomy-worker-start-failed",
+  details = null
+} = {}) {
+  if (!task) {
+    return null;
+  }
+  if (!isRunAuthoritative(task.runId) && !task.stopRequested) {
+    return summarizeAutonomyTask(task);
+  }
+  clearAutonomyStartTimeouts(task);
+  task.status = status;
+  task.error = message;
+  task.result = null;
+  task.failureDetails = normalizeAutonomyFailureDetails(details, status);
+  task.finishedAt = new Date().toISOString();
+  await logAutonomyMilestone(task, logEvent, { status, stage, message });
+  if (task.projectRoot) {
+    await updateAutonomyRunState(task.projectRoot, {
+      status,
+      currentStage: stage,
+      nextAction: "manual_review",
+      lastError: message,
+      lastValidationStatus: status,
+      failureStatus: status,
+      failureDetails: task.failureDetails
+    }).catch(() => {});
+    await upsertPersistentRunbook(task.projectRoot, {
+      runId: task.runId,
+      mode: "normal_autonomy",
+      status: mapRunStatus(status),
+      stopReason: message,
+      currentStage: stage
+    }, {
+      type: "run-failed",
+      status: mapRunStatus(status),
+      message
+    }).catch(() => {});
+  }
+  await persistActiveWorkPointer({
+    projectRoot: task.projectRoot,
+    projectName: task.payload?.projectName || path.basename(task.projectRoot || "TriFix Task"),
+    runId: task.runId,
+    type: "autonomy",
+    status: mapRunStatus(status) === "failed" ? "manual_review" : mapRunStatus(status),
+    message: buildCompactFailureMessage(message, task.failureDetails),
+    returnView: "workspace",
+    source: logEvent
+  }).catch(() => {});
+  sendAutonomyProgress(task, {
+    agent: "architect",
+    stage,
+    status,
+    queueStatus: status,
+    message,
+    failureDetails: task.failureDetails,
+    forceDispatch: true
+  });
+  releaseActiveRunLock(task.runId, status);
+  await persistAutonomyQueueState(task, {
+    status,
+    finishedAt: task.finishedAt,
+    currentStage: stage,
+    currentTask: message,
+    nextAction: "manual_review",
+    lastValidationStatus: status,
+    failureStatus: status,
+    failureDetails: task.failureDetails
+  }).catch(() => {});
+  return summarizeAutonomyTask(task);
+}
+
 async function startAutonomyRun(payload = {}) {
   const runId = payload?.runId || `auto-${Date.now()}`;
   logRunLock("run-start-request received", { channel: "autonomy:start", runId });
@@ -1089,11 +1368,56 @@ async function startAutonomyRun(payload = {}) {
       error: "",
       result: null,
       progress: [],
-      projectRoot: payload?.projectRoot || ""
+      projectRoot: payload?.projectRoot || "",
+      workerStartedAt: "",
+      pmStageStartedAt: "",
+      pmRequestStartingAt: "",
+      pmRequestSentAt: "",
+      pmResponseReceivedAt: "",
+      prePmLastStartedStep: "",
+      prePmLastCompletedStep: "",
+      workerStartTimer: null,
+      prePmSetupTimer: null,
+      pmDispatchTimer: null
     };
 
     autonomyRuns.set(runId, task);
     autonomyQueue.push(task);
+    if (["ready", "ready_with_warnings", "normal_qa_unavailable", "degraded_available"].includes(String(payload?.preflight?.state || "").trim().toLowerCase())) {
+      logRunLock("model-preflight-ok", {
+        runId,
+        preflightState: payload.preflight.state,
+        selectedRunMode: payload.preflight.selectedRunMode || payload.preflight.runMode || payload.executionMode || "normal"
+      });
+    }
+    await logAutonomyMilestone(task, "autonomy-worker-dispatch-requested", {
+      queueDepth: autonomyQueue.length,
+      selectedRunMode: payload?.executionMode || payload?.preflight?.selectedRunMode || payload?.preflight?.runMode || "normal"
+    });
+    scheduleAutonomyWorkerStartTimeout(task);
+    await logAutonomyMilestone(task, "process-autonomy-queue-invoked", {
+      queueDepth: autonomyQueue.length,
+      activeRunId: activeRunLock?.runId || ""
+    });
+    Promise.resolve()
+      .then(() => processAutonomyQueue())
+      .then(() => logAutonomyMilestone(task, "process-autonomy-queue-returned", {
+        queueDepth: autonomyQueue.length,
+        activeRunId: activeRunLock?.runId || ""
+      }))
+      .catch((error) => {
+        void logAutonomyMilestone(task, "process-autonomy-queue-failed", {
+          queueDepth: autonomyQueue.length,
+          activeRunId: activeRunLock?.runId || "",
+          message: error?.message || String(error)
+        });
+        void failAutonomyTask(task, {
+          status: "autonomy-worker-start-failed",
+          stage: "autonomy-error",
+          message: error?.message || "Autonomy worker failed to start.",
+          logEvent: "autonomy-worker-start-failed"
+        });
+      });
     if (task.projectRoot) {
       await upsertPersistentRunbook(task.projectRoot, {
         runId,
@@ -1121,9 +1445,9 @@ async function startAutonomyRun(payload = {}) {
       source: "autonomy:start"
     }).catch(() => {});
     await persistAutonomyQueueState(task);
-    processAutonomyQueue();
     return summarizeAutonomyTask(task);
   } catch (error) {
+    clearAutonomyStartTimeouts(autonomyRuns.get(runId));
     releaseActiveRunLock(runId, "autonomy:start failed");
     throw error;
   }
@@ -1148,26 +1472,38 @@ async function stopAutonomyRun(runId = "") {
     return null;
   }
 
+  const stopMessage = "Stop requested.";
+  clearAutonomyStartTimeouts(task);
   task.stopRequested = true;
-  markRunStale(task.runId, "stop requested");
-  if (task.status === "queued") {
-    task.status = "stopped";
-    task.finishedAt = new Date().toISOString();
-  } else if (task.status === "running") {
-    task.status = "stopping";
+  task.status = "stopped";
+  task.error = stopMessage;
+  task.finishedAt = new Date().toISOString();
+  await persistAutonomyQueueState(task, {
+    status: "stopped",
+    finishedAt: task.finishedAt,
+    currentStage: "manual_review",
+    currentTask: stopMessage,
+    nextAction: "manual_review"
+  });
+  if (task.projectRoot) {
+    await updateAutonomyRunState(task.projectRoot, {
+      status: "stopped",
+      currentStage: "decision",
+      nextAction: "manual_review",
+      lastError: stopMessage
+    }).catch(() => {});
   }
-  await persistAutonomyQueueState(task);
   if (task.projectRoot) {
     await upsertPersistentRunbook(task.projectRoot, {
       runId: task.runId,
       mode: "normal_autonomy",
-      status: task.status === "stopping" ? "stopped" : task.status,
-      stopReason: "Stop requested.",
+      status: "stopped",
+      stopReason: stopMessage,
       currentStage: "stopped"
     }, {
       type: "run-stopped",
-      status: task.status,
-      message: "Stop requested."
+      status: "stopped",
+      message: stopMessage
     }).catch(() => {});
   }
   await persistActiveWorkPointer({
@@ -1175,70 +1511,177 @@ async function stopAutonomyRun(runId = "") {
     projectName: task.payload?.projectName || path.basename(task.projectRoot || "TriFix Task"),
     runId: task.runId,
     type: "autonomy",
-    status: task.status === "stopping" ? "stopped" : task.status,
-    message: "Stop requested.",
+    status: "stopped",
+    message: stopMessage,
     returnView: "workspace",
     source: "autonomy:stop"
   }).catch(() => {});
-  releaseActiveRunLock(task.runId, task.status);
+  sendAutonomyProgress(task, {
+    agent: "architect",
+    stage: "autonomy-stopped",
+    status: "stopped",
+    message: stopMessage,
+    stopReason: stopMessage
+  });
+  releaseActiveRunLock(task.runId, "stop requested");
   return summarizeAutonomyTask(task);
 }
 
 async function processAutonomyQueue() {
+  const entryPayload = {
+    queueDepth: autonomyQueue.length,
+    activeRunId: activeRunLock?.runId || "",
+    workerActive: autonomyWorkerActive
+  };
+  logRunLock("process-autonomy-queue-entered", entryPayload);
+  if (autonomyQueue.length === 0) {
+    logRunLock("process-autonomy-queue-exit-early", {
+      ...entryPayload,
+      reason: "queue empty"
+    });
+    return;
+  }
+  if (shouldResetAutonomyWorkerFlag()) {
+    logRunLock("process-autonomy-queue-reset-worker-flag", entryPayload);
+    autonomyWorkerActive = false;
+  }
   if (autonomyWorkerActive) {
+    logRunLock("process-autonomy-queue-exit-early", {
+      ...entryPayload,
+      reason: "worker already running"
+    });
     return;
   }
 
   autonomyWorkerActive = true;
   try {
-  while (autonomyQueue.length > 0) {
-    const task = autonomyQueue.shift();
-    if (!task || task.status === "stopped" || task.stopRequested) {
-      continue;
-    }
+    while (autonomyQueue.length > 0) {
+      const task = autonomyQueue.shift();
+      logRunLock("process-autonomy-queue-selected-run", {
+        runId: task?.runId || "",
+        queueDepth: autonomyQueue.length,
+        activeRunId: activeRunLock?.runId || "",
+        workerActive: autonomyWorkerActive
+      });
+      if (!task) {
+        logRunLock("process-autonomy-queue-skip-run", {
+          reason: "queue item missing",
+          queueDepth: autonomyQueue.length,
+          activeRunId: activeRunLock?.runId || ""
+        });
+        continue;
+      }
+      if (task.status === "stopped" || task.stopRequested) {
+        await logAutonomyMilestone(task, "process-autonomy-queue-exit-early", {
+          reason: task.stopRequested ? "stop requested before worker start" : "task already stopped",
+          queueDepth: autonomyQueue.length,
+          activeRunId: activeRunLock?.runId || ""
+        });
+        if (!task.workerStartedAt) {
+          await failAutonomyTask(task, {
+            status: "autonomy-worker-start-failed",
+            stage: "autonomy-error",
+            message: task.stopRequested ? "Autonomy worker did not start because stop was already requested." : "Autonomy worker did not start because the queued task was already stopped.",
+            logEvent: "autonomy-worker-start-failed"
+          });
+        }
+        continue;
+      }
+      if (activeRunLock?.runId && activeRunLock.runId !== task.runId) {
+        await logAutonomyMilestone(task, "process-autonomy-queue-exit-early", {
+          reason: "active run lock belongs to a different run",
+          queueDepth: autonomyQueue.length,
+          activeRunId: activeRunLock?.runId || ""
+        });
+        await failAutonomyTask(task, {
+          status: "autonomy-worker-start-failed",
+          stage: "autonomy-error",
+          message: `Autonomy worker did not start because the active run lock belongs to ${activeRunLock?.runId || "another run"}.`,
+          logEvent: "autonomy-worker-start-failed"
+        });
+        continue;
+      }
       await executeAutonomyTask(task);
     }
+    logRunLock("process-autonomy-queue-returned", {
+      queueDepth: autonomyQueue.length,
+      activeRunId: activeRunLock?.runId || "",
+      workerActive: autonomyWorkerActive,
+      reason: "queue drained"
+    });
   } finally {
     autonomyWorkerActive = false;
   }
 }
 
 async function executeAutonomyTask(task) {
+  await logAutonomyMilestone(task, "execute-autonomy-task-entered", {
+    queueDepth: autonomyQueue.length,
+    activeRunId: activeRunLock?.runId || ""
+  });
   let finalResult = null;
   let activeTrackedEntry = null;
-  task.status = "running";
-  task.startedAt = new Date().toISOString();
-  task.deadlineAt = new Date(Date.now() + task.maxRuntimeMs).toISOString();
-  await persistAutonomyQueueState(task, {
-    status: "running",
-    maxRuntimeMs: task.maxRuntimeMs,
-    deadlineAt: task.deadlineAt,
-    currentStage: "autonomy-runner",
-    currentTask: "Backend runner started",
-    nextAction: "agent-pipeline"
-  });
-  sendAutonomyProgress(task, {
-    agent: "architect",
-    stage: "autonomy-runner",
-    status: "running",
-    message: "Backend autonomy runner started."
-  });
-
+  const executionMode = String(task?.payload?.executionMode || task?.payload?.preflight?.runMode || "normal").trim().toLowerCase();
+  const expectsPmPlanning = executionMode !== "degraded_developer_only";
   try {
+    await runPrePmStep(task, "mark-worker-running", async () => {
+      task.status = "running";
+      task.startedAt = new Date().toISOString();
+      task.deadlineAt = new Date(Date.now() + task.maxRuntimeMs).toISOString();
+      task.workerStartedAt = task.startedAt;
+      clearAutonomyStartTimeouts(task);
+      await logAutonomyMilestone(task, "autonomy-worker-started", {
+        startedAt: task.startedAt
+      });
+    });
+    if (expectsPmPlanning) {
+      schedulePrePmSetupTimeout(task);
+      await markPmStageStarting(task);
+    }
+    await runPrePmStep(task, "emit-initial-progress", async () => {
+      sendAutonomyProgress(task, {
+        agent: "architect",
+        stage: expectsPmPlanning ? "pm_plan" : "autonomy-runner",
+        status: "running",
+        message: expectsPmPlanning ? "Backend autonomy runner started. PM planning continuing." : "Backend autonomy runner started."
+      });
+    });
+    void runPrePmStep(task, "persist-runner-state", async () => {
+      await persistAutonomyQueueState(task, {
+        status: "running",
+        maxRuntimeMs: task.maxRuntimeMs,
+        deadlineAt: task.deadlineAt,
+        currentStage: expectsPmPlanning ? "pm_plan" : "autonomy-runner",
+        currentTask: expectsPmPlanning ? "PM planning started" : "Backend runner started",
+        nextAction: "agent-pipeline"
+      });
+    }).catch(() => {});
+    if (expectsPmPlanning) {
+      schedulePmDispatchTimeout(task);
+    }
+
+    task.prePmLastStartedStep = "assert-run-authoritative";
     assertRunAuthoritative(task.runId, "before start");
+    task.prePmLastCompletedStep = "assert-run-authoritative";
+    task.prePmLastStartedStep = "assert-autonomy-can-continue";
     assertAutonomyCanContinue(task, "before start");
+    task.prePmLastCompletedStep = "assert-autonomy-can-continue";
 
     activeTrackedEntry = task.payload?.projectRoot
-      ? await findTrackedProjectByPath(task.payload.projectRoot)
+      ? await runPrePmStep(task, "find-tracked-project-by-path", async () =>
+          findTrackedProjectByPath(task.payload.projectRoot))
       : null;
     const files = task.payload?.projectRoot
-      ? await backend.readSelectedProjectFiles(task.payload.projectRoot, task.payload.selectedFiles || [])
+      ? await runPrePmStep(task, "read-selected-project-files", async () =>
+          backend.readSelectedProjectFiles(task.payload.projectRoot, task.payload.selectedFiles || []))
       : [];
     const graphContext = task.payload?.projectRoot
-      ? await buildPipelineGraphContext(task.payload.projectRoot, task.payload, files)
+      ? await runPrePmStep(task, "build-pipeline-graph-context", async () =>
+          buildPipelineGraphContext(task.payload.projectRoot, task.payload, files))
       : null;
     const uiPromptPayload = task.payload?.projectRoot
-      ? await buildUiQualityPromptPayload(task.payload.projectRoot, task.payload?.input || "")
+      ? await runPrePmStep(task, "build-ui-quality-prompt-payload", async () =>
+          buildUiQualityPromptPayload(task.payload.projectRoot, task.payload?.input || ""))
       : {};
 
     const result = await withAutonomyRuntimeLimit(
@@ -1251,7 +1694,67 @@ async function executeAutonomyTask(task) {
           graphContext,
           mode: "autonomous",
           runPath: task.payload?.projectRoot || "",
-          sandboxParentPath: app.getPath("documents")
+          sandboxParentPath: app.getPath("documents"),
+          onPmStageStarting: async () => {
+            await markPmStageStarting(task);
+          },
+          onPmRequestStarting: async () => {
+            if (!task.pmStageStartedAt) {
+              await markPmStageStarting(task);
+            }
+            if (task.pmRequestStartingAt) {
+              return;
+            }
+            task.pmRequestStartingAt = new Date().toISOString();
+            await logAutonomyMilestone(task, "pm-model-request-starting", {
+              stage: "pm_plan"
+            });
+            await logAutonomyMilestone(task, "pm-autonomy-prompt-dispatching", {
+              stage: "pm_plan"
+            });
+          },
+          onPmRequestSent: async () => {
+            if (task.pmRequestSentAt) {
+              return;
+            }
+            task.pmRequestSentAt = new Date().toISOString();
+            if (task.pmDispatchTimer) {
+              clearTimeout(task.pmDispatchTimer);
+              task.pmDispatchTimer = null;
+            }
+            await logAutonomyMilestone(task, "pm-model-request-sent", {
+              stage: "pm_plan"
+            });
+          },
+          onPmResponseReceived: async () => {
+            if (task.pmResponseReceivedAt) {
+              return;
+            }
+            task.pmResponseReceivedAt = new Date().toISOString();
+            await logAutonomyMilestone(task, "pm-model-response-received", {
+              stage: "pm_plan"
+            });
+          },
+          onPmRequestFailed: async (error) => {
+            await logAutonomyMilestone(task, "pm-model-request-failed", {
+              stage: "pm_plan",
+              message: error?.message || String(error || "Unknown PM request failure")
+            });
+          },
+          onRunPathResolved: async (resolvedRunPath, pmArchitecture) => {
+            const normalizedRunPath = String(resolvedRunPath || "").trim();
+            if (!normalizedRunPath) {
+              return;
+            }
+            task.projectRoot = normalizedRunPath;
+            await persistAutonomyQueueState(task, {
+              status: task.status,
+              currentStage: expectsPmPlanning ? "pm_plan" : "autonomy-runner",
+              currentTask: expectsPmPlanning ? "PM planning started" : "Backend runner started",
+              nextAction: "agent-pipeline",
+              projectSlug: pmArchitecture?.projectSlug || ""
+            }).catch(() => {});
+          }
         },
         (progress) => {
           if (!isRunAuthoritative(task.runId)) {
@@ -1277,6 +1780,10 @@ async function executeAutonomyTask(task) {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
       if (fileOperations.length > 0) {
         assertRunAuthoritative(task.runId, "before applying existing-project file operations");
+        await logAutonomyMilestone(task, "apply-file-operations-start", {
+          scope: "existing-project",
+          count: fileOperations.length
+        });
         const patchResult = await applyFileOperationsToExistingProject(
           task.payload.projectRoot,
           result,
@@ -1284,6 +1791,14 @@ async function executeAutonomyTask(task) {
           fileOperations
         );
         finalResult = attachExistingProjectPatchResult(finalResult, patchResult);
+        await logAutonomyMilestone(task, "apply-file-operations-complete", {
+          scope: "existing-project",
+          applied: patchResult?.applied?.length || 0,
+          failed: patchResult?.failedOperations?.length || 0
+        });
+        await logAutonomyMilestone(task, "changed-files-count", {
+          count: patchResult?.applied?.length || 0
+        });
       }
     } else {
       const fileOperations = Array.isArray(result?.dev?.fileOperations) ? result.dev.fileOperations : [];
@@ -1291,12 +1806,57 @@ async function executeAutonomyTask(task) {
         throw new Error("DEV produced no valid fileOperations or path-tagged code blocks.");
       }
       assertRunAuthoritative(task.runId, "before applying generated-project file operations");
+      await logAutonomyMilestone(task, "apply-file-operations-start", {
+        scope: "generated-project",
+        count: fileOperations.length
+      });
       const generatedProject = await backend.applyFileOperations(
         app.getPath("documents"),
         result?.project?.architecture || result?.project || {},
         fileOperations
       );
       finalResult = attachGeneratedProjectResult(finalResult, generatedProject);
+      await logAutonomyMilestone(task, "apply-file-operations-complete", {
+        scope: "generated-project",
+        applied: generatedProject?.applied?.length || 0,
+        failed: generatedProject?.failedOperations?.length || 0
+      });
+      await logAutonomyMilestone(task, "changed-files-count", {
+        count: generatedProject?.applied?.length || 0
+      });
+      if (!Array.isArray(generatedProject?.applied) || generatedProject.applied.length === 0) {
+        const error = new Error("DEV completed but no files were applied to the generated project.");
+        error.autonomyStatus = "dev_no_valid_file_operations";
+        throw error;
+      }
+      const requiredViteFiles = resolveRequiredViteRootFiles(finalResult);
+      if (requiredViteFiles.length > 0) {
+        await logAutonomyMilestone(task, "required-vite-files-check", {
+          requiredFiles: requiredViteFiles
+        });
+        const missingFiles = [];
+        for (const filePath of requiredViteFiles) {
+          const absolutePath = path.join(generatedProject.rootPath, filePath.split("/").join(path.sep));
+          if (!(await pathExists(absolutePath))) {
+            missingFiles.push(filePath);
+          }
+        }
+        if (missingFiles.length > 0) {
+          const nestedSandboxFolderPath = path.join(generatedProject.rootPath, "Sandbox folder");
+          if (await pathExists(nestedSandboxFolderPath)) {
+            await logAutonomyMilestone(task, "nested_project_folder_detected", {
+              path: nestedSandboxFolderPath
+            });
+          }
+          await logAutonomyMilestone(task, "required-vite-files-missing", {
+            missingFiles
+          });
+          const error = new Error(`DEV completed, but required Vite project files were not created in the project root. Missing: ${missingFiles.join(", ")}`);
+          error.autonomyStatus = "dev_missing_required_project_files";
+          error.missingFiles = missingFiles;
+          throw error;
+        }
+      }
       activeTrackedEntry = await upsertProjectEntry(
         projectToTrackedEntry(generatedProject, {
           type: "sandbox-task",
@@ -1341,10 +1901,14 @@ async function executeAutonomyTask(task) {
 
     const finalValidationStatus = getEffectiveValidationStatus(finalResult);
     const finalPmUnavailable = isFinalPmUnavailable(finalResult);
-    const finalStatus = finalValidationStatus === "passed" && !isQaUnavailable(finalResult) && !finalPmUnavailable
-      ? "completed"
-      : "needs_review";
+    const verificationTerminalStatus = String(repaired?.terminalStatus || "").trim().toLowerCase();
+    const finalStatus = verificationTerminalStatus
+      ? (verificationTerminalStatus === "build_passed" ? "completed" : verificationTerminalStatus)
+      : finalValidationStatus === "passed" && !isQaUnavailable(finalResult) && !finalPmUnavailable
+        ? "completed"
+        : "needs_review";
     task.status = finalStatus;
+    task.error = repaired?.terminalMessage || task.error || "";
     const projectRoot = finalResult?.project?.rootPath || task.payload?.projectRoot || "";
     if (projectRoot) {
       task.projectRoot = projectRoot;
@@ -1364,6 +1928,17 @@ async function executeAutonomyTask(task) {
         })
       );
       await writeAutonomyFinalReport(projectRoot, finalResult, task);
+      await updateAutonomyRunState(projectRoot, {
+        status: task.status,
+        currentStage: repaired?.currentStage || (task.status === "completed" ? "decision" : "manual_review"),
+        nextAction: repaired?.nextAction || (task.status === "completed" ? "user-decision" : "manual_review"),
+        changedFiles: repaired?.changedFiles || finalResult?.decision?.affectedFiles || [],
+        generatedRootFiles: repaired?.generatedRootFiles || await listProjectRootEntries(projectRoot),
+        lastValidationStatus: verificationTerminalStatus || finalValidationStatus || task.status,
+        lastError: task.status === "completed" ? "" : (task.error || ""),
+        failureStatus: task.status === "completed" ? "" : (verificationTerminalStatus || task.status),
+        failureDetails: task.failureDetails || null
+      }).catch(() => {});
     }
 
     task.finishedAt = new Date().toISOString();
@@ -1371,21 +1946,45 @@ async function executeAutonomyTask(task) {
     await persistAutonomyQueueState(task, {
       status: task.status,
       finishedAt: task.finishedAt,
-      currentStage: finalResult?.workflow?.currentStage || "decision",
-      currentTask: finalResult?.workflow?.currentTask || "Review output",
-      nextAction: "user-decision"
+      currentStage: repaired?.currentStage || finalResult?.workflow?.currentStage || (task.status === "completed" ? "decision" : "manual_review"),
+      currentTask: repaired?.terminalMessage || finalResult?.workflow?.currentTask || "Review output",
+      nextAction: repaired?.nextAction || (task.status === "completed" ? "user-decision" : "manual_review"),
+      lastValidationStatus: verificationTerminalStatus || finalValidationStatus || task.status,
+      failureStatus: task.status === "completed" ? "" : (verificationTerminalStatus || task.status),
+      failureDetails: task.failureDetails || null
     });
     sendAutonomyProgress(task, {
       agent: "architect",
-      stage: "autonomy-complete",
+      stage: task.status === "completed" ? "autonomy-complete" : "autonomy-error",
       status: task.status,
+      message: repaired?.terminalMessage || "",
       partialResult: finalResult
     });
+    clearAutonomyStartTimeouts(task);
     releaseActiveRunLock(task.runId, task.status);
   } catch (error) {
     if (error?.code === "EAUTOSTALE") {
       return;
     }
+    if (!task.stopRequested && task.prePmLastStartedStep && !task.pmRequestSentAt) {
+      await failAutonomyTask(task, {
+        status: "pre_pm_setup_failed",
+        stage: "pm_plan",
+        message: `Autonomy PM setup failed during ${task.prePmLastStartedStep || "unknown step"}: ${error?.message || String(error)}. Last completed step: ${task.prePmLastCompletedStep || "none"}.`,
+        logEvent: "pre-pm-setup-failed"
+      });
+      return;
+    }
+    if (!task.stopRequested && !task.pmStageStartedAt && task.progress.length === 0) {
+      await failAutonomyTask(task, {
+        status: "autonomy-worker-start-failed",
+        stage: "autonomy-error",
+        message: error?.message || "Autonomy worker failed before the PM stage started.",
+        logEvent: "autonomy-worker-start-failed"
+      });
+      return;
+    }
+    clearAutonomyStartTimeouts(task);
     const preserved = await classifyRecoverableAutonomyFailure({
       task,
       result: finalResult,
@@ -1393,6 +1992,8 @@ async function executeAutonomyTask(task) {
     });
     task.status = preserved
       ? "needs_review"
+      : error?.autonomyStatus
+        ? error.autonomyStatus
       : error?.code === "EAUTORUNTIME"
         ? "timed_out"
         : task.stopRequested
@@ -1402,7 +2003,14 @@ async function executeAutonomyTask(task) {
       ? buildRecoverableAutonomyMessage(error)
       : error?.message || String(error);
     task.finishedAt = new Date().toISOString();
-    task.result = finalResult || task.result || null;
+    task.result = preserved ? (finalResult || task.result || null) : null;
+    task.failureDetails = normalizeAutonomyFailureDetails(error?.debugMetadata, task.status);
+    if (expectsPmPlanning && !task.pmRequestSentAt && !task.stopRequested && task.pmRequestStartingAt) {
+      await logAutonomyMilestone(task, error?.code === "EAUTORUNTIME" ? "pm-model-timeout" : "pm-model-request-failed", {
+        stage: "pm_plan",
+        message: error?.message || String(error)
+      });
+    }
     if (preserved) {
       const projectRoot = finalResult?.project?.rootPath || task.projectRoot || task.payload?.projectRoot || "";
       if (projectRoot && finalResult) {
@@ -1410,45 +2018,85 @@ async function executeAutonomyTask(task) {
         await writeAutonomyFinalReport(projectRoot, finalResult, task);
       }
     }
-    await persistAutonomyQueueState(task, {
-      status: task.status,
-      finishedAt: task.finishedAt,
-      currentStage: preserved ? "final" : "autonomy-error",
-      currentTask: task.error,
-      nextAction: preserved ? "user-decision" : "blocked"
-    });
-    if (preserved) {
+    if (task.projectRoot) {
+      await updateAutonomyRunState(task.projectRoot, {
+        status: task.status,
+        currentStage: task.stopRequested ? "manual_review" : (preserved ? "final" : "autonomy-error"),
+        nextAction: task.stopRequested ? "manual_review" : (preserved ? "user-decision" : "manual_review"),
+        lastError: task.error,
+        lastValidationStatus: task.status,
+        failureStatus: task.status,
+        failureDetails: task.failureDetails
+      }).catch(() => {});
+      await persistActiveWorkPointer({
+        projectRoot: task.projectRoot,
+        projectName: task.payload?.projectName || path.basename(task.projectRoot || "TriFix Task"),
+        runId: task.runId,
+        type: "autonomy",
+        status: task.stopRequested ? "stopped" : (preserved ? "needs_review" : "manual_review"),
+        message: buildCompactFailureMessage(task.error, task.failureDetails),
+        returnView: "workspace",
+        source: "autonomy:error"
+      }).catch(() => {});
+    }
+    if (task.stopRequested) {
+      sendAutonomyProgress(task, {
+        agent: "architect",
+        stage: "autonomy-stopped",
+        status: "stopped",
+        message: task.error,
+        stopReason: "Stop requested.",
+        forceDispatch: true
+      });
+    } else if (preserved) {
       sendAutonomyProgress(task, {
         agent: "architect",
         stage: "autonomy-complete",
         status: "needs_review",
         partialResult: finalResult,
-        message: task.error
+        message: task.error,
+        forceDispatch: true
       });
     } else {
       sendAutonomyProgress(task, {
         agent: "architect",
         stage: "autonomy-error",
-        status: "failed",
-        message: task.error
+        status: task.status,
+        message: task.error,
+        failureDetails: task.failureDetails,
+        forceDispatch: true
       });
     }
-    releaseActiveRunLock(task.runId, task.status);
+    releaseActiveRunLock(task.runId, task.stopRequested ? "stop requested" : task.status);
+    await persistAutonomyQueueState(task, {
+      status: task.status,
+      finishedAt: task.finishedAt,
+      currentStage: task.stopRequested ? "manual_review" : (preserved ? "final" : "autonomy-error"),
+      currentTask: task.error,
+      nextAction: task.stopRequested ? "manual_review" : (preserved ? "user-decision" : "manual_review"),
+      lastValidationStatus: task.status,
+      failureStatus: task.status,
+      failureDetails: task.failureDetails
+    }).catch(() => {});
   }
 }
 
 function sendAutonomyProgress(task, progress) {
-  if (!isRunAuthoritative(task.runId)) {
+  const forceDispatch = progress?.forceDispatch === true;
+  if (!forceDispatch && !isRunAuthoritative(task.runId)) {
     markRunStale(task.runId, "send-progress");
     return;
   }
+  const payload = { ...(progress || {}) };
+  delete payload.forceDispatch;
   mainWindow?.webContents?.send("autonomy:progress", {
     runId: task.runId,
     autonomy: true,
     queueStatus: task.status,
     deadlineAt: task.deadlineAt,
     maxRuntimeMs: task.maxRuntimeMs,
-    ...progress
+    failureDetails: task.failureDetails || null,
+    ...payload
   });
 }
 
@@ -1644,10 +2292,12 @@ function summarizeAutonomyTask(task) {
     deadlineAt: task.deadlineAt,
     maxRuntimeMs: task.maxRuntimeMs,
     stopRequested: task.stopRequested,
+    stopReason: task.stopRequested ? "Stop requested." : "",
     error: task.error,
     projectRoot: task.projectRoot,
     progress: task.progress.slice(-20),
-    result: task.result
+    result: task.result,
+    failureDetails: task.failureDetails || null
   };
 }
 
@@ -2617,6 +3267,7 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
 
   const runState = await backend.runState.loadRunState(root);
   const maxRepairAttempts = Number(runState?.maxAttempts || 3);
+  const generatedRootFiles = await listProjectRootEntries(root);
 
   event.sender.send("pipeline:progress", {
     runId,
@@ -2637,20 +3288,22 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
   await updateAutonomyRunState(root, {
     status: "running",
     currentStage: "verify",
-    changedFiles: appliedFiles
+    changedFiles: appliedFiles,
+    generatedRootFiles
   });
   await appendAutonomyLog(root, {
     type: "stage-detail",
     runId,
-    event: "verification started"
+    event: "post-apply-verification-start"
   });
 
   const initialValidation = await executeAutomaticProjectSteps(root, activeTrackedEntry?.id, result);
   result = attachValidationResult(result, initialValidation);
   await updateAutonomyRunState(root, {
-    status: initialValidation.status === "failed" ? "failed" : initialValidation.status === "needs_review" ? "needs_review" : "running",
+    status: initialValidation.status,
     currentStage: "verify",
     changedFiles: appliedFiles,
+    generatedRootFiles,
     lastValidationStatus: initialValidation.status,
     lastError: initialValidation.status === "passed" ? "" : initialValidation.error || backend.verifier.buildVerificationReport(initialValidation.verification)
   });
@@ -2668,6 +3321,41 @@ async function runAutoValidationAndRepair({ event, payload, runId, result, activ
     status: initialValidation.status === "failed" ? "failed" : "done",
     partialResult: result
   });
+
+  if (shouldFinishPostApplyVerification(initialValidation.status)) {
+    const terminalStatus = normalizePostApplyTerminalStatus(initialValidation.status);
+    const terminalMessage = buildPostApplyVerificationMessage(initialValidation, result);
+    await updateAutonomyRunState(root, {
+      status: terminalStatus,
+      currentStage: terminalStatus === "build_passed" ? "decision" : "manual_review",
+      nextAction: terminalStatus === "build_passed" ? "user-decision" : "manual_review",
+      changedFiles: appliedFiles,
+      generatedRootFiles,
+      lastValidationStatus: terminalStatus,
+      lastError: terminalStatus === "build_passed" ? "" : terminalMessage,
+      failureStatus: terminalStatus === "build_passed" ? "" : terminalStatus,
+      failureDetails: terminalStatus === "build_passed" ? null : {
+        status: terminalStatus
+      }
+    });
+    await appendAutonomyLog(root, {
+      type: "stage-detail",
+      runId,
+      event: "post-apply-verification-terminal",
+      status: terminalStatus,
+      message: terminalMessage
+    });
+    return {
+      result,
+      activeTrackedEntry,
+      terminalStatus,
+      terminalMessage,
+      currentStage: terminalStatus === "build_passed" ? "decision" : "manual_review",
+      nextAction: terminalStatus === "build_passed" ? "user-decision" : "manual_review",
+      generatedRootFiles,
+      changedFiles: appliedFiles
+    };
+  }
 
   if (initialValidation.status === "passed" || initialValidation.status === "needs_review") {
     return { result, activeTrackedEntry };
@@ -2909,11 +3597,71 @@ function buildValidationSignature(validation) {
   ].join("|");
 }
 
+async function listProjectRootEntries(root) {
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    return entries
+      .map((entry) => entry.name)
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right));
+  } catch {
+    return [];
+  }
+}
+
+function shouldFinishPostApplyVerification(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return [
+    "passed",
+    "needs_review",
+    "build_passed",
+    "build_failed",
+    "needs_dependency_install",
+    "dependency_install_timeout",
+    "generated_needs_manual_verification"
+  ].includes(normalized);
+}
+
+function normalizePostApplyTerminalStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "passed") {
+    return "build_passed";
+  }
+  return normalized || "generated_needs_manual_verification";
+}
+
+function buildPostApplyVerificationMessage(validation, result) {
+  const normalized = normalizePostApplyTerminalStatus(validation?.status);
+  if (normalized === "dependency_install_timeout") {
+    return "Files were generated successfully, but dependency installation timed out. Manual verification is required.";
+  }
+  if (normalized === "needs_dependency_install") {
+    return "Files were generated successfully, but dependencies must be installed before build verification can continue.";
+  }
+  if (normalized === "build_failed") {
+    return validation?.error || "Generated files were applied, but the project build failed. Manual verification is required.";
+  }
+  if (normalized === "generated_needs_manual_verification") {
+    return validation?.error || "Generated files were applied, but automatic verification could not complete. Manual verification is required.";
+  }
+  if (normalized === "needs_review") {
+    return validation?.error || "Generated files were applied. Manual verification is still recommended.";
+  }
+  if (normalized === "build_passed") {
+    const changedCount = (result?.executor?.applied || []).length;
+    return changedCount > 0
+      ? `Generated files were applied successfully and build verification passed for ${changedCount} file(s).`
+      : "Generated files were applied successfully and build verification passed.";
+  }
+  return validation?.error || "Generated files were applied successfully.";
+}
+
 async function executeAutomaticProjectSteps(root, projectId, result, options = {}) {
   const entries = [];
   const commands = options.skipSetupCommands
     ? []
     : await collectAutomaticCommands(root, result);
+  const hasNodeModules = await directoryExists(path.join(root, "node_modules"));
   const verification = await backend.verifier.verifyArtifacts({
     rootPath: root,
     expectedFiles: result?.project?.requiredFiles || [],
@@ -2941,7 +3689,7 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
 
   if (verification.projectType === "static-html") {
     return {
-      status: "passed",
+      status: "build_passed",
       entries,
       verification,
       projectType: verification.projectType,
@@ -2958,7 +3706,29 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
   try {
     let installStatus = "not_run";
     let buildStatus = "not_run";
+    if (verification.projectType === "vite-react" && hasNodeModules) {
+      await appendAutonomyLog(root, {
+        type: "stage-detail",
+        event: "dependency-install-skipped",
+        reason: "node_modules already exists"
+      });
+    }
     for (const command of commands) {
+      const normalizedCommand = normalizeSuggestedCommand(command).toLowerCase();
+      if (normalizedCommand === "npm install") {
+        await appendAutonomyLog(root, {
+          type: "stage-detail",
+          event: "dependency-install-start",
+          command
+        });
+      }
+      if (normalizedCommand === "npm run build") {
+        await appendAutonomyLog(root, {
+          type: "stage-detail",
+          event: "build-start",
+          command
+        });
+      }
       const entry = await runProjectCommand({
         projectRoot: root,
         projectId,
@@ -2966,34 +3736,97 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
         command
       });
       entries.push(entry);
-      const normalizedCommand = normalizeSuggestedCommand(entry.command).toLowerCase();
-      if (normalizedCommand === "npm install") {
+      const executedCommand = normalizeSuggestedCommand(entry.command).toLowerCase();
+      if (executedCommand === "npm install") {
         installStatus = entry.status;
       }
-      if (normalizedCommand === "npm run build") {
+      if (executedCommand === "npm run build") {
         buildStatus = entry.status;
       }
       if (entry.status !== "passed") {
-        const installFailed = normalizedCommand === "npm install";
+        const installFailed = executedCommand === "npm install";
+        const buildFailed = executedCommand === "npm run build";
+        if (installFailed && entry.timedOut) {
+          await appendAutonomyLog(root, {
+            type: "stage-detail",
+            event: "dependency-install-timeout",
+            command: entry.command
+          });
+          return {
+            status: "dependency_install_timeout",
+            entries,
+            verification,
+            projectType: verification.projectType,
+            validationMode: verification.projectType === "vite-react" ? "vite-build" : "command-validation",
+            validation: entry,
+            installStatus,
+            buildStatus: "blocked",
+            error: "Generated files were applied, but dependency installation timed out.",
+            nextAction: "manual_review"
+          };
+        }
+        if (installFailed) {
+          return {
+            status: "needs_dependency_install",
+            entries,
+            verification,
+            projectType: verification.projectType,
+            validationMode: verification.projectType === "vite-react" ? "vite-build" : "command-validation",
+            validation: entry,
+            installStatus,
+            buildStatus: "blocked",
+            error: "Generated files were applied, but dependencies must be installed before build verification can continue.",
+            nextAction: "manual_review"
+          };
+        }
+        if (buildFailed) {
+          await appendAutonomyLog(root, {
+            type: "stage-detail",
+            event: "build-failed",
+            command: entry.command
+          });
+          return {
+            status: "build_failed",
+            entries,
+            verification,
+            projectType: verification.projectType,
+            validationMode: verification.projectType === "vite-react" ? "vite-build" : "command-validation",
+            validation: entry,
+            installStatus,
+            buildStatus: "failed",
+            error: `${entry.command} failed.`,
+            nextAction: "manual_review"
+          };
+        }
         return {
-          status: "failed",
+          status: "generated_needs_manual_verification",
           entries,
           verification,
           projectType: verification.projectType,
           validationMode: verification.projectType === "vite-react" ? "vite-build" : "command-validation",
           validation: entry,
           installStatus,
-          buildStatus: installFailed ? "blocked" : buildStatus,
-          error: installFailed
-            ? "Build was not run because dependencies were not installed."
-            : `${entry.command} failed.`,
-          nextAction: installFailed ? "fix_dependencies" : "patch_validation_failure"
+          buildStatus,
+          error: `${entry.command} failed.`,
+          nextAction: "manual_review"
         };
+      }
+      if (executedCommand === "npm run build") {
+        await appendAutonomyLog(root, {
+          type: "stage-detail",
+          event: "build-passed",
+          command: entry.command
+        });
       }
     }
 
     let validation = null;
     try {
+      await appendAutonomyLog(root, {
+        type: "stage-detail",
+        event: "build-start",
+        command: "validate"
+      });
       validation = await runProjectCommand({
         projectRoot: root,
         projectId,
@@ -3002,7 +3835,7 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
     } catch (error) {
       if (verification.projectType === "vite-react" && /No validation command is available/i.test(String(error?.message || ""))) {
         return {
-          status: "needs_review",
+          status: "generated_needs_manual_verification",
           entries,
           verification,
           projectType: verification.projectType,
@@ -3018,8 +3851,21 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
       throw error;
     }
     entries.push(validation);
+    if (validation.status === "passed") {
+      await appendAutonomyLog(root, {
+        type: "stage-detail",
+        event: "build-passed",
+        command: validation.command
+      });
+    } else {
+      await appendAutonomyLog(root, {
+        type: "stage-detail",
+        event: "build-failed",
+        command: validation.command
+      });
+    }
     return {
-      status: validation.status,
+      status: validation.status === "passed" ? "build_passed" : "build_failed",
       entries,
       verification,
       projectType: verification.projectType,
@@ -3033,7 +3879,7 @@ async function executeAutomaticProjectSteps(root, projectId, result, options = {
     };
   } catch (error) {
     return {
-      status: "failed",
+      status: "generated_needs_manual_verification",
       entries,
       verification,
       projectType: verification.projectType,
@@ -3178,6 +4024,17 @@ function attachExistingProjectPatchResult(result, patchResult) {
 }
 
 function attachValidationResult(result, validation) {
+  const validationStatus = String(validation?.status || "").trim().toLowerCase();
+  const projectStatus = validationStatus === "build_passed" || validationStatus === "passed"
+    ? "Validation passed"
+    : ["needs_review", "needs_dependency_install", "dependency_install_timeout", "generated_needs_manual_verification"].includes(validationStatus)
+      ? "Manual verification required"
+      : "Validation failed";
+  const currentTask = validationStatus === "build_passed" || validationStatus === "passed"
+    ? "Review validated output"
+    : ["needs_review", "needs_dependency_install", "dependency_install_timeout", "generated_needs_manual_verification"].includes(validationStatus)
+      ? "Review generated source and finish environment validation manually"
+      : "Repair validation failure";
   return {
     ...result,
     validation: {
@@ -3192,17 +4049,9 @@ function attachValidationResult(result, validation) {
     workflow: {
       ...(result?.workflow || {}),
       commandStatus: validation.status,
-      projectStatus: validation.status === "passed"
-        ? "Validation passed"
-        : validation.status === "needs_review"
-          ? "Build unverified"
-          : "Validation failed",
+      projectStatus,
       currentStage: "auto-validation",
-      currentTask: validation.status === "passed"
-        ? "Review validated output"
-        : validation.status === "needs_review"
-          ? "Review generated source and optional build"
-          : "Repair validation failure"
+      currentTask
     }
   };
 }
@@ -3483,15 +4332,83 @@ function mapRunStage(stage) {
   if (["verify", "auto-validation", "validation"].includes(normalized)) return "verify";
   if (["qa", "senior-parallel-review", "senior-final-review"].includes(normalized)) return "qa";
   if (["patch", "junior-patch", "auto-repair"].includes(normalized)) return "patch";
-  if (["final", "supervisor-final", "decision"].includes(normalized)) return "final";
+  if (["final", "supervisor-final", "decision", "autonomy-error", "manual_review", "stopped", "autonomy-stopped"].includes(normalized)) return "final";
   return "pm_plan";
+}
+
+function normalizeAutonomyFailureDetails(details, fallbackStatus = "failed") {
+  if (!details || typeof details !== "object") {
+    return null;
+  }
+  const hasParsePosition = details.parsePosition !== null && details.parsePosition !== undefined && details.parsePosition !== "";
+  return {
+    status: String(details.status || fallbackStatus || "").trim() || "failed",
+    outputLength: Number(details.outputLength || 0),
+    rawOutputPath: String(details.rawOutputPath || ""),
+    repairRawOutputPath: String(details.repairRawOutputPath || ""),
+    parseError: String(details.parseError || ""),
+    parsePosition: hasParsePosition && Number.isFinite(Number(details.parsePosition)) ? Number(details.parsePosition) : null,
+    code: String(details.code || ""),
+    type: String(details.type || ""),
+    rejectedKeys: Array.isArray(details.rejectedKeys) ? details.rejectedKeys.map((item) => String(item || "").trim()).filter(Boolean) : [],
+    endpoint: String(details.endpoint || ""),
+    model: String(details.model || ""),
+    requestedMaxOutputTokens: Number(details.requestedMaxOutputTokens || 0),
+    outputBudgetSource: String(details.outputBudgetSource || "")
+  };
+}
+
+function buildCompactFailureMessage(message, details = null) {
+  const baseMessage = String(message || "Autonomy run failed.").trim();
+  if (!details || typeof details !== "object") {
+    return baseMessage;
+  }
+  const parts = [baseMessage];
+  if (details.parseError) {
+    parts.push(`Parse error: ${details.parseError}`);
+  }
+  if (details.rawOutputPath) {
+    parts.push(`Raw output: ${details.rawOutputPath}`);
+  }
+  if (Array.isArray(details.rejectedKeys) && details.rejectedKeys.length > 0) {
+    parts.push(`Rejected keys: ${details.rejectedKeys.join(", ")}`);
+  }
+  return parts.join(" ");
+}
+
+function isTerminalRunStateWriteStatus(requestedStatus, mappedStatus) {
+  const requested = String(requestedStatus || "").trim().toLowerCase();
+  const mapped = String(mappedStatus || "").trim().toLowerCase();
+  return [
+    "stopped",
+    "dependency_install_timeout",
+    "needs_dependency_install",
+    "generated_needs_manual_verification",
+    "build_failed",
+    "build_passed",
+    "dev_invalid_json",
+    "dev_json_repair_timeout",
+    "dev_no_valid_file_operations",
+    "dev_missing_required_project_files",
+    "model_request_invalid_payload",
+    "autonomy_worker_start_timeout",
+    "pm_dispatch_timeout",
+    "pre_pm_setup_timeout",
+    "pre_pm_setup_failed",
+    "autonomy-worker-start-failed",
+    "failed",
+    "completed"
+  ].includes(requested) || ["stopped", "manual_review", "completed", "failed"].includes(mapped);
 }
 
 function mapRunStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (["completed", "done", "passed", "success"].includes(normalized)) return "completed";
+  if (["stopped", "stop requested", "stop_requested"].includes(normalized)) return "stopped";
+  if (["manual_review", "manual review", "manual_review_required", "dependency_install_timeout", "needs_dependency_install", "generated_needs_manual_verification", "build_failed"].includes(normalized)) return "manual_review";
   if (["needs_review", "waiting_for_decision", "waiting for decision"].includes(normalized)) return "needs_review";
-  if (["failed", "error"].includes(normalized)) return "failed";
+  if (["build_passed"].includes(normalized)) return "completed";
+  if (["failed", "error", "autonomy_worker_start_timeout", "pm_dispatch_timeout", "autonomy-worker-start-failed", "pre_pm_setup_timeout", "pre_pm_setup_failed", "dev_no_valid_file_operations", "dev_invalid_json", "dev_missing_required_project_files", "dev_json_repair_timeout", "model_request_invalid_payload"].includes(normalized)) return "failed";
   if (["running", "thinking", "coding", "testing", "speaking", "pending", "queued", "idle"].includes(normalized)) return "running";
   return "pending";
 }
@@ -8046,9 +8963,9 @@ function normalizeRunbookStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (["queued", "running", "stopping"].includes(normalized)) return "running";
   if (["stopped"].includes(normalized)) return "stopped";
-  if (["completed", "quality_loop_passed", "qa_evidence_ready"].includes(normalized)) return "completed";
-  if (["needs_review", "quality_loop_needs_review", "blocked_missing_health_url", "gui_qa_skipped_missing_playwright", "gui_qa_failed"].includes(normalized)) return "needs_review";
-  if (["failed", "quality_loop_failed", "timed_out"].includes(normalized)) return "failed";
+  if (["completed", "quality_loop_passed", "qa_evidence_ready", "build_passed"].includes(normalized)) return "completed";
+  if (["needs_review", "quality_loop_needs_review", "blocked_missing_health_url", "gui_qa_skipped_missing_playwright", "gui_qa_failed", "dependency_install_timeout", "needs_dependency_install", "generated_needs_manual_verification", "build_failed"].includes(normalized)) return "needs_review";
+  if (["failed", "quality_loop_failed", "timed_out", "autonomy_worker_start_timeout", "pm_dispatch_timeout", "autonomy-worker-start-failed", "pre_pm_setup_timeout", "pre_pm_setup_failed", "dev_no_valid_file_operations", "dev_invalid_json", "dev_missing_required_project_files", "dev_json_repair_timeout", "model_request_invalid_payload"].includes(normalized)) return "failed";
   return normalized || "idle";
 }
 
@@ -8677,7 +9594,9 @@ async function initializeAutonomyLedger(rootPath, statePatch = {}) {
     workspacePath: root,
     changedFiles: uniqueStrings(statePatch.changedFiles ?? existingState?.changedFiles ?? []),
     lastError: statePatch.lastError ?? existingState?.lastError ?? "",
-    lastValidationStatus: statePatch.lastValidationStatus ?? existingState?.lastValidationStatus ?? ""
+    lastValidationStatus: statePatch.lastValidationStatus ?? existingState?.lastValidationStatus ?? "",
+    failureStatus: statePatch.failureStatus ?? existingState?.failureStatus ?? "",
+    failureDetails: statePatch.failureDetails ?? existingState?.failureDetails ?? null
   });
   await backend.artifactLedger.createArtifactLedger({
     runPath: root,
@@ -9231,15 +10150,29 @@ function runQuickProcess(command, args, cwd, timeoutMs) {
 async function updateAutonomyRunState(rootPath, statePatch = {}) {
   await initializeAutonomyLedger(rootPath);
   const current = await backend.runState.loadRunState(rootPath);
+  const requestedStatus = String(statePatch.status ?? current?.status ?? "running").trim().toLowerCase();
+  const mappedStatus = mapRunStatus(requestedStatus);
+  const mappedStage = mapRunStage(statePatch.currentStage ?? statePatch.stage ?? current?.stage ?? "pm_plan");
   await backend.runState.saveRunState(rootPath, {
     ...current,
     ...stripUndefined(statePatch),
-    status: mapRunStatus(statePatch.status ?? current?.status ?? "running"),
-    stage: mapRunStage(statePatch.currentStage ?? statePatch.stage ?? current?.stage ?? "pm_plan"),
+    status: mappedStatus,
+    stage: mappedStage,
     changedFiles: uniqueStrings(statePatch.changedFiles ?? current?.changedFiles ?? []),
     lastValidationStatus: statePatch.lastValidationStatus ?? current?.lastValidationStatus ?? "",
-    lastError: statePatch.lastError ?? current?.lastError ?? ""
+    lastError: statePatch.lastError ?? current?.lastError ?? "",
+    failureStatus: statePatch.failureStatus ?? current?.failureStatus ?? "",
+    failureDetails: statePatch.failureDetails ?? current?.failureDetails ?? null
   });
+  if (isTerminalRunStateWriteStatus(requestedStatus, mappedStatus)) {
+    await appendAutonomyLog(rootPath, {
+      type: "stage-detail",
+      event: "run-state-terminal-write",
+      requestedStatus,
+      status: mappedStatus,
+      stage: mappedStage
+    }).catch(() => {});
+  }
 }
 
 async function appendAutonomyLog(rootPath, entry = {}) {
